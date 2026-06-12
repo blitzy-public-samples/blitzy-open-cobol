@@ -290,7 +290,6 @@ def test_init_call_pre_load(module_dir, monkeypatch):
 # These materialise the call-argument idioms the emitter lowers from the
 # original C union/cast forms (codegen.c output_call).
 # ===========================================================================
-import struct as _struct
 import sys as _sys
 
 
@@ -359,3 +358,175 @@ class TestValueBuffer:
     def test_negative_twos_complement(self):
         vb = call.cob_value_buffer(-1, 2, 0)
         assert int.from_bytes(vb, _sys.byteorder) == 0xFFFF
+
+
+# ===========================================================================
+# cob_strdup (call.c L165-L175) - independent-copy semantics
+# ===========================================================================
+class TestStrdup:
+    def test_str_returned_unchanged(self):
+        # str is immutable; the duplicate is value-equal and still a str.
+        result = call.cob_strdup("ABC")
+        assert result == "ABC" and isinstance(result, str)
+
+    def test_bytes_yields_mutable_bytearray(self):
+        result = call.cob_strdup(b"xyz")
+        assert isinstance(result, bytearray) and result == bytearray(b"xyz")
+        result[0] = ord("Q")            # the copy is writable (strtok use case)
+        assert result == bytearray(b"Qyz")
+
+    def test_bytearray_copy_is_independent(self):
+        src = bytearray(b"123")
+        result = call.cob_strdup(src)
+        result[0] = 0
+        assert src == bytearray(b"123")     # source untouched
+
+    def test_memoryview_source(self):
+        src = bytearray(b"MVW")
+        result = call.cob_strdup(memoryview(src))
+        assert isinstance(result, bytearray) and result == bytearray(b"MVW")
+
+    def test_none_passthrough(self):
+        assert call.cob_strdup(None) is None
+
+    def test_other_object_normalised_to_str(self):
+        assert call.cob_strdup(12345) == "12345"
+
+
+# ===========================================================================
+# cob_get_buff (call.c L204) - reusable, growable scratch buffer
+# ===========================================================================
+class TestGetBuff:
+    def test_returns_zeroed_buffer_of_width(self):
+        buf = call.cob_get_buff(8)
+        assert len(buf) == 8 and all(x == 0 for x in buf)
+
+    def test_writable(self):
+        buf = call.cob_get_buff(4)
+        buf[0] = 0x41
+        assert buf[0] == 0x41
+
+    def test_smaller_request_rezeroes_window(self):
+        big = call.cob_get_buff(16)
+        big[0] = 0xFF
+        small = call.cob_get_buff(4)         # reuse + re-zero active window
+        assert len(small) == 4 and all(x == 0 for x in small)
+
+    def test_grow_enlarges_backing_store(self):
+        call.cob_get_buff(4)
+        grown = call.cob_get_buff(128)
+        assert len(grown) == 128
+
+    def test_negative_treated_as_zero(self):
+        assert len(call.cob_get_buff(-5)) == 0
+
+
+# ===========================================================================
+# cobcall / cobfunc (call.c L602 / L638) - call-by-name with argv
+# ===========================================================================
+@pytest.fixture
+def runtime_initialized():
+    """Force common.cob_initialized truthy for cobcall/cobfunc, then restore.
+
+    cobcall publishes ``common.cob_call_params`` (the CALL argument count); this
+    fixture also saves and restores that global so the value never leaks into
+    sibling test modules (e.g. fileio's ``_chk_parms`` count check).
+    """
+    saved_init = common.cob_initialized
+    saved_params = common.cob_call_params
+    common.cob_initialized = 1
+    yield
+    common.cob_initialized = saved_init
+    common.cob_call_params = saved_params
+
+
+def _write_recorder(directory, modname):
+    """Write a module whose entry records its args and returns their count."""
+    (directory / (modname + ".py")).write_text(
+        "CALLS = []\n"
+        "def %s(*args):\n"
+        "    CALLS.append(args)\n"
+        "    return len(args)\n" % modname
+    )
+
+
+def test_cobcall_resolves_and_invokes(module_dir, runtime_initialized):
+    _write_recorder(module_dir, "RECPROG")
+    rc = call.cobcall("RECPROG", 2, ["A", "B"])
+    assert rc == 2                                  # entry returned len(args)
+    assert common.cob_call_params == 2              # parameter count published
+    assert sys.modules["RECPROG"].CALLS[-1] == ("A", "B")
+
+
+def test_cobcall_pads_short_argv_with_none(module_dir, runtime_initialized):
+    _write_recorder(module_dir, "PADPROG")
+    rc = call.cobcall("PADPROG", 3, ["X"])
+    assert rc == 3
+    assert sys.modules["PADPROG"].CALLS[-1] == ("X", None, None)
+
+
+def test_cobcall_none_argv(module_dir, runtime_initialized):
+    _write_recorder(module_dir, "NILPROG")
+    rc = call.cobcall("NILPROG", 0, None)
+    assert rc == 0
+    assert sys.modules["NILPROG"].CALLS[-1] == ()
+
+
+def test_cobcall_not_initialized_stops(monkeypatch):
+    monkeypatch.setattr(common, "cob_initialized", 0)
+    with pytest.raises(SystemExit):
+        call.cobcall("ANY", 0, [])
+
+
+def test_cobcall_bad_argc_stops(runtime_initialized):
+    with pytest.raises(SystemExit):
+        call.cobcall("ANY", 99, [])
+    with pytest.raises(SystemExit):
+        call.cobcall("ANY", -1, [])
+
+
+def test_cobcall_none_name_stops(runtime_initialized):
+    with pytest.raises(SystemExit):
+        call.cobcall(None, 0, [])
+
+
+def test_cobfunc_calls_then_cancels(module_dir, runtime_initialized):
+    _write_recorder(module_dir, "FUNCPROG")
+    rc = call.cobfunc("FUNCPROG", 1, ["Z"])
+    assert rc == 1
+    # cobfunc cancels after calling: the module is evicted and the cache cleared.
+    assert "FUNCPROG" not in sys.modules
+    assert call.lookup("FUNCPROG") is None
+
+
+def test_cobfunc_not_initialized_stops(monkeypatch):
+    monkeypatch.setattr(common, "cob_initialized", 0)
+    with pytest.raises(SystemExit):
+        call.cobfunc("ANY", 0, [])
+
+
+def test_max_cobcall_parms_constant():
+    assert call.COB_MAX_COBCALL_PARMS == 16
+
+
+# ===========================================================================
+# cob_init_call - environment fallback branches (AAP 0.7.2)
+# ===========================================================================
+def test_init_call_library_path_unset_uses_default(monkeypatch):
+    # When COB_LIBRARY_PATH is unset, the search path defaults to "." plus the
+    # built-in COB_LIBRARY_PATH (call.c L558-L560).
+    monkeypatch.delenv("COB_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("COB_PRE_LOAD", raising=False)
+    monkeypatch.delenv("COB_LOAD_CASE", raising=False)
+    call.cob_init_call()
+    assert "." in call._resolve_paths
+
+
+def test_init_call_pre_load_missing_module_skipped(module_dir, monkeypatch):
+    # A COB_PRE_LOAD entry that cannot be imported is silently skipped, exactly
+    # like the C preload loop (call.c L571-L593) - no exception escapes.
+    monkeypatch.setenv("COB_PRE_LOAD", "NO_SUCH_PRELOAD_MODULE")
+    monkeypatch.setenv("COB_LIBRARY_PATH", str(module_dir))
+    monkeypatch.delenv("COB_LOAD_CASE", raising=False)
+    call.cob_init_call()                 # must not raise
+    assert "NO_SUCH_PRELOAD_MODULE" not in sys.modules

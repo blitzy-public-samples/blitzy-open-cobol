@@ -16,11 +16,15 @@ collapses onto the standard library (AAP sections 0.3.2 and 0.5):
 * ``COB_PRE_LOAD`` preloads modules at start-up and ``COB_LOAD_CASE``
   (``UPPER``/``LOWER``) folds resolved names, exactly as the C did.
 
-Standard-library only (Rule R3): ``importlib``, ``sys``, ``os``, ``struct``.
+Standard-library only (Rule R3 / AAP sections 0.5 and 0.7.1): the whole module
+is built from ``importlib``, ``sys`` and ``os`` -- zero third-party packages.
+``importlib`` supplies the dynamic loader, ``sys`` supplies ``sys.path`` and
+``sys.modules`` (search path + CANCEL eviction) and ``os`` supplies the
+environment reads (``COB_LIBRARY_PATH`` / ``COB_PRE_LOAD`` / ``COB_LOAD_CASE``)
+and the OS path separator.
 """
 import importlib
 import os
-import struct
 import sys
 
 from libcob_py import common
@@ -38,6 +42,10 @@ _cancel_handlers = {}
 _resolve_error = None
 # COB_LOAD_CASE: 0 = preserve, 1 = lower, 2 = upper (call.c ``name_convert``).
 name_convert = 0
+# Reusable scratch buffer backing :func:`cob_get_buff` (call.c statics
+# ``call_buffer`` / ``call_lastsize``).  Grown on demand, never shrunk, so the
+# same storage is handed back to repeated callers exactly like the C runtime.
+_call_buffer = bytearray()
 
 # Default built-in library path baked into the C build (defaults.h
 # COB_LIBRARY_PATH); under Python the module search uses sys.path, so the
@@ -85,6 +93,28 @@ def _apply_case(name):
     return name
 
 
+def cob_strdup(stptr):
+    """Return an independent copy of *stptr* (call.c L165-L175).
+
+    The C ``cob_strdup`` did ``cob_malloc(strlen+1)`` + ``memcpy`` so the caller
+    owned a private, mutable duplicate it could hand to ``strtok`` without
+    clobbering the source.  Under Python the analogue is a fresh, independent
+    object: ``str`` (immutable) is returned unchanged because no caller can
+    mutate it, while ``bytes``/``bytearray``/``memoryview`` yield a brand-new
+    ``bytearray`` the caller may freely mutate (the ``strtok`` use case).
+    """
+    if stptr is None:
+        return None
+    if isinstance(stptr, str):
+        # Immutable: a copy is indistinguishable from the original, and every
+        # call.c use of cob_strdup(str) only ever read or tokenised the result.
+        return stptr
+    if isinstance(stptr, (bytes, bytearray, memoryview)):
+        return bytearray(bytes(stptr))
+    # Any other text-like object: normalise to str (its immutable duplicate).
+    return str(stptr)
+
+
 def cob_set_library_path(path):
     """Set the resolver search path from a PATHSEP-delimited string (call.c L178).
 
@@ -98,6 +128,31 @@ def cob_set_library_path(path):
     for entry in reversed(_resolve_paths):
         if entry not in sys.path:
             sys.path.insert(0, entry)
+
+
+def cob_get_buff(buffsize):
+    """Return a reusable scratch buffer of at least *buffsize* bytes (call.c L204).
+
+    Mirrors the C ``cob_get_buff``: a single module-level buffer
+    (:data:`_call_buffer`) is grown (never shrunk) whenever a larger size is
+    requested and the same storage is handed back to every caller, so repeated
+    name/field conversions reuse one allocation just as the C runtime reused its
+    ``call_buffer`` static.  The returned :class:`bytearray` is zero-filled to
+    the requested width and is writable by the caller (the C out-parameter
+    idiom, e.g. ``cob_field_to_string(f, buff)``).
+    """
+    global _call_buffer
+    n = int(buffsize)
+    if n < 0:
+        n = 0
+    if n > len(_call_buffer):
+        _call_buffer = bytearray(n)
+    else:
+        # Reuse the existing allocation, re-zeroing the active window.
+        for i in range(n):
+            _call_buffer[i] = 0
+    # Hand back a view of exactly the requested width over the shared buffer.
+    return memoryview(_call_buffer)[:n]
 
 
 def lookup(name):
@@ -272,6 +327,66 @@ def cob_init_call():
             except ImportError:
                 # Mirror the C behaviour: a missing preload module is skipped.
                 continue
+
+
+# ===========================================================================
+# Programmatic call entry points (call.c cobcall / cobfunc).
+#
+# These are the public "call a program by name with an argument vector"
+# helpers used by the C API and by ``cobcrun``.  Under the Python backend the
+# resolved entry point is an ordinary callable, so invocation collapses to
+# ``func(*args)``; the resolver/cancel machinery above does the heavy lifting.
+# ===========================================================================
+
+# COB_MAX_COBCALL_PARMS (call.c L103): the fixed upper bound on CALL arguments.
+COB_MAX_COBCALL_PARMS = 16
+
+
+def cobcall(name, argc, argv):
+    """Resolve *name* and invoke it with *argc* arguments from *argv* (call.c L602).
+
+    Reproduces the C ``cobcall`` contract exactly: the runtime must be
+    initialised, ``argc`` must lie in ``0..COB_MAX_COBCALL_PARMS`` (16) and
+    *name* must be non-``None``; otherwise a runtime error is raised and the run
+    unit stops.  ``cob_resolve_1`` performs the lookup (aborting if the program
+    cannot be found), :data:`common.cob_call_params` is set to *argc* (so the
+    callee's ``C$NARG`` / ``cob_get_int`` sees the right count) and the entry
+    callable is invoked with the first *argc* items of *argv*.  Returns whatever
+    the called program returns (its RETURN-CODE).
+    """
+    if not common.cob_initialized:
+        common.cob_runtime_error("'cobcall' - Runtime has not been initialized")
+        common.cob_stop_run(1)
+    if argc < 0 or argc > COB_MAX_COBCALL_PARMS:
+        common.cob_runtime_error("Invalid number of arguments to 'cobcall'")
+        common.cob_stop_run(1)
+    if name is None:
+        common.cob_runtime_error("NULL name parameter passed to 'cobcall'")
+        common.cob_stop_run(1)
+    func = cob_resolve_1(name)
+    # Publish the parameter count exactly like the C did (call.c L628).
+    common.cob_call_params = argc
+    # Marshal the first argc arguments, padding short vectors with None so the
+    # callee always receives argc positional arguments (the C runtime padded
+    # the unused pargv[] slots with NULL).
+    seq = list(argv) if argv is not None else []
+    args = [seq[i] if i < len(seq) else None for i in range(argc)]
+    return func(*args)
+
+
+def cobfunc(name, argc, argv):
+    """Call *name* then immediately CANCEL it (call.c L638).
+
+    The C ``cobfunc`` is ``cobcall`` followed by ``cobcancel`` so a one-shot
+    invocation leaves no cached/loaded state behind (a fresh module is loaded on
+    any later CALL).  The runtime must already be initialised.
+    """
+    if not common.cob_initialized:
+        common.cob_runtime_error("'cobfunc' - Runtime has not been initialized")
+        common.cob_stop_run(1)
+    ret = cobcall(name, argc, argv)
+    cobcancel(name)
+    return ret
 
 
 # ===========================================================================
