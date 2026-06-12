@@ -25,7 +25,11 @@
 
 #include	<stdio.h>
 #include	<string.h>
-#include	"libcob.h"
+#include	<stdlib.h>	/* MIGRATION (C→Python): getenv() for COB_PYTHON */
+#include	<unistd.h>	/* MIGRATION (C→Python): execvp() to spawn the interpreter */
+/* MIGRATION (C→Python): removed #include "libcob.h". cobcrun no longer links
+   the C runtime (cob_init/cob_resolve/cob_call_error/cob_stop_run are gone),
+   and libcob.h pulls in <gmp.h>, which is removed under the CPython backend. */
 #include	"tarstamp.h"
 
 #ifdef	HAVE_KPATHSEA_GETOPT_H
@@ -131,11 +135,7 @@ int
 main (int argc, char **argv)
 {
 	int pcl_return;
-	
-	union {
-		int	(*func)();
-		void	*func_void;
-	} unifunc;
+	const char *cob_python;	/* MIGRATION (C→Python): CPython interpreter to spawn */
 	
 #ifdef	HAVE_SETLOCALE
 	setlocale (LC_ALL, "");
@@ -151,10 +151,38 @@ main (int argc, char **argv)
 		fprintf (stderr, "Invalid PROGRAM name\n");
 		return 1;
 	}
-	cob_init (argc - 1, &argv[1]);
-	unifunc.func_void = cob_resolve (argv[1]);
-	if (unifunc.func_void == NULL) {
-		cob_call_error ();
+	/* MIGRATION (C→Python): the COBOL program is now a Python module emitted by
+	   cobc, not a native object resolved via cob_resolve/dlopen. Instead of
+	   cob_init + cob_resolve + native call + cob_stop_run, spawn the configured
+	   CPython interpreter on the named program and let it run. */
+
+	/* MIGRATION (C→Python): interpreter = $COB_PYTHON if set, else "python3".
+	   COB_PYTHON is the env var that supersedes COB_CC/COB_CFLAGS and is the
+	   same name cobc.c reads, keeping the backend interpreter selection in
+	   lockstep across the driver and the runner. */
+	cob_python = getenv ("COB_PYTHON");
+	if (cob_python == NULL || cob_python[0] == '\0') {
+		cob_python = "python3";
 	}
-	cob_stop_run ( unifunc.func() );
+
+	/* MIGRATION (C→Python): build the child argument vector by reusing argv.
+	   Original argv = { "cobcrun", <program>, <param>... , NULL }. Overwriting
+	   argv[0] with the interpreter yields { <python>, <program>, <param>... , NULL }
+	   i.e. `python <program> [param ...]`. argv[argc] is guaranteed NULL by the C
+	   standard, so argv is already a valid NULL-terminated vector for execvp. */
+	argv[0] = (char *) cob_python;
+
+	/* MIGRATION (C→Python): replace the process image so the Python program's exit
+	   status becomes cobcrun's exit status (preserves the cob_stop_run(ret)
+	   exit-status-propagation contract). execv* is preferred over system() for
+	   exit-status fidelity per the bin/ requirements. */
+	execvp (cob_python, argv);
+
+	/* MIGRATION (C→Python): execvp only returns on failure (e.g. interpreter not
+	   found). Emit a fatal diagnostic naming the interpreter and COB_PYTHON, then
+	   exit non-zero — mirroring AAP §0.7.2's invocation-failure contract. */
+	fprintf (stderr,
+		 "cobcrun: Python interpreter '%s' not found. Set COB_PYTHON.\n",
+		 cob_python);
+	return 1;
 }
