@@ -378,3 +378,162 @@ class TestCobScreen:
     def test_repr_is_safe(self):
         s = screenio.cob_screen(type=2, occurs=1, attr=5)
         assert "cob_screen" in repr(s)
+
+
+
+# ===========================================================================
+# Multi-field SCREEN preparation + input (screenio.c L551-L867) - the three
+# entry points added for the emitter->runtime contract: cob_screen_puts,
+# cob_prep_input, cob_screen_get_all.  The curses rendering they perform needs
+# a TTY (no-cover), but the tree dispatch / INPUT-table construction and the
+# defensive guards run without one and are validated here.
+# ===========================================================================
+def _input_field(text="     "):
+    return screenio.cob_screen(
+        field=alnum(text), type=screenio.COB_SCREEN_TYPE_FIELD,
+        attr=common.COB_SCREEN_INPUT)
+
+
+def test_prep_input_collects_input_fields():
+    # GROUP -> two INPUT FIELD children (sibling-linked).
+    fld1 = _input_field()
+    fld2 = _input_field()
+    fld1.next = fld2
+    grp = screenio.cob_screen(child=fld1, type=screenio.COB_SCREEN_TYPE_GROUP)
+
+    screenio._cob_base_inp = []
+    screenio._totl_index = 0
+    screenio.cob_prep_input(grp)
+
+    assert screenio._totl_index == 2
+    assert [e.scr for e in screenio._cob_base_inp] == [fld1, fld2]
+    # captured cursor positions default to 0 with no active terminal
+    assert all(e.this_y == 0 and e.this_x == 0 for e in screenio._cob_base_inp)
+
+
+def test_prep_input_value_and_attribute_nodes_collect_nothing():
+    # VALUE (output, occurs) and ATTRIBUTE nodes are dispatched but add no
+    # INPUT fields to the table.
+    val = screenio.cob_screen(value=alnum("LABEL"),
+                              type=screenio.COB_SCREEN_TYPE_VALUE, occurs=3)
+    attrnode = screenio.cob_screen(type=screenio.COB_SCREEN_TYPE_ATTRIBUTE)
+    val.next = attrnode
+    grp = screenio.cob_screen(child=val, type=screenio.COB_SCREEN_TYPE_GROUP)
+
+    screenio._cob_base_inp = []
+    screenio._totl_index = 0
+    screenio.cob_prep_input(grp)
+    assert screenio._totl_index == 0
+    assert screenio._cob_base_inp == []
+
+
+def test_prep_input_none_is_safe():
+    screenio.cob_prep_input(None)  # must not raise
+
+
+def test_screen_puts_noop_without_tty():
+    # No active screen -> cob_screen_puts returns immediately (no raise),
+    # mirroring the C "#else" empty-stub build.
+    s = _input_field("AB")
+    screenio.cob_screen_puts(s, alnum("AB"))
+
+
+def test_screen_get_all_defensive_guard_without_tty():
+    # In the C flow cob_screen_get_all is only reached after a successful init;
+    # without a terminal it returns the read-error status 8001 and never blocks.
+    screenio._global_return = 0
+    assert screenio.cob_screen_get_all() == 8001
+    assert screenio._global_return == 8001
+
+
+# ===========================================================================
+# Additional branch coverage for the (otherwise TTY-driven) lifecycle and the
+# CRT-status / key-filter edge branches that ARE reachable without a terminal.
+# ===========================================================================
+class _FakeCurses:
+    """Minimal curses stand-in whose initscr() raises, to drive the env-read +
+    graceful-degradation branch deterministically regardless of the host TTY."""
+    error = RuntimeError
+
+    def initscr(self):
+        raise RuntimeError("no terminal")
+
+
+def test_screen_init_reads_env_then_degrades(monkeypatch):
+    # _curses present (so init proceeds past the availability gate and reads the
+    # environment options) but initscr() fails -> env flags set, then fallback.
+    monkeypatch.setattr(screenio, "_curses", _FakeCurses())
+    monkeypatch.setenv("COB_SCREEN_EXCEPTIONS", "Y")
+    monkeypatch.setenv("COB_SCREEN_ESC", "Y")
+    monkeypatch.setenv("COB_INSERT_MODE", "Y")
+    common.cob_exception_code = 0
+    screenio.cob_screen_init()
+    assert screenio.cob_extended_status == 1
+    assert screenio.cob_use_esc == 1
+    assert screenio.insert_mode == 1
+    # initscr failed -> graceful degradation latched + 0F03 raised.
+    assert screenio.cob_screen_initialized == 0
+    assert screenio._curses_failed is True
+    assert common.cob_exception_code == 0x0F03
+
+
+def test_screen_init_idempotent_when_already_initialised():
+    # The C guard `if (cob_screen_initialized) return;` - a second call is a
+    # no-op that leaves the active screen untouched.
+    screenio.cob_screen_initialized = 1
+    screenio.cob_screen_init()
+    assert screenio.cob_screen_initialized == 1
+
+
+def test_terminate_when_active_calls_endwin():
+    calls = []
+
+    class _Win:
+        pass
+
+    class _FakeC:
+        def endwin(self):
+            calls.append("endwin")
+
+    screenio.cob_screen_initialized = 1
+    screenio._stdscr = _Win()
+    monkeypatch_curses = _FakeC()
+    saved = screenio._curses
+    screenio._curses = monkeypatch_curses
+    try:
+        screenio.cob_screen_terminate()
+    finally:
+        screenio._curses = saved
+    assert screenio.cob_screen_initialized == 0
+    assert screenio._stdscr is None
+    assert calls == ["endwin"]
+
+
+def test_convert_key_ppage_ignored_without_extended_status():
+    if screenio._curses is None:  # pragma: no cover - curses present in CI
+        pytest.skip("curses not available")
+    c = screenio._curses
+    # PAGE-UP / PAGE-DOWN / PRINT are zeroed unless COB_SCREEN_EXCEPTIONS is on.
+    assert screenio.cob_extended_status == 0
+    assert screenio.cob_convert_key(c.KEY_PPAGE, False) == 0
+    assert screenio.cob_convert_key(c.KEY_NPAGE, False) == 0
+
+
+def test_convert_key_up_down_ignored_in_field_accept():
+    if screenio._curses is None:  # pragma: no cover
+        pytest.skip("curses not available")
+    c = screenio._curses
+    # Cursor UP/DOWN are ignored during a single-field ACCEPT (field_accept=1)
+    # when extended status is off, but pass through otherwise.
+    assert screenio.cob_convert_key(c.KEY_UP, 1) == 0
+    assert screenio.cob_convert_key(c.KEY_DOWN, 1) == 0
+    assert screenio.cob_convert_key(c.KEY_UP, 0) == c.KEY_UP
+
+
+def test_check_pos_status_numeric_nondisplay_cursor():
+    # A non-DISPLAY numeric CURSOR field is encoded as line*1000 + column.
+    mod = common.cob_module(cursor_pos=numbin4(0))
+    common.cob_current_module = mod
+    screenio.cob_check_pos_status(0, yx=(2, 3))
+    assert move.cob_get_int(mod.cursor_pos) == 2 * 1000 + 3
+
