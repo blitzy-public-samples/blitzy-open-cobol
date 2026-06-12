@@ -1,38 +1,174 @@
-"""Unit tests for :mod:`libcob_py.call`.
+"""Unit tests for :mod:`libcob_py.call` - the pure-Python dynamic CALL loader.
 
-Exercises the pure-Python dynamic CALL loader that replaces the C runtime's
-131-bucket hash plus ``dlopen``/``dlsym`` resolver (``libcob/call.c``) with
-:func:`importlib.import_module`, ``sys.path`` manipulation, and module-cache
-eviction for CANCEL (AAP 0.3.2 "Dynamic loader" / 0.4.1).  Coverage targets:
+``libcob_py/call.py`` replaces the C runtime's 131-bucket name hash plus
+``lt_dlopen``/``lt_dlsym`` resolver (``libcob/call.c``) with
+:func:`importlib.import_module`, ``sys.path`` manipulation (seeded from
+``COB_LIBRARY_PATH``) and ``sys.modules`` eviction for CANCEL (AAP sections
+0.3.2 "Dynamic loader" and 0.4.1).  This suite verifies, against the behaviour
+encoded in ``libcob/call.c``, that:
 
-* ``cob_encode_program_id`` byte-for-byte program-name encoding,
-* ``COB_LOAD_CASE`` folding (``_apply_case``),
-* the search path (``cob_set_library_path``) and the call cache
-  (``lookup`` / ``insert`` / ``cob_set_cancel``),
-* dynamic resolution of a real generated-style module, the not-found path
-  (``EC-PROGRAM-NOT-FOUND``) and the aborting ``*_1`` variants,
-* field-addressed resolution (``cob_call_resolve`` / ``cob_field_cancel``),
-* CANCEL eviction + fresh re-import (``cobcancel``),
-* ``cob_init_call`` env wiring and system-routine registration.
+* program-name encoding (``cob_encode_program_id`` / ``cb_encode_program_id``)
+  and ``COB_LOAD_CASE`` folding (``_apply_case``) are byte-for-byte faithful;
+* the search path (``cob_set_library_path``, ``call.c`` L177-L202) and the call
+  cache (``lookup`` / ``insert`` / ``cob_set_cancel``) behave as the C statics;
+* a generated-style module resolves dynamically, a repeat resolve hits the
+  cache (``importlib.import_module`` is *not* re-invoked), the not-found path
+  raises ``EC-PROGRAM-NOT-FOUND`` and the aborting ``*_1`` variants stop the run
+  unit;
+* field-addressed resolution works (``cob_call_resolve`` / ``cob_field_cancel``);
+* CANCEL evicts from ``sys.modules``, calls :func:`importlib.invalidate_caches`
+  and a subsequent resolve re-imports a *fresh* module (``cobcancel``,
+  ``call.c`` L481-L519);
+* ``cob_init_call`` (``call.c`` L520-L600) wires the environment
+  (``COB_LIBRARY_PATH`` -> ``sys.path``, ``COB_PRE_LOAD`` preloads,
+  ``COB_LOAD_CASE`` folding) and registers the 43 ``CBL_``/``C$`` system
+  routines from :mod:`libcob_py.system` into the resolver;
+* the BY CONTENT / BY VALUE argument-passing wrappers and the ``cob_strdup`` /
+  ``cob_get_buff`` helpers (``call.c`` L165-L213) that the emitter lowers CALL
+  idioms onto behave exactly like their C originals.
 
-Standard library only; ``pytest`` is a development-only framework (AAP 0.5).
+HARD CONSTRAINTS (AAP sections 0.5 / 0.7.1)
+-------------------------------------------
+* **Standard library only.**  ``importlib`` / ``os`` / ``sys`` are standard
+  library; ``pytest`` is a development-only test framework (never a runtime
+  dependency).  No third-party package is imported.
+* **Clean skip when the runtime is absent.**  The module under test is obtained
+  with :func:`pytest.importorskip` at module top level (suite convention,
+  documented in ``conftest.py``).
+* **No state leakage.**  ``call`` keeps module-level resolver state
+  (``_call_cache`` / ``_cancel_handlers`` / ``_resolve_paths`` / ``name_convert``
+  / ``_resolve_error``) and the loader mutates the process-global ``sys.path`` /
+  ``sys.modules``; the autouse :func:`_isolate_call_state` fixture snapshots and
+  restores all of it (plus the touched ``common`` globals) so the dynamic-import
+  tests never leak into sibling test modules.
+* **Fixtures from conftest.**  The dynamic-loader tests consume the shared
+  ``lib_dir`` / ``clean_cob_env`` / ``set_cob_env`` fixtures (``conftest.py``).
 """
+# --- Standard-library imports (stdlib only; no third-party packages) -------
 import importlib
 import os
 import sys
 
 import pytest
 
-libcob_py = pytest.importorskip("libcob_py")
-common = pytest.importorskip("libcob_py.common")
+# --- Runtime under test + its declared in-package dependencies -------------
+# importorskip yields a clean SKIP (not a collection error) when the
+# parallel-built runtime package is not yet importable (conftest convention).
 call = pytest.importorskip("libcob_py.call")
+common = pytest.importorskip("libcob_py.common")
 system = pytest.importorskip("libcob_py.system")
 
 
-# ---------------------------------------------------------------------------
-# Helpers / fixtures
-# ---------------------------------------------------------------------------
-def strfld(text, size=None):
+# ===========================================================================
+# Isolation fixture - snapshot/restore ALL resolver + process global state
+# ===========================================================================
+@pytest.fixture(autouse=True)
+def _isolate_call_state():
+    """Fully isolate the dynamic loader's mutable state around every test.
+
+    ``libcob_py.call`` keeps file-scope statics (mirroring ``call.c``'s
+    ``call_table`` / ``resolve_path`` / ``name_convert`` / ``resolve_error``)
+    and the loader mutates the *process*-global ``sys.path`` and ``sys.modules``
+    when it seeds the search path and imports/evicts program modules.  Without
+    careful teardown a resolved ``DUMMYPROG`` (or a ``"."`` pushed onto
+    ``sys.path``) would leak into sibling test modules.
+
+    This autouse fixture therefore:
+
+    * snapshots ``sys.path`` and the set of loaded ``sys.modules`` keys, plus
+      every ``call`` resolver static and the three ``common`` globals the call
+      paths touch (``cob_initialized`` / ``cob_call_params`` /
+      ``cob_exception_code``);
+    * starts each test from an EMPTY resolver (cache, cancel handlers and
+      resolve paths cleared; ``name_convert`` reset; last error cleared) so the
+      tests are deterministic regardless of execution order;
+    * on teardown evicts any module imported during the test, restores
+      ``sys.path`` verbatim, restores all resolver statics and ``common``
+      globals, and invalidates the import caches.
+    """
+    saved_path = list(sys.path)
+    saved_modules = set(sys.modules)
+    saved_cache = dict(call._call_cache)
+    saved_cancel = dict(call._cancel_handlers)
+    saved_resolve_paths = list(call._resolve_paths)
+    saved_convert = call.name_convert
+    saved_error = call._resolve_error
+    saved_initialized = common.cob_initialized
+    saved_params = common.cob_call_params
+    saved_exc = common.cob_exception_code
+
+    # Deterministic clean slate for the resolver.
+    call._call_cache.clear()
+    call._cancel_handlers.clear()
+    call._resolve_paths = []
+    call.name_convert = 0
+    call._resolve_error = None
+
+    yield
+
+    # Evict anything the test imported (dummy program modules, and any module
+    # the runtime lazily pulled in - e.g. screenio/fileio via _shutdown_runtime
+    # on an abort path); a clean re-import is harmless next time.
+    for name in set(sys.modules) - saved_modules:
+        sys.modules.pop(name, None)
+    sys.path[:] = saved_path
+
+    call._call_cache.clear()
+    call._call_cache.update(saved_cache)
+    call._cancel_handlers.clear()
+    call._cancel_handlers.update(saved_cancel)
+    call._resolve_paths = saved_resolve_paths
+    call.name_convert = saved_convert
+    call._resolve_error = saved_error
+    common.cob_initialized = saved_initialized
+    common.cob_call_params = saved_params
+    common.cob_exception_code = saved_exc
+
+    importlib.invalidate_caches()
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+def _write_dummy_module(directory, modname="DUMMYPROG", *, state=0,
+                        entries=None):
+    """Write a generated-style program module into *directory*.
+
+    The code generator emits one ``.py`` module per COBOL compilation unit whose
+    entry symbol is the *encoded* program-id (see ``cob_encode_program_id``).
+    To resolve robustly regardless of which candidate attribute the loader
+    selects (encoded name, folded module name, or ``main``), the module exposes
+    the entry under *both* the encoded name and ``main``.
+
+    Each entry records its positional arguments in a module-level ``CALLS`` list
+    and returns ``len(args)`` so the call wrappers can be exercised, while a
+    module-level ``STATE`` marker (default ``0``) lets the CANCEL test prove a
+    *fresh* module is re-imported (the in-memory mutation is discarded).
+
+    Returns the :class:`pathlib.Path` of the written file.
+    """
+    if entries is None:
+        entries = (modname, "main")
+    lines = ["STATE = %d" % int(state), "CALLS = []"]
+    for name in entries:
+        lines.append(
+            "def %s(*args):\n"
+            "    CALLS.append(args)\n"
+            "    return len(args)" % name
+        )
+    path = directory / (modname + ".py")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _name_field(text, size=None):
+    """Build an ALPHANUMERIC ``common.cob_field`` carrying a program *name*.
+
+    Used to drive the field-addressed entry points ``cob_call_resolve`` /
+    ``cob_field_cancel``, which read the program name out of a field via
+    ``common.cob_field_to_string`` (trailing spaces/NULs are trimmed, so the
+    field may be right-padded to a fixed width).
+    """
     data = text.encode("latin-1")
     if size is not None:
         data = data.ljust(size, b" ")
@@ -41,88 +177,81 @@ def strfld(text, size=None):
     return common.cob_field(size=len(data), data=bytearray(data), attr=attr)
 
 
-@pytest.fixture(autouse=True)
-def clean_resolver():
-    """Reset the resolver caches and case-fold around every test."""
-    saved_convert = call.name_convert
-    call._call_cache.clear()
-    call._cancel_handlers.clear()
-    call._resolve_error = None
-    call.name_convert = 0
-    yield
-    call._call_cache.clear()
-    call._cancel_handlers.clear()
-    call.name_convert = saved_convert
-
-
-@pytest.fixture
-def module_dir(tmp_path, monkeypatch):
-    """Put *tmp_path* on sys.path and clean up imported test modules."""
-    monkeypatch.syspath_prepend(str(tmp_path))
-    created = set(sys.modules)
-    yield tmp_path
-    for name in set(sys.modules) - created:
-        sys.modules.pop(name, None)
-    importlib.invalidate_caches()
-
-
 # ===========================================================================
-# Program-name encoding (cb_encode_program_id parity)
+# Program-name encoding (cb_encode_program_id parity, typeck.c L621-L646)
 # ===========================================================================
 def test_encode_plain_alnum():
+    """An all-alphanumeric name is its own Python identifier (unchanged)."""
     assert call.cob_encode_program_id("PROG1") == "PROG1"
 
 
 def test_encode_leading_digit():
-    # A leading digit becomes _HH (uppercase hex of the byte).
+    """A leading digit becomes ``_HH`` (uppercase hex of the byte): '1'==0x31."""
     assert call.cob_encode_program_id("1ABC") == "_31ABC"
 
 
 def test_encode_hyphen_becomes_double_underscore():
+    """COBOL '-' maps to '__' (the documented hyphen transform)."""
     assert call.cob_encode_program_id("MY-PROG") == "MY__PROG"
 
 
 def test_encode_special_char():
-    # '.' (0x2E) -> _2E
+    """A non-alnum/underscore char becomes ``_HH``: '.' (0x2E) -> '_2E'."""
     assert call.cob_encode_program_id("A.B") == "A_2EB"
 
 
 def test_encode_empty():
+    """The empty name encodes to the empty string (guard branch)."""
     assert call.cob_encode_program_id("") == ""
 
 
 # ===========================================================================
-# COB_LOAD_CASE folding
+# COB_LOAD_CASE folding (_apply_case, call.c name_convert L394-L408)
 # ===========================================================================
 def test_apply_case_default_is_identity():
+    """name_convert == 0 leaves the name untouched."""
     call.name_convert = 0
     assert call._apply_case("MixedCase") == "MixedCase"
 
 
 def test_apply_case_lower():
+    """name_convert == 1 folds to lower case."""
     call.name_convert = 1
     assert call._apply_case("MixedCase") == "mixedcase"
 
 
 def test_apply_case_upper():
+    """name_convert == 2 folds to upper case."""
     call.name_convert = 2
     assert call._apply_case("MixedCase") == "MIXEDCASE"
 
 
 # ===========================================================================
-# Search path + cache primitives
+# Search path + cache primitives (cob_set_library_path / lookup / insert /
+# cob_set_cancel)
 # ===========================================================================
 def test_set_library_path_prepends_syspath(tmp_path):
+    """The PATHSEP-delimited path is split, recorded, and prepended to sys.path."""
     d1 = str(tmp_path / "one")
     d2 = str(tmp_path / "two")
     os.makedirs(d1, exist_ok=True)
     os.makedirs(d2, exist_ok=True)
     call.cob_set_library_path(d1 + os.pathsep + d2)
     assert d1 in sys.path and d2 in sys.path
+    # Order is preserved (call.c strtok order over resolve_path[]).
     assert call._resolve_paths == [d1, d2]
 
 
+def test_set_library_path_ignores_empty_segments(tmp_path):
+    """Empty path segments (leading/trailing/double separators) are dropped."""
+    d1 = str(tmp_path / "only")
+    os.makedirs(d1, exist_ok=True)
+    call.cob_set_library_path(os.pathsep + d1 + os.pathsep + os.pathsep)
+    assert call._resolve_paths == [d1]
+
+
 def test_lookup_insert_roundtrip():
+    """``insert`` caches an entry that ``lookup`` then returns by identity."""
     def entry():
         return 0
     assert call.lookup("X") is None
@@ -130,15 +259,26 @@ def test_lookup_insert_roundtrip():
     assert call.lookup("X") is entry
 
 
-def test_set_cancel_registers_handler():
+def test_set_cancel_register_refresh_and_none_branch():
+    """cob_set_cancel registers, refreshes only the cancel handler, and the
+    ``cancel is None`` refresh path is a no-op (call.c L302-L320)."""
     def entry():
         return 0
+
     def cancel(*a):
         return 0
+
+    # First registration: not yet cached -> insert entry + cancel.
     call.cob_set_cancel("Y", entry, cancel)
     assert call.lookup("Y") is entry
     assert call._cancel_handlers["Y"] is cancel
-    # A second call only refreshes the cancel handler, keeping the entry.
+
+    # Already cached + cancel is None -> no change (covers the False branch).
+    call.cob_set_cancel("Y", None, None)
+    assert call.lookup("Y") is entry
+    assert call._cancel_handlers["Y"] is cancel
+
+    # Already cached + new cancel -> refresh the handler only, keep the entry.
     def cancel2(*a):
         return 0
     call.cob_set_cancel("Y", None, cancel2)
@@ -147,79 +287,179 @@ def test_set_cancel_registers_handler():
 
 
 # ===========================================================================
-# Dynamic resolution
+# Phase 1 - Dynamic resolution + cache (cob_resolve, call.c L321-L447)
 # ===========================================================================
-def _write_module(directory, modname, entry_name):
-    """Write a generated-style module exposing an int-returning entry function."""
-    path = directory / (modname + ".py")
-    path.write_text(
-        "def %s(*args):\n    return 0\n" % entry_name
-    )
-    return path
+def test_resolve_from_library_path(lib_dir):
+    """A module dropped on COB_LIBRARY_PATH resolves to a callable entry point.
+
+    ``cob_init_call`` reads ``COB_LIBRARY_PATH`` (pointed at *lib_dir* by the
+    fixture) and feeds it into ``sys.path`` so :func:`importlib.import_module`
+    can find the generated module.
+    """
+    _write_dummy_module(lib_dir, "DUMMYPROG")
+    call.cob_init_call()
+    func = call.cob_resolve("DUMMYPROG")
+    assert func is not None and callable(func)
+    # The COB_LIBRARY_PATH directory was fed onto sys.path.
+    assert str(lib_dir) in sys.path
 
 
-def test_resolve_imports_module_and_finds_entry(module_dir):
-    _write_module(module_dir, "PROG1", "PROG1")
-    func = call.cob_resolve("PROG1")
-    assert callable(func)
-    assert func() == 0
-    # Cached on the second resolve.
-    assert call.cob_resolve("PROG1") is func
+def test_resolve_cached(lib_dir, monkeypatch):
+    """A second resolve of the same name hits the cache (no re-import).
+
+    ``importlib.import_module`` is spied (after init, so only the resolve calls
+    are counted): the first resolve imports once and caches; the second returns
+    the identical cached entry without importing again.
+    """
+    _write_dummy_module(lib_dir, "DUMMYPROG")
+    call.cob_init_call()  # seed sys.path from COB_LIBRARY_PATH BEFORE spying
+
+    real_import = importlib.import_module
+    calls = []
+
+    def spy(name, *args, **kwargs):
+        calls.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", spy)
+
+    first = call.cob_resolve("DUMMYPROG")
+    second = call.cob_resolve("DUMMYPROG")
+    assert first is not None
+    assert first is second                       # identical cached entry
+    assert calls.count("DUMMYPROG") == 1         # imported exactly once
 
 
-def test_resolve_encoded_name(module_dir):
-    # 'MY-PROG' -> module 'MY__PROG' with entry 'MY__PROG'.
-    _write_module(module_dir, "MY__PROG", "MY__PROG")
+def test_resolve_encoded_name(lib_dir):
+    """'MY-PROG' resolves through the encoded module name 'MY__PROG'."""
+    _write_dummy_module(lib_dir, "MY__PROG")
+    call.cob_init_call()
     func = call.cob_resolve("MY-PROG")
     assert callable(func)
 
 
-def test_resolve_falls_back_to_main(module_dir):
-    _write_module(module_dir, "PROG2", "main")
+def test_resolve_falls_back_to_main(lib_dir):
+    """When the encoded-name attribute is absent, the loader falls back to main."""
+    _write_dummy_module(lib_dir, "PROG2", entries=("main",))
+    call.cob_init_call()
     func = call.cob_resolve("PROG2")
     assert callable(func)
 
 
-def test_resolve_not_found_sets_exception(module_dir):
+def test_resolve_unknown_error(clean_cob_env):
+    """An unresolvable name returns None, sets EC-PROGRAM-NOT-FOUND and records
+    a resolve error that is cleared on read (call.c not-found path)."""
     common.cob_exception_code = 0
-    func = call.cob_resolve("NOSUCHPROG")
+    func = call.cob_resolve("NO_SUCH_PROGRAM_ZZZ")
     assert func is None
-    assert common.cob_exception_code != 0
-    # error message is recorded and cleared on read
-    err = call.cob_resolve_error()
-    assert err is not None
+    assert common.cob_exception_code != 0          # EC-PROGRAM-NOT-FOUND latched
+    assert call._resolve_error is not None
+    msg = call.cob_resolve_error()
+    assert "NO_SUCH_PROGRAM_ZZZ" in msg
+    # cob_resolve_error returns AND clears the message.
     assert call.cob_resolve_error() is None
 
 
-def test_resolve_no_entry_point(module_dir):
-    # Module exists but exposes no matching entry / main.
-    (module_dir / "PROG3.py").write_text("X = 1\n")
+def test_resolve_no_entry_point(lib_dir):
+    """A module that exposes no entry callable resolves to None."""
+    (lib_dir / "PROG3.py").write_text("X = 1\n")
+    call.cob_init_call()
     assert call.cob_resolve("PROG3") is None
 
 
-def test_resolve_1_aborts_when_missing(module_dir):
+def test_resolve_1_aborts_when_missing(clean_cob_env, capsys):
+    """cob_resolve_1 stops the run unit (SystemExit) on an unresolvable name and
+    reports the resolve error to stderr (call.c L448-L459)."""
     with pytest.raises(SystemExit):
-        call.cob_resolve_1("MISSINGPROG")
+        call.cob_resolve_1("NO_SUCH_PROGRAM_YYY")
+    err = capsys.readouterr().err
+    assert "NO_SUCH_PROGRAM_YYY" in err
 
 
-def test_call_resolve_via_field(module_dir):
-    _write_module(module_dir, "FPROG", "FPROG")
-    func = call.cob_call_resolve(strfld("FPROG", 16))
+# ===========================================================================
+# Field-addressed resolution (cob_call_resolve / cob_call_resolve_1)
+# ===========================================================================
+def test_call_resolve_via_field(lib_dir):
+    """cob_call_resolve reads the program name out of a field and resolves it."""
+    _write_dummy_module(lib_dir, "FPROG")
+    call.cob_init_call()
+    func = call.cob_call_resolve(_name_field("FPROG", 16))
     assert callable(func)
 
 
-def test_call_resolve_1_aborts(module_dir):
+def test_call_resolve_1_aborts(clean_cob_env):
+    """cob_call_resolve_1 aborts (SystemExit) when the field names a ghost."""
     with pytest.raises(SystemExit):
-        call.cob_call_resolve_1(strfld("GHOSTPROG", 16))
+        call.cob_call_resolve_1(_name_field("GHOSTPROG", 16))
+
+
+def test_call_resolve_1_success(lib_dir):
+    """cob_call_resolve_1 returns the entry callable for a resolvable field
+    (the non-aborting success path, call.c L470-L480)."""
+    _write_dummy_module(lib_dir, "FPROG1")
+    call.cob_init_call()
+    func = call.cob_call_resolve_1(_name_field("FPROG1", 16))
+    assert callable(func)
 
 
 # ===========================================================================
-# CANCEL
+# Phase 2 - CANCEL: module-cache eviction + invalidate_caches + fresh reload
+# (cobcancel, call.c L481-L519)
 # ===========================================================================
-def test_cobcancel_runs_handler_and_evicts(module_dir):
-    _write_module(module_dir, "CPROG", "CPROG")
+def test_cancel_reloads_module(lib_dir, monkeypatch):
+    """CANCEL evicts the module, calls invalidate_caches and re-imports fresh.
+
+    The in-memory module's ``STATE`` is mutated after the first resolve; after
+    CANCEL the name is gone from both ``sys.modules`` and the call cache, and a
+    subsequent resolve produces a *different* module object whose ``STATE`` is
+    back to its source value (0) - proving a genuinely fresh import rather than
+    a reuse of the mutated module.  ``importlib.invalidate_caches`` is spied to
+    confirm the cancel path invalidated the import system.
+    """
+    _write_dummy_module(lib_dir, "DUMMYPROG", state=0)
+    call.cob_init_call()
+
+    func = call.cob_resolve("DUMMYPROG")
+    assert func is not None
+    assert "DUMMYPROG" in sys.modules
+    assert call.lookup("DUMMYPROG") is func
+
+    first_mod = sys.modules["DUMMYPROG"]
+    first_mod.STATE = 999                         # mutate the live module
+
+    # Spy importlib.invalidate_caches (call.py looks it up on the importlib
+    # module at call time, so patching the attribute is observed).
+    real_invalidate = importlib.invalidate_caches
+    counter = {"n": 0}
+
+    def spy_invalidate():
+        counter["n"] += 1
+        return real_invalidate()
+
+    monkeypatch.setattr(importlib, "invalidate_caches", spy_invalidate)
+
+    call.cobcancel("DUMMYPROG")
+
+    # Evicted from the import system and the call cache.
+    assert "DUMMYPROG" not in sys.modules
+    assert call.lookup("DUMMYPROG") is None
+    assert counter["n"] >= 1                      # invalidate_caches was called
+
+    # A subsequent resolve re-imports a FRESH module (state reset to source 0).
+    func2 = call.cob_resolve("DUMMYPROG")
+    assert func2 is not None
+    fresh_mod = sys.modules["DUMMYPROG"]
+    assert fresh_mod is not first_mod
+    assert fresh_mod.STATE == 0                   # mutation discarded
+
+
+def test_cobcancel_runs_handler_and_evicts(lib_dir):
+    """A registered cancel handler runs, then the program is uncached/evicted."""
+    _write_dummy_module(lib_dir, "CPROG")
+    call.cob_init_call()
     func = call.cob_resolve("CPROG")
     assert func is not None
+
     flags = {"cancelled": False}
 
     def cancel(*a):
@@ -234,55 +474,171 @@ def test_cobcancel_runs_handler_and_evicts(module_dir):
 
 
 def test_cobcancel_none_name_aborts():
+    """CANCEL of a NULL name is a fatal runtime error (SystemExit)."""
     with pytest.raises(SystemExit):
         call.cobcancel(None)
 
 
-def test_field_cancel(module_dir):
-    _write_module(module_dir, "DPROG", "DPROG")
-    call.cob_resolve("DPROG")
-    call.cob_field_cancel(strfld("DPROG", 16))
-    assert call.lookup("DPROG") is None
-
-
-# ===========================================================================
-# cob_init_call - environment wiring + system-routine registration
-# ===========================================================================
-def test_init_call_registers_system_routines(monkeypatch):
-    monkeypatch.delenv("COB_LOAD_CASE", raising=False)
-    monkeypatch.delenv("COB_PRE_LOAD", raising=False)
-    monkeypatch.setenv("COB_LIBRARY_PATH", ".")
-    call._call_cache.clear()
+def test_field_cancel(lib_dir):
+    """cob_field_cancel reads the name from a field and cancels that program."""
+    _write_dummy_module(lib_dir, "DPROG")
     call.cob_init_call()
-    # Every system routine name should be resolvable from the call cache.
-    assert call.lookup("CBL_AND") is system.CBL_AND
-    assert call.lookup("C$GETPID") is system.cob_acuw_getpid
+    call.cob_resolve("DPROG")
+    assert call.lookup("DPROG") is not None
+    call.cob_field_cancel(_name_field("DPROG", 16))
+    assert call.lookup("DPROG") is None
+    assert "DPROG" not in sys.modules
 
 
-def test_init_call_load_case_lower(monkeypatch):
-    monkeypatch.setenv("COB_LOAD_CASE", "LOWER")
-    monkeypatch.setenv("COB_LIBRARY_PATH", ".")
-    monkeypatch.delenv("COB_PRE_LOAD", raising=False)
+# ===========================================================================
+# Phase 3 - Environment variables (COB_LIBRARY_PATH / COB_PRE_LOAD /
+# COB_LOAD_CASE), wired by cob_init_call (call.c L520-L600)
+# ===========================================================================
+def test_cob_library_path_to_syspath(tmp_path, clean_cob_env, set_cob_env):
+    """COB_LIBRARY_PATH (one or more dirs) is fed onto sys.path by cob_init_call.
+
+    Uses ``clean_cob_env`` for a deterministic baseline and ``set_cob_env`` to
+    set a two-directory ``COB_LIBRARY_PATH`` (OS path separator); after init both
+    directories must be present on ``sys.path`` and recorded as resolve paths.
+    """
+    d1 = tmp_path / "libone"
+    d2 = tmp_path / "libtwo"
+    d1.mkdir()
+    d2.mkdir()
+    set_cob_env("COB_LIBRARY_PATH", str(d1) + os.pathsep + str(d2))
+
+    call.cob_init_call()
+
+    assert str(d1) in sys.path
+    assert str(d2) in sys.path
+    assert str(d1) in call._resolve_paths
+    assert str(d2) in call._resolve_paths
+
+
+def test_cob_pre_load(lib_dir, set_cob_env):
+    """COB_PRE_LOAD modules are imported at startup (present in sys.modules)."""
+    _write_dummy_module(lib_dir, "PRELOADED")
+    set_cob_env("COB_PRE_LOAD", "PRELOADED")
+    call.cob_init_call()
+    assert "PRELOADED" in sys.modules
+
+
+def test_cob_pre_load_missing_module_skipped(lib_dir, set_cob_env):
+    """A COB_PRE_LOAD entry that cannot be imported is silently skipped - no
+    exception escapes (mirrors the C preload loop, call.c L571-L593)."""
+    set_cob_env("COB_PRE_LOAD", "NO_SUCH_PRELOAD_MODULE")
+    call.cob_init_call()                         # must not raise
+    assert "NO_SUCH_PRELOAD_MODULE" not in sys.modules
+
+
+def test_cob_pre_load_empty_entries_skipped(lib_dir, set_cob_env):
+    """Empty COB_PRE_LOAD segments (leading/trailing separators) are skipped."""
+    _write_dummy_module(lib_dir, "PRELOADED")
+    set_cob_env("COB_PRE_LOAD", os.pathsep + "PRELOADED" + os.pathsep)
+    call.cob_init_call()
+    assert "PRELOADED" in sys.modules
+
+
+def test_cob_load_case_upper_resolves_lower_name(lib_dir, set_cob_env):
+    """COB_LOAD_CASE=UPPER folds a lower-case program name during resolution.
+
+    The module file is ``DUMMYPROG.py``; with upper-case folding enabled,
+    resolving the lower-case name ``"dummyprog"`` folds the encoded name to
+    ``DUMMYPROG`` and finds the module.
+    """
+    _write_dummy_module(lib_dir, "DUMMYPROG")
+    set_cob_env("COB_LOAD_CASE", "UPPER")
+    call.cob_init_call()
+    assert call.name_convert == 2
+    func = call.cob_resolve("dummyprog")
+    assert func is not None and callable(func)
+
+
+def test_cob_load_case_lower(clean_cob_env, set_cob_env):
+    """COB_LOAD_CASE=LOWER sets name_convert to 1 during init."""
+    set_cob_env("COB_LOAD_CASE", "LOWER")
     call.cob_init_call()
     assert call.name_convert == 1
 
 
-def test_init_call_load_case_upper(monkeypatch):
-    monkeypatch.setenv("COB_LOAD_CASE", "UPPER")
-    monkeypatch.setenv("COB_LIBRARY_PATH", ".")
-    monkeypatch.delenv("COB_PRE_LOAD", raising=False)
+def test_cob_load_case_upper(clean_cob_env, set_cob_env):
+    """COB_LOAD_CASE=UPPER sets name_convert to 2 during init."""
+    set_cob_env("COB_LOAD_CASE", "UPPER")
     call.cob_init_call()
     assert call.name_convert == 2
 
 
-def test_init_call_pre_load(module_dir, monkeypatch):
-    _write_module(module_dir, "PRELOADED", "PRELOADED")
-    monkeypatch.setenv("COB_PRE_LOAD", "PRELOADED")
-    monkeypatch.setenv("COB_LIBRARY_PATH", str(module_dir))
-    monkeypatch.delenv("COB_LOAD_CASE", raising=False)
-    # Should import the preloaded module without raising.
+def test_cob_load_case_invalid_value_ignored(clean_cob_env, set_cob_env):
+    """A COB_LOAD_CASE value that is neither LOWER nor UPPER leaves folding off
+    (name_convert stays 0), mirroring the C strcasecmp guards (call.c L547-L554)."""
+    set_cob_env("COB_LOAD_CASE", "SOMETHING_ELSE")
     call.cob_init_call()
-    assert "PRELOADED" in sys.modules
+    assert call.name_convert == 0
+
+
+# ===========================================================================
+# Phase 4 - Builtin (system routine) registration (call.c L597-L599)
+# ===========================================================================
+def test_resolve_builtin_cbl_toupper(clean_cob_env):
+    """After init, CBL_TOUPPER resolves to the system routine and upper-cases.
+
+    The 43 ``CBL_``/``C$`` builtins from :mod:`libcob_py.system` are registered
+    into the resolver by ``cob_init_call``; resolving ``"CBL_TOUPPER"`` must
+    return that callable, and driving it must upper-case the supplied buffer
+    in place (only ASCII lower-case letters are folded).
+    """
+    call.cob_init_call()
+    fn = call.cob_resolve("CBL_TOUPPER")
+    assert fn is not None and callable(fn)
+    assert fn is system.CBL_TOUPPER
+
+    buf = bytearray(b"abcDEF")
+    rc = fn(buf, len(buf))
+    assert rc == 0
+    assert bytes(buf) == b"ABCDEF"
+
+
+def test_resolve_builtin_alias_c_toupper(clean_cob_env):
+    """The ACUCOBOL ``C$TOUPPER`` alias resolves to the same callable object."""
+    call.cob_init_call()
+    assert call.cob_resolve("C$TOUPPER") is call.cob_resolve("CBL_TOUPPER")
+
+
+def test_init_registers_all_system_routines(clean_cob_env):
+    """Every row of system.SYSTEM_TABLE is resolvable to its system callable.
+
+    Cross-checks the full 43-entry dispatch contract: after ``cob_init_call``,
+    ``cob_resolve(external_name)`` must return the exact callable named by the
+    table's internal-name mapping for every registered builtin.
+    """
+    call.cob_init_call()
+    checked = 0
+    for ext_name, internal in system.SYSTEM_TABLE.items():
+        fn = getattr(system, internal, None)
+        if fn is None:
+            continue
+        assert call.cob_resolve(ext_name) is fn
+        checked += 1
+    # Sanity: the table is non-trivial (43 rows per system.def).
+    assert checked == len(system.SYSTEM_TABLE)
+
+
+# ===========================================================================
+# Phase 5 - init & helpers (cob_init_call idempotency, env fallbacks)
+# ===========================================================================
+def test_init_call_callable_and_idempotent(clean_cob_env):
+    """cob_init_call is callable and idempotent (a second call must not raise)."""
+    call.cob_init_call()
+    call.cob_init_call()
+    # Builtins remain registered after a repeat init.
+    assert call.lookup("CBL_TOUPPER") is system.CBL_TOUPPER
+
+
+def test_init_call_library_path_unset_uses_default(clean_cob_env):
+    """With COB_LIBRARY_PATH unset, the search path defaults to '.' plus the
+    built-in default (call.c L558-L560)."""
+    call.cob_init_call()
+    assert "." in call._resolve_paths
 
 
 # ===========================================================================
@@ -290,22 +646,21 @@ def test_init_call_pre_load(module_dir, monkeypatch):
 # These materialise the call-argument idioms the emitter lowers from the
 # original C union/cast forms (codegen.c output_call).
 # ===========================================================================
-import sys as _sys
-
-
 class TestContentInt:
+    """cob_content_int - BY CONTENT / BY REFERENCE integer temporary."""
+
     def test_fits_int_is_4_byte_buffer(self):
         b = call.cob_content_int(5, 1)
         assert isinstance(b, bytearray) and len(b) == 4
-        assert int.from_bytes(b, _sys.byteorder) == 5
+        assert int.from_bytes(b, sys.byteorder) == 5
 
     def test_not_fits_int_is_8_byte_buffer(self):
         b = call.cob_content_int(5, 0)
-        assert len(b) == 8 and int.from_bytes(b, _sys.byteorder) == 5
+        assert len(b) == 8 and int.from_bytes(b, sys.byteorder) == 5
 
     def test_negative_twos_complement(self):
         b = call.cob_content_int(-1, 1)
-        assert int.from_bytes(b, _sys.byteorder) == 0xFFFFFFFF
+        assert int.from_bytes(b, sys.byteorder) == 0xFFFFFFFF
 
     def test_buffer_is_writable_by_reference(self):
         b = call.cob_content_int(0, 1)
@@ -314,6 +669,8 @@ class TestContentInt:
 
 
 class TestContentBuffer:
+    """cob_content_buffer - BY CONTENT independent copy."""
+
     def test_independent_copy(self):
         src = bytearray(b"HELLO")
         c = call.cob_content_buffer(memoryview(src)[0:], 5)
@@ -330,6 +687,8 @@ class TestContentBuffer:
 
 
 class TestValueInt:
+    """cob_value_int - BY VALUE numeric reduced to width."""
+
     def test_unsigned_short_wrap(self):
         assert call.cob_value_int(70000, 2, 1) == 70000 & 0xFFFF
 
@@ -347,17 +706,19 @@ class TestValueInt:
 
 
 class TestValueBuffer:
+    """cob_value_buffer - BY VALUE numeric wrapped into a width-N buffer."""
+
     def test_two_byte_native_endian(self):
         vb = call.cob_value_buffer(258, 2, 0)
         assert isinstance(vb, bytearray) and len(vb) == 2
-        assert int.from_bytes(vb, _sys.byteorder) == 258
+        assert int.from_bytes(vb, sys.byteorder) == 258
 
     def test_width_respected(self):
         assert len(call.cob_value_buffer(1, 8, 1)) == 8
 
     def test_negative_twos_complement(self):
         vb = call.cob_value_buffer(-1, 2, 0)
-        assert int.from_bytes(vb, _sys.byteorder) == 0xFFFF
+        assert int.from_bytes(vb, sys.byteorder) == 0xFFFF
 
 
 # ===========================================================================
@@ -394,7 +755,7 @@ class TestStrdup:
 
 
 # ===========================================================================
-# cob_get_buff (call.c L204) - reusable, growable scratch buffer
+# cob_get_buff (call.c L204-L213) - reusable, growable scratch buffer
 # ===========================================================================
 class TestGetBuff:
     def test_returns_zeroed_buffer_of_width(self):
@@ -428,9 +789,9 @@ class TestGetBuff:
 def runtime_initialized():
     """Force common.cob_initialized truthy for cobcall/cobfunc, then restore.
 
-    cobcall publishes ``common.cob_call_params`` (the CALL argument count); this
-    fixture also saves and restores that global so the value never leaks into
-    sibling test modules (e.g. fileio's ``_chk_parms`` count check).
+    cobcall publishes ``common.cob_call_params`` (the CALL argument count); the
+    autouse ``_isolate_call_state`` fixture also snapshots/restores that global,
+    but this fixture makes the per-test intent explicit and self-contained.
     """
     saved_init = common.cob_initialized
     saved_params = common.cob_call_params
@@ -440,33 +801,26 @@ def runtime_initialized():
     common.cob_call_params = saved_params
 
 
-def _write_recorder(directory, modname):
-    """Write a module whose entry records its args and returns their count."""
-    (directory / (modname + ".py")).write_text(
-        "CALLS = []\n"
-        "def %s(*args):\n"
-        "    CALLS.append(args)\n"
-        "    return len(args)\n" % modname
-    )
-
-
-def test_cobcall_resolves_and_invokes(module_dir, runtime_initialized):
-    _write_recorder(module_dir, "RECPROG")
+def test_cobcall_resolves_and_invokes(lib_dir, runtime_initialized):
+    _write_dummy_module(lib_dir, "RECPROG")
+    call.cob_init_call()
     rc = call.cobcall("RECPROG", 2, ["A", "B"])
     assert rc == 2                                  # entry returned len(args)
     assert common.cob_call_params == 2              # parameter count published
     assert sys.modules["RECPROG"].CALLS[-1] == ("A", "B")
 
 
-def test_cobcall_pads_short_argv_with_none(module_dir, runtime_initialized):
-    _write_recorder(module_dir, "PADPROG")
+def test_cobcall_pads_short_argv_with_none(lib_dir, runtime_initialized):
+    _write_dummy_module(lib_dir, "PADPROG")
+    call.cob_init_call()
     rc = call.cobcall("PADPROG", 3, ["X"])
     assert rc == 3
     assert sys.modules["PADPROG"].CALLS[-1] == ("X", None, None)
 
 
-def test_cobcall_none_argv(module_dir, runtime_initialized):
-    _write_recorder(module_dir, "NILPROG")
+def test_cobcall_none_argv(lib_dir, runtime_initialized):
+    _write_dummy_module(lib_dir, "NILPROG")
+    call.cob_init_call()
     rc = call.cobcall("NILPROG", 0, None)
     assert rc == 0
     assert sys.modules["NILPROG"].CALLS[-1] == ()
@@ -490,8 +844,9 @@ def test_cobcall_none_name_stops(runtime_initialized):
         call.cobcall(None, 0, [])
 
 
-def test_cobfunc_calls_then_cancels(module_dir, runtime_initialized):
-    _write_recorder(module_dir, "FUNCPROG")
+def test_cobfunc_calls_then_cancels(lib_dir, runtime_initialized):
+    _write_dummy_module(lib_dir, "FUNCPROG")
+    call.cob_init_call()
     rc = call.cobfunc("FUNCPROG", 1, ["Z"])
     assert rc == 1
     # cobfunc cancels after calling: the module is evicted and the cache cleared.
@@ -506,27 +861,6 @@ def test_cobfunc_not_initialized_stops(monkeypatch):
 
 
 def test_max_cobcall_parms_constant():
+    """The fixed upper bound on CALL arguments mirrors COB_MAX_COBCALL_PARMS."""
     assert call.COB_MAX_COBCALL_PARMS == 16
 
-
-# ===========================================================================
-# cob_init_call - environment fallback branches (AAP 0.7.2)
-# ===========================================================================
-def test_init_call_library_path_unset_uses_default(monkeypatch):
-    # When COB_LIBRARY_PATH is unset, the search path defaults to "." plus the
-    # built-in COB_LIBRARY_PATH (call.c L558-L560).
-    monkeypatch.delenv("COB_LIBRARY_PATH", raising=False)
-    monkeypatch.delenv("COB_PRE_LOAD", raising=False)
-    monkeypatch.delenv("COB_LOAD_CASE", raising=False)
-    call.cob_init_call()
-    assert "." in call._resolve_paths
-
-
-def test_init_call_pre_load_missing_module_skipped(module_dir, monkeypatch):
-    # A COB_PRE_LOAD entry that cannot be imported is silently skipped, exactly
-    # like the C preload loop (call.c L571-L593) - no exception escapes.
-    monkeypatch.setenv("COB_PRE_LOAD", "NO_SUCH_PRELOAD_MODULE")
-    monkeypatch.setenv("COB_LIBRARY_PATH", str(module_dir))
-    monkeypatch.delenv("COB_LOAD_CASE", raising=False)
-    call.cob_init_call()                 # must not raise
-    assert "NO_SUCH_PRELOAD_MODULE" not in sys.modules
