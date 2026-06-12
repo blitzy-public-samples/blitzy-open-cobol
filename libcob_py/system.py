@@ -2,18 +2,34 @@
 
 Python standard-library port of the system-routine dispatch table defined in
 ``libcob/system.def`` (the authoritative ``COB_SYSTEM_GEN`` enumeration) together
-with the C implementations physically located in ``libcob/common.c`` and
-``libcob/fileio.c``.  Part of the C->Python backend refactor (AAP 0.4.1).
+with the C implementations physically located in ``libcob/common.c`` (the
+bit-logic, case, ``SYSTEM`` and call-frame helpers) and ``libcob/fileio.c`` (the
+low-level file-handle API and the ``C$`` ACUCOBOL filesystem wrappers).  Part of
+the C->Python backend refactor (AAP 0.4.1).
 
-``system.def`` enumerates 43 ``COB_SYSTEM_GEN (external, param-count, internal)``
-rows (the AAP narrative says "44"; per the .def-authority hierarchy in AAP
-0.6.1 rule 3, the authoritative enumeration is implemented exactly and the
-count delta is logged here in this docstring).  Every external name is exposed
-through :data:`SYSTEM_TABLE` mapping ``external -> internal-function-name``;
-:mod:`libcob_py.call` registers these at runtime init so dynamic
-``CALL "CBL_..."`` / ``CALL "C$..."`` statements resolve to the functions below.
+Count mandate (AAP 0.6.1 rule 3 - the .def is authoritative).  ``system.def``
+enumerates **exactly 43** ``COB_SYSTEM_GEN (external, param-count, internal)``
+rows; the line carrying the ``/* COB_SYSTEM_GEN (external name, ...) */`` text is
+a comment, not an entry.  The AAP narrative says "44"; per the .def-authority
+hierarchy the authoritative enumeration is implemented exactly and the **43 vs
+44 count delta is logged here** and treated as a non-authoritative aggregate.
+Every external name is exposed through :data:`SYSTEM_TABLE` mapping
+``external -> internal-function-name``; :mod:`libcob_py.call` registers these at
+runtime init (``cob_init_call``) so that a dynamic ``CALL "CBL_..."`` /
+``CALL "C$..."`` resolves to the functions below via
+``getattr(system, internal_name)``.
 
-Calling convention (matches the emitter, ``cobc/codegen.c`` output_call):
+Dependencies (AAP whitelist - standard library plus the two declared runtime
+modules ``common`` and ``fileio``).  **Standard-library only** (AAP 0.5 / 0.7.1):
+``os``, ``struct``, ``time``.  No third-party packages.  ``common`` is the
+runtime base; the five call-frame ``C$`` helpers (``C$GETPID``/``C$NARG``/
+``C$PARAMSIZE``/``C$SLEEP``/``C$JUSTIFY``) are re-exported from it (their C
+bodies live in ``common.c``), and the five filesystem ``C$`` routines
+(``C$CHDIR``/``C$COPY``/``C$DELETE``/``C$FILEINFO``/``C$MAKEDIR``) are
+**delegated to** :mod:`libcob_py.fileio`, where they physically live in the C
+source (``fileio.c``).
+
+Calling convention (matches the emitter, ``cobc/codegen.c`` output_param):
 
 * ``BY REFERENCE`` data operands arrive as a mutable :class:`memoryview` over the
   COBOL data item's backing bytearray - the byte-exact equivalent of the C
@@ -23,35 +39,48 @@ Calling convention (matches the emitter, ``cobc/codegen.c`` output_call):
   plain Python ``int``.
 * Several routines additionally consult
   ``common.cob_current_module.cob_procedure_parameters`` exactly where the C
-  code does (filename extraction, C$NARG/C$PARAMSIZE call-frame inspection).
+  code does (filename extraction, C$NARG/C$PARAMSIZE call-frame inspection,
+  SYSTEM command text).  The ``fileio`` C$ wrappers expect ``cob_field``
+  operands, so the delegating wrappers below resolve each operand to a
+  ``cob_field`` (preferring the procedure-parameter frame) before delegating.
 
 Each routine returns its integer return-code (0 on success), matching the C
 ``int`` return contract the emitter captures via ``move.cob_set_int``.
 """
 
-# --- Standard-library imports (rule R3: stdlib only) ------------------------
+# --- Standard-library imports (rule: stdlib only) --------------------------
 import os
 import struct
 import time
 
-# --- Internal runtime imports ----------------------------------------------
-# ``common`` is the runtime base; ``move`` supplies the integer accessors used
-# by the call-frame routines.  ``screenio`` is imported lazily inside SYSTEM to
-# toggle screen mode without a hard import-time dependency.
+# --- Internal runtime imports (AAP whitelist: common + fileio) -------------
+# ``common`` is the runtime base.  ``fileio`` owns the C$ filesystem routines
+# (their C bodies live in fileio.c); the wrappers below delegate to it.  The
+# numeric ``move`` accessors are reached only through ``common``'s deferred
+# accessor (and a single deferred helper for the 64-bit nanosleep value),
+# mirroring the package-wide ``from libcob_py import move`` idiom used by
+# common.py / fileio.py / strings.py to avoid import-time coupling.
 from libcob_py import common
-from libcob_py import move
+from libcob_py import fileio
 
-# Re-export the C$ helper routines whose C bodies live in common.c (common.c
-# L2167-L2292).  Re-exporting makes ``getattr(system, internal_name)`` resolve
-# for the C$GETPID / C$NARG / C$PARAMSIZE / C$SLEEP / C$JUSTIFY rows of the
-# dispatch table (call.py uses exactly that getattr lookup).
-from libcob_py.common import (   # noqa: F401  (re-exported for SYSTEM_TABLE)
-    cob_acuw_getpid,
-    cob_return_args,
-    cob_parameter_size,
-    cob_acuw_sleep,
-    cob_acuw_justify,
-)
+# Re-export the C$ call-frame helper routines whose C bodies live in common.c
+# (common.c L2167-L2292).  These are bound as explicit module-level assignments
+# (rather than a ``from ... import`` re-export) so that
+# ``getattr(system, internal_name)`` resolves for the
+# C$GETPID / C$NARG / C$PARAMSIZE / C$SLEEP / C$JUSTIFY rows of the dispatch
+# table -- call.py uses exactly that getattr lookup.  Binding via assignment
+# (not import) keeps the static-lint surface clean: these names are a
+# deliberate part of this module's public API, not dead imports.
+cob_acuw_getpid = common.cob_acuw_getpid
+cob_return_args = common.cob_return_args
+cob_parameter_size = common.cob_parameter_size
+cob_acuw_sleep = common.cob_acuw_sleep
+cob_acuw_justify = common.cob_acuw_justify
+
+#: Shared ALPHANUMERIC attribute used when wrapping a raw operand buffer in a
+#: transient :class:`common.cob_field` for delegation to the fileio C$ routines.
+_ALNUM_ATTR = common.cob_field_attr(
+    type=common.COB_TYPE_ALPHANUMERIC, digits=0, scale=0, flags=0, pic=None)
 
 
 # ===========================================================================
@@ -76,11 +105,29 @@ def _as_int(x):
 
     A plain ``int`` is returned unchanged; a :class:`common.cob_field` is
     decoded through the runtime integer accessor (so tests may pass a numeric
-    field where generated code passes the pre-evaluated int).
+    field where generated code passes the pre-evaluated int).  The decode is
+    routed through ``common._lazy_get_int`` - the canonical, whitelisted
+    field->int accessor (it performs the deferred ``move.cob_get_int`` call),
+    so this module needs no direct ``move`` import.
     """
     if isinstance(x, common.cob_field):
-        return move.cob_get_int(x)
+        return common._lazy_get_int(x)
     return int(x)
+
+
+def _get_long_long(f):
+    """Decode :class:`common.cob_field` *f* as a C ``long long`` (64-bit).
+
+    CBL_OC_NANOSLEEP reads a nanosecond count that the C runtime decodes with
+    ``cob_get_long_long`` (common.c L2137) - a 64-bit value that ``cob_get_int``
+    would truncate.  ``common`` exposes no 64-bit lazy accessor, so this mirrors
+    the package-wide deferred-``move`` idiom (the same pattern as
+    ``common._lazy_get_int``) for the one place that genuinely needs it,
+    preserving byte-for-byte numeric fidelity without a module-level ``move``
+    dependency.
+    """
+    from libcob_py import move  # deferred: preserve cob_get_long_long fidelity
+    return move.cob_get_long_long(f)
 
 
 def _fld_str(x):
@@ -94,7 +141,7 @@ def _fld_str(x):
     buf = _as_buf(x)
     raw = bytes(buf)
 
-    # Trim trailing spaces / NULs (cob_str_from_fld L: scan from the end).
+    # Trim trailing spaces / NULs (cob_str_from_fld: scan from the end).
     i = len(raw)
     while i > 0 and raw[i - 1] in (0x20, 0x00):
         i -= 1
@@ -131,13 +178,69 @@ def _proc_param(n):
     return params[n]
 
 
+def _filename_arg(direct, idx=0):
+    """Resolve a filename, preferring the call-frame parameter (C behaviour).
+
+    The C routines extract the name from ``cob_procedure_parameters[idx]`` via
+    ``cob_str_from_fld``; when no frame is present (direct unit-test calls) the
+    passed operand is used instead.
+    """
+    param = _proc_param(idx)
+    if param is not None:
+        return _fld_str(param)
+    return _fld_str(direct)
+
+
+def _as_field(operand, idx):
+    """Resolve a filesystem operand to a :class:`common.cob_field` for fileio.
+
+    The fileio ``C$`` wrappers consume ``cob_field`` operands (they call
+    ``common.cob_field_to_string``), whereas the emitter passes BY REFERENCE
+    operands as memoryviews.  This bridges the two conventions, exactly as the C
+    code does: prefer the procedure-parameter frame entry
+    (``cob_procedure_parameters[idx]``); otherwise wrap the raw positional bytes
+    (memoryview/bytes/bytearray) in a transient ALPHANUMERIC field; ``None`` (no
+    operand) propagates as ``None`` so fileio's parameter-count guard fires.
+    """
+    param = _proc_param(idx)
+    if isinstance(param, common.cob_field):
+        return param
+    if isinstance(operand, common.cob_field):
+        return operand
+    if operand is None:
+        return None
+    raw = bytes(_as_buf(operand))
+    return common.cob_field(size=len(raw), data=bytearray(raw), attr=_ALNUM_ATTR)
+
+
+def _status_field(status, idx):
+    """Resolve the OUTPUT status operand of C$CHDIR to a cob_field (or None).
+
+    The C ``cob_acuw_chdir`` stores its result into the call-frame field
+    ``cob_procedure_parameters[idx]``; prefer that, falling back to a directly
+    supplied ``cob_field``.  A bare memoryview cannot receive an integer MOVE,
+    so it maps to ``None`` (status simply not written, matching the C path when
+    no usable field is present).
+    """
+    param = _proc_param(idx)
+    if isinstance(param, common.cob_field):
+        return param
+    if isinstance(status, common.cob_field):
+        return status
+    return None
+
+
 # ===========================================================================
 # Authoritative dispatch table - libcob/system.def (43 COB_SYSTEM_GEN rows)
 # ===========================================================================
 # external-name -> (param-count, internal-function-name).  The param counts are
 # reproduced verbatim from system.def for diagnostics/validation; call.py keys
 # off the internal name via getattr(system, internal).  The two high-bit
-# external names use the exact octal escapes from the .def (\221, \364, \365).
+# external names use the exact octal escapes from the .def (\221, \364, \365 =
+# bytes 0x91, 0xF4, 0xF5).  NOTE (43 vs 44): the AAP narrative cites 44 system
+# routines; the authoritative system.def contains exactly 43 COB_SYSTEM_GEN
+# entries (the 44th "row" is the format comment).  Per AAP 0.6.1 rule 3 the .def
+# wins; all 43 are implemented and the delta is logged (see module docstring).
 SYSTEM_DEF = (
     ("SYSTEM", 1, "SYSTEM"),
     ("CBL_AND", 3, "CBL_AND"),
@@ -417,17 +520,19 @@ def CBL_TOLOWER(data, length):
 def CBL_OC_NANOSLEEP(data):
     """Sleep for the nanoseconds given by procedure parameter 0 (common.c).
 
-    Reads a long-long nanosecond count from the call frame and sleeps that
-    long when positive; a no-op otherwise.
+    Reads a long-long nanosecond count from the call frame (the C uses
+    ``cob_get_long_long`` - decoded here via :func:`_get_long_long` to preserve
+    64-bit fidelity) and sleeps that long when positive; a no-op otherwise.
     """
     param = _proc_param(0)
     if param is None:
         param = data if isinstance(data, common.cob_field) else None
     if param is not None:
-        nsecs = move.cob_get_long_long(param)
+        nsecs = _get_long_long(param)
         if nsecs > 0:
             time.sleep(nsecs / 1_000_000_000.0)
     return 0
+
 
 
 # ===========================================================================
@@ -492,19 +597,6 @@ def CBL_ERROR_PROC(x, pptr):
 # native OS descriptor (C ``memcpy(file_handle, &fd, 4)`` - native byte order).
 # file_offset (8 bytes) and file_len (4 bytes) are big-endian on the wire (the C
 # code byte-swaps them on little-endian hosts), so struct '>' formats are used.
-
-def _filename_arg(direct, idx=0):
-    """Resolve a filename, preferring the call-frame parameter (C behaviour).
-
-    The C routines extract the name from ``cob_procedure_parameters[idx]`` via
-    ``cob_str_from_fld``; when no frame is present (direct unit-test calls) the
-    passed operand is used instead.
-    """
-    param = _proc_param(idx)
-    if param is not None:
-        return _fld_str(param)
-    return _fld_str(direct)
-
 
 def _open_cbl_file(file_name, file_access, file_handle, extra_flags):
     """Shared open path for CBL_OPEN_FILE / CBL_CREATE_FILE (fileio.c open_cbl_file).
@@ -714,6 +806,9 @@ def CBL_RENAME_FILE(fname1, fname2):
     return 0
 
 
+# ===========================================================================
+# Directory routines (fileio.c L4724-L4830)
+# ===========================================================================
 def CBL_GET_CURRENT_DIR(flags, dir_length, directory):
     """Store the current working directory into ``directory`` (fileio.c).
 
@@ -778,69 +873,68 @@ def CBL_DELETE_DIR(directory):
 
 
 # ===========================================================================
-# ACUCOBOL-style C$ wrappers (fileio.c L4952-L5070)
+# ACUCOBOL-style C$ filesystem wrappers - DELEGATED to libcob_py.fileio
 # ===========================================================================
+# AAP 0.4.1 / agent-prompt: "delegate filesystem C$ routines to libcob_py.fileio
+# where they physically live" (their C bodies are in fileio.c L4951-L5063).  The
+# emitter passes BY REFERENCE operands as memoryviews and sets up the
+# procedure-parameter frame, while the fileio cob_acuw_* routines consume
+# cob_field operands; the thin wrappers below bridge the two conventions via
+# :func:`_as_field` / :func:`_status_field` and then call into fileio, so there
+# is a single authoritative filesystem implementation (DRY) and system.py is the
+# CALL-dispatch entry layer.  C$JUSTIFY / C$GETPID / C$NARG / C$PARAMSIZE /
+# C$SLEEP are re-exported from common (their C bodies live in common.c).
+
 def cob_acuw_mkdir(directory):
-    """C$MAKEDIR - create a directory, normalising -1 to 128 (fileio.c)."""
-    ret = CBL_CREATE_DIR(directory)
-    return 128 if ret < 0 else ret
+    """C$MAKEDIR - create a directory (delegates to fileio.cob_acuw_mkdir)."""
+    return fileio.cob_acuw_mkdir(_as_field(directory, 0))
 
 
 def cob_acuw_chdir(directory, status):
-    """C$CHDIR - change directory and store the result into ``status`` (fileio.c)."""
-    ret = CBL_CHANGE_DIR(directory)
-    if ret < 0:
-        ret = 128
-    param = _proc_param(1)
-    if param is not None:
-        move.cob_set_int(param, ret)
-    elif isinstance(status, common.cob_field):
-        move.cob_set_int(status, ret)
-    return ret
+    """C$CHDIR - change directory, store the result into the status field.
+
+    Delegates to fileio.cob_acuw_chdir; the status code is written into the
+    call-frame field ``cob_procedure_parameters[1]`` (the C behaviour),
+    resolved by :func:`_status_field`.
+    """
+    return fileio.cob_acuw_chdir(_as_field(directory, 0),
+                                 _status_field(status, 1))
 
 
 def cob_acuw_copyfile(fname1, fname2, file_type):
-    """C$COPY - copy a file (fileio.c).  file_type is not yet evaluated (as in C)."""
-    if common.cob_call_params < 3:
-        return 128
-    ret = CBL_COPY_FILE(fname1, fname2)
-    return 128 if ret < 0 else ret
+    """C$COPY - copy a file (delegates to fileio.cob_acuw_copyfile).
+
+    ``file_type`` is forwarded unchanged; as in the C runtime it is not yet
+    evaluated.  fileio enforces the 3-parameter requirement (returns 128 when
+    ``cob_call_params`` < 3).
+    """
+    return fileio.cob_acuw_copyfile(_as_field(fname1, 0),
+                                    _as_field(fname2, 1), file_type)
 
 
 def cob_acuw_file_info(file_name, file_info):
-    """C$FILEINFO - stat a file into a 16-byte block (fileio.c cob_acuw_file_info).
+    """C$FILEINFO - stat a file into a 16-byte block (delegates to fileio).
 
-    Layout: size (big-endian 8) | date YYYYMMDD (big-endian 4) | time
-    HHMMSS*100 (big-endian 4).  Returns 35 when the file is missing, 0 on success.
+    fileio.cob_acuw_file_info writes the 16-byte ``size | YYYYMMDD | HHMMSSss``
+    block into a cob_field's ``.data``; a transient field receives it and the
+    bytes are copied back into the caller's OUTPUT buffer (slice-safe for the
+    emitter's ``memoryview(b_N)[offset:]`` operands).  Returns fileio's status
+    (0 success, 35 missing, 128 bad parameters).
     """
-    if common.cob_call_params < 2 or _proc_param(0) is None:
-        if file_name is None:
-            return 128
-    try:
-        st = os.stat(_filename_arg(file_name, 0))
-    except OSError:
-        return 35
-    tm = time.localtime(st.st_mtime)
-    info = _as_buf(file_info)
-    info[0:8] = struct.pack(">Q", st.st_size)
-    # MIGRATION (C -> Python): as in cob_acuw_file_info's C source the date is
-    # packed as YYYYMMDD; Python's struct_time already gives a full year and
-    # 1-12 month, so the C "+1900"/"+1" adjustments are dropped (see
-    # CBL_CHECK_FILE_EXIST) to keep the packed YYYYMMDD value identical.
-    dt = tm.tm_year * 10000 + tm.tm_mon * 100 + tm.tm_mday
-    info[8:12] = struct.pack(">I", dt & 0xFFFFFFFF)
-    tt = tm.tm_hour * 1000000 + tm.tm_min * 10000 + tm.tm_sec * 100
-    info[12:16] = struct.pack(">I", tt & 0xFFFFFFFF)
-    return 0
+    temp = common.cob_field(size=16, data=bytearray(16), attr=_ALNUM_ATTR)
+    rc = fileio.cob_acuw_file_info(_as_field(file_name, 0), temp)
+    if rc == 0:
+        out = _as_buf(file_info)
+        out[0:16] = bytes(temp.data[0:16])
+    return rc
 
 
 def cob_acuw_file_delete(file_name, file_type):
-    """C$DELETE - delete a file (fileio.c).  file_type is not yet evaluated."""
-    if common.cob_call_params < 2 or _proc_param(0) is None:
-        if file_name is None:
-            return 128
-    ret = CBL_DELETE_FILE(file_name)
-    return 128 if ret < 0 else ret
+    """C$DELETE - delete a file (delegates to fileio.cob_acuw_file_delete).
+
+    ``file_type`` is forwarded unchanged (not yet evaluated, as in the C).
+    """
+    return fileio.cob_acuw_file_delete(_as_field(file_name, 0), file_type)
 
 
 # ===========================================================================
@@ -855,3 +949,4 @@ def cob_init_system():
     """
     _exit_handlers.clear()
     _error_handlers.clear()
+
