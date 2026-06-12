@@ -804,3 +804,229 @@ class TestEdgeCases:
         strings.cob_inspect_characters(cnt)
         strings.cob_inspect_finish()
         assert cval(cnt) == 2
+
+
+# ===========================================================================
+# Agent-prompt checklist tests (explicit, named exactly as the file
+# specification enumerates them in Phases 1-5).  These provide direct,
+# 1:1 traceability from each required checklist item to a passing test.
+# They reuse the module-level field helpers (``alnum`` / ``counter`` / ``cval``
+# / ``text_of``) and drive the documented ``init -> ... -> finish`` call
+# protocol of :mod:`libcob_py.strings` exactly as the cobc emitter generates it.
+# The broader behavioural matrix above (TestInspect*/TestString/TestUnstring/
+# TestEdgeCases) remains the primary coverage; this class guarantees the
+# specification's named scenarios are each present and green.
+# ===========================================================================
+class TestAgentPromptChecklist:
+    # ----- Phase 1 - INSPECT TALLYING ------------------------------------
+    def test_inspect_tallying_all(self):
+        # INSPECT "AABAA" TALLYING cnt FOR ALL "A" -> 4.
+        var = alnum("AABAA")
+        cnt = counter(value=0)
+        strings.cob_inspect_init(var, 0)
+        strings.cob_inspect_start()
+        strings.cob_inspect_all(cnt, alnum("A"))
+        strings.cob_inspect_finish()
+        assert cval(cnt) == 4
+
+    def test_inspect_tallying_leading(self):
+        # INSPECT "AABAA" TALLYING cnt FOR LEADING "A" -> 2 (the leading run).
+        var = alnum("AABAA")
+        cnt = counter(value=0)
+        strings.cob_inspect_init(var, 0)
+        strings.cob_inspect_start()
+        strings.cob_inspect_leading(cnt, alnum("A"))
+        strings.cob_inspect_finish()
+        assert cval(cnt) == 2
+
+    def test_inspect_tallying_characters_before_after(self):
+        # CHARACTERS BEFORE INITIAL "B" in "AABAA" -> the "AA" prefix = 2;
+        # CHARACTERS AFTER INITIAL "B" -> the trailing "AA" = 2.  Asserts that
+        # the BEFORE/AFTER region boundaries are honoured.
+        var_before = alnum("AABAA")
+        cnt_before = counter(value=0)
+        strings.cob_inspect_init(var_before, 0)
+        strings.cob_inspect_start()
+        strings.cob_inspect_before(alnum("B"))
+        strings.cob_inspect_characters(cnt_before)
+        strings.cob_inspect_finish()
+        assert cval(cnt_before) == 2
+
+        var_after = alnum("AABAA")
+        cnt_after = counter(value=0)
+        strings.cob_inspect_init(var_after, 0)
+        strings.cob_inspect_start()
+        strings.cob_inspect_after(alnum("B"))
+        strings.cob_inspect_characters(cnt_after)
+        strings.cob_inspect_finish()
+        assert cval(cnt_after) == 2
+
+    # ----- Phase 2 - INSPECT REPLACING & CONVERTING ----------------------
+    def test_inspect_replacing_all(self):
+        # INSPECT "AABAA" REPLACING ALL "A" BY "X" -> "XXBXX".
+        var = alnum("AABAA")
+        strings.cob_inspect_init(var, 1)
+        strings.cob_inspect_start()
+        strings.cob_inspect_all(alnum("X"), alnum("A"))
+        strings.cob_inspect_finish()
+        assert text_of(var) == "XXBXX"
+
+    def test_inspect_replacing_first_leading(self):
+        # FIRST replaces only the first occurrence; LEADING replaces the
+        # leading run only - both partial replacements.
+        var_first = alnum("AABAA")
+        strings.cob_inspect_init(var_first, 1)
+        strings.cob_inspect_start()
+        strings.cob_inspect_first(alnum("X"), alnum("A"))
+        strings.cob_inspect_finish()
+        assert text_of(var_first) == "XABAA"
+
+        var_leading = alnum("AABAA")
+        strings.cob_inspect_init(var_leading, 1)
+        strings.cob_inspect_start()
+        strings.cob_inspect_leading(alnum("X"), alnum("A"))
+        strings.cob_inspect_finish()
+        assert text_of(var_leading) == "XXBAA"
+
+    def test_inspect_converting(self):
+        # CONVERTING "abc" TO "ABC": a translate table over the subject
+        # (lowercase a/b/c -> uppercase A/B/C); other bytes are untouched.
+        var = alnum("abcXabc")
+        strings.cob_inspect_init(var, 0)
+        strings.cob_inspect_start()
+        strings.cob_inspect_converting(alnum("abc"), alnum("ABC"))
+        strings.cob_inspect_finish()
+        assert text_of(var) == "ABCXABC"
+
+    # ----- Phase 3 - STRING ----------------------------------------------
+    def test_string_basic(self):
+        # STRING "AB", "CD" DELIMITED BY SIZE INTO PIC X(10) (initialised to
+        # spaces) -> "ABCD      ", with WITH POINTER advanced to 5 (1-based).
+        dst = alnum(" ", size=10)
+        ptr = counter(digits=2, value=1)
+        strings.cob_string_init(dst, ptr)
+        strings.cob_string_delimited(None)            # DELIMITED BY SIZE
+        strings.cob_string_append(alnum("AB"))
+        strings.cob_string_append(alnum("CD"))
+        strings.cob_string_finish()
+        assert text_of(dst) == "ABCD      "
+        assert cval(ptr) == 5                         # 4 bytes written -> next = 5
+        assert common.cob_exception_code == 0
+
+    def test_string_delimited_value(self):
+        # DELIMITED BY "/" truncates each source at the delimiter: "AB/Z" -> "AB"
+        # and "CD/Q" -> "CD", giving "ABCD" then space filler.
+        dst = alnum(" ", size=6)
+        strings.cob_string_init(dst, None)
+        strings.cob_string_delimited(alnum("/"))
+        strings.cob_string_append(alnum("AB/Z"))
+        strings.cob_string_append(alnum("CD/Q"))
+        strings.cob_string_finish()
+        assert text_of(dst) == "ABCD  "
+
+    def test_string_overflow(self):
+        # Concatenation exceeding the target raises ON OVERFLOW and sets
+        # EC-OVERFLOW-STRING (0x0A02); the target is filled to its end.
+        dst = alnum(" ", size=4)
+        strings.cob_string_init(dst, None)
+        strings.cob_string_delimited(None)
+        strings.cob_string_append(alnum("ABCDEF"))    # only 4 fit
+        strings.cob_string_finish()
+        assert text_of(dst) == "ABCD"
+        assert common.cob_exception_code == 0x0A02
+
+    # ----- Phase 4 - UNSTRING --------------------------------------------
+    def test_unstring_basic(self):
+        # UNSTRING "A,B,C" DELIMITED BY "," INTO three receivers -> "A","B","C";
+        # TALLYING records the 3 receiving items filled.
+        src = alnum("A,B,C")
+        r1 = alnum(".", size=1)
+        r2 = alnum(".", size=1)
+        r3 = alnum(".", size=1)
+        tally = counter(value=0)
+        strings.cob_unstring_init(src, None, 1)
+        strings.cob_unstring_delimited(alnum(","), 0)
+        strings.cob_unstring_into(r1, None, None)
+        strings.cob_unstring_into(r2, None, None)
+        strings.cob_unstring_into(r3, None, None)
+        strings.cob_unstring_tallying(tally)
+        strings.cob_unstring_finish()
+        assert (text_of(r1), text_of(r2), text_of(r3)) == ("A", "B", "C")
+        assert cval(tally) == 3
+
+    def test_unstring_all_delimiter(self):
+        # DELIMITED BY ALL "," collapses the consecutive ",,," run in "AB,,,CD"
+        # into a single separator -> "AB","CD".
+        src = alnum("AB,,,CD")
+        r1 = alnum(".", size=2)
+        r2 = alnum(".", size=2)
+        strings.cob_unstring_init(src, None, 1)
+        strings.cob_unstring_delimited(alnum(","), 1)   # ALL
+        strings.cob_unstring_into(r1, None, None)
+        strings.cob_unstring_into(r2, None, None)
+        strings.cob_unstring_finish()
+        assert (text_of(r1), text_of(r2)) == ("AB", "CD")
+
+    def test_unstring_all_multibyte_delimiter_runs_past_end(self):
+        # DELIMITED BY ALL with a 2-byte delimiter whose swallow loop reaches a
+        # point with fewer than 2 bytes remaining exercises the "delimiter would
+        # run past the source end" break inside the ALL collapse: "AB:::" ALL
+        # "::" yields "AB", then the lone trailing ":" remains as data.
+        src = alnum("AB:::")
+        r1 = alnum(".", size=2)
+        r2 = alnum(".", size=2)
+        strings.cob_unstring_init(src, None, 1)
+        strings.cob_unstring_delimited(alnum("::"), 1)   # ALL
+        strings.cob_unstring_into(r1, None, None)
+        strings.cob_unstring_into(r2, None, None)
+        strings.cob_unstring_finish()
+        assert text_of(r1) == "AB"
+        # The lone trailing ':' is data; cob_memcpy left-justifies it into the
+        # 2-byte receiver and space-fills the remainder (-> ": ").
+        assert text_of(r2) == ": "
+
+    def test_unstring_count_delimiter_in(self):
+        # COUNT IN receives the source-character count moved (4 for "ABCD");
+        # DELIMITER IN receives the matched delimiter (",").
+        src = alnum("ABCD,EF")
+        r1 = alnum(".", size=6)
+        dlm = alnum(".", size=1)
+        cnt = counter(value=0)
+        strings.cob_unstring_init(src, None, 1)
+        strings.cob_unstring_delimited(alnum(","), 0)
+        strings.cob_unstring_into(r1, dlm, cnt)
+        assert text_of(r1) == "ABCD  "    # left-justified, space-filled receiver
+        assert text_of(dlm) == ","
+        assert cval(cnt) == 4
+
+    def test_unstring_overflow(self):
+        # More fields than receivers: only the first field is extracted and
+        # source characters remain, so ON OVERFLOW fires with
+        # EC-OVERFLOW-UNSTRING (0x0A03).
+        src = alnum("AB,CD,EF")
+        r1 = alnum(".", size=2)
+        strings.cob_unstring_init(src, None, 1)
+        strings.cob_unstring_delimited(alnum(","), 0)
+        strings.cob_unstring_into(r1, None, None)
+        strings.cob_unstring_finish()
+        assert text_of(r1) == "AB"
+        assert common.cob_exception_code == 0x0A03
+
+    # ----- Phase 5 - initialisation --------------------------------------
+    def test_init_strings_callable(self):
+        # ``cob_init_strings()`` must be callable without arguments or error and
+        # must leave the subsystem in a clean baseline (no pending exception).
+        common.cob_exception_code = 0
+        result = strings.cob_init_strings()
+        assert result is None
+        assert common.cob_exception_code == 0
+        # A subsequent INSPECT runs correctly after a re-init, proving the reset
+        # left usable state.
+        var = alnum("ZZZ")
+        cnt = counter(value=0)
+        strings.cob_inspect_init(var, 0)
+        strings.cob_inspect_start()
+        strings.cob_inspect_all(cnt, alnum("Z"))
+        strings.cob_inspect_finish()
+        assert cval(cnt) == 3
+
