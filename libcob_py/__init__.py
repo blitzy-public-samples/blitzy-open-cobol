@@ -1,9 +1,21 @@
 """libcob_py - Pure-Python runtime package for GNU Cobol (OpenCOBOL).
 
-This is the Python replacement for the C ``libcob`` shared library.  It is the
-runtime targeted by the rewritten code emitter (``cobc/codegen.c``): every
-``cob_*`` call-site emitted for a compiled COBOL program resolves to a function
-in one of the ``libcob_py`` sub-modules.
+This is the pure-standard-library Python facade that **replaces the C
+``libcob.so`` shared library**.  It is the runtime targeted by the rewritten
+code emitter (``cobc/codegen.c``): every ``cob_*`` call-site emitted for a
+compiled COBOL program resolves to a function in one of the ``libcob_py``
+sub-modules.
+
+Design reference / API authority
+--------------------------------
+The public runtime surface mirrored by this package is defined by
+``libcob/common.h`` - the umbrella header that declares the ``cob_*`` / ``COB_*``
+API the original C ``libcob`` exported (e.g. ``cob_init`` at common.h L856 and
+``cobinit`` at common.h L896).  The root ``libcob.h`` umbrella header is just
+``#include <gmp.h>`` + ``#include <libcob/common.h>``; the GMP include is
+intentionally **dropped** here because numeric arithmetic is provided by the
+standard-library :mod:`decimal` module (AAP sections 0.3.3 / 0.5), so this
+package introduces ZERO third-party dependencies.
 
 Runtime facade (AAP sections 0.3.2 "Runtime API facade" and 0.4.1)
 ------------------------------------------------------------------
@@ -34,6 +46,13 @@ L784-L790); ``screenio`` initialises lazily on first ACCEPT/DISPLAY and the
 Standard library only - this package introduces ZERO third-party dependencies
 (AAP sections 0.5 / 0.7.1).
 """
+
+# ---------------------------------------------------------------------------
+# Package metadata.  ``__version__`` is kept in lock-step with the
+# ``version`` field declared in ``libcob_py/pyproject.toml`` (AAP 0.4.1) and
+# tracks the GNU Cobol release this runtime corresponds to (1.1.0).
+# ---------------------------------------------------------------------------
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Eager, ordered sub-module imports (the facade load order).
