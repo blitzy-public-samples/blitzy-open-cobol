@@ -1,38 +1,84 @@
-# Package manifest for the pure-Python GNU Cobol runtime (libcob_py).
+# =============================================================================
+# Package manifest for the pure-Python GNU Cobol runtime  (libcob_py)
+# =============================================================================
 #
-# This is the build/packaging descriptor for the Python replacement of the C
-# ``libcob`` shared library, created for the C->Python backend refactor
-# (AAP sections 0.2.1, 0.4.1, 0.5.3).  It declares a standard ``setuptools``
-# build backend and pins the minimum interpreter to CPython 3.11, matching the
-# ``COB_PYTHON``/``python3>=3.11`` requirement detected by ``configure.ac`` and
-# the ``requires-python`` contract referenced throughout the plan.
+# MIGRATION (C -> Python):  This manifest is the setuptools build/packaging
+# descriptor for the *new* Python runtime package "libcob_py" that REPLACES the
+# C runtime shared object "libcob" (libcob/libcob.la, no longer built) as part
+# of the C -> Python backend refactor.  It is created from scratch (it has no
+# source equivalent) per AAP sections 0.2.1, 0.4.1, 0.5.1 and 0.5.3.
 #
-# HARD CONSTRAINT (AAP 0.5 / 0.7.1): the runtime is *standard library only* and
-# therefore declares ZERO runtime dependencies.  ``coverage`` is a development /
-# test-only tool (the >=80% coverage gate) and is intentionally NOT a runtime
-# dependency; it lives in the optional ``test`` extra below.
+# It is the packaging companion to two sibling mechanisms that MUST stay in
+# agreement on the package name and module layout (AAP 0.4.1 "Coordination"):
+#   * libcob_py/Makefile.am  - installs/distributes the same modules and builds
+#                              the self-contained "dist/libcob_py.pyz" archive
+#                              with the standard-library "zipapp" module.
+#   * configure.ac           - detects COB_PYTHON (CPython >= 3.11) and performs
+#                              a build-time `python3 -c "import libcob_py"`
+#                              check; this manifest's `requires-python = ">=3.11"`
+#                              agrees with that gate (AAP 0.5.3 / 0.7.2).
+#
+# HARD CONSTRAINT (AAP 0.5 / 0.7.1) -- STANDARD LIBRARY ONLY:
+#   The runtime is pure Python standard library with ZERO third-party packages.
+#   The `[project].dependencies` array below is therefore intentionally EMPTY.
+#   The GMP-equivalent arbitrary-precision need is met entirely by the stdlib
+#   `decimal` module (AAP 0.3.3), so no third-party requirement is permitted.
+# =============================================================================
 
 [build-system]
 # setuptools is the build backend (AAP 0.4.1: "setuptools; name=libcob_py;
-# requires-python>=3.11").  wheel is the standard bdist build helper.
-requires = ["setuptools>=61.0", "wheel"]
+# requires-python>=3.11").  setuptools is a *build-time* tool only -- it is NOT
+# a runtime dependency of the emitted/executed COBOL programs, so listing it
+# here does not violate the stdlib-only RUNTIME constraint above.  Modern
+# setuptools (>=70) vendors the wheel builder (bdist_wheel), so no separate
+# "wheel" build requirement is needed.
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
+# EXACT name mandated by AAP 0.2.1 / 0.4.1 -- the importable package name the
+# cobc-emitted modules use (`from libcob_py import ...`) and the name the
+# configure.ac build-time import check resolves.
 name = "libcob_py"
+
+# Version mirrors the host GNU Cobol 1.1 source tree (AAP 0.4.1) and is kept in
+# lock-step with `libcob_py/__init__.py` `__version__` (currently "1.1.0").
 version = "1.1.0"
-description = "Pure-Python standard-library runtime for GNU Cobol (OpenCOBOL) - the libcob C library replacement targeted by the cobc Python backend."
-# CPython 3.11+ is the compile-time and runtime engine (AAP 0.5.1); the C
-# backend's compiler dependency is replaced by this single interpreter.
+
+# Short description (AAP 0.4.1 suggested text).
+description = "Pure-Python (standard-library-only) GNU Cobol runtime; functional replacement for the libcob C runtime."
+
+# EXACT interpreter floor mandated by AAP 0.2.1 / 0.4.1 / 0.5.3:  CPython >= 3.11
+# is the compile-time and runtime engine (it supersedes the C compiler via the
+# COB_PYTHON mechanism).  This gate rejects interpreters older than 3.11.
 requires-python = ">=3.11"
+
+# The runtime library is LGPL: the original C `libcob` runtime headers are
+# LGPL (see COPYING.LIB, GNU LGPL v2.1) and AAP 0.4.1 directs an LGPL-2.1-or-later
+# license.  The table ("text") form is used (rather than a bare SPDX string) so
+# the manifest parses correctly across the full `requires = setuptools>=61.0`
+# range; the matching OSI classifier is declared below.
 license = { text = "LGPL-2.1-or-later" }
-authors = [{ name = "GNU Cobol contributors" }]
-keywords = ["cobol", "gnucobol", "opencobol", "libcob", "runtime"]
+
+# Authorship per the repository AUTHORS file and the libcob source headers.
+authors = [
+    { name = "Keisuke Nishida" },
+    { name = "Roger While" },
+]
+maintainers = [
+    { name = "GNU Cobol contributors" },
+]
+
+keywords = ["cobol", "gnucobol", "opencobol", "libcob", "runtime", "compiler"]
+
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    # LGPL-2.1-or-later, matching the `license` field above and COPYING.LIB.
     "License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)",
+    "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -40,30 +86,69 @@ classifiers = [
     "Topic :: Software Development :: Interpreters",
 ]
 
-# AAP 0.5 / 0.7.1: ZERO third-party runtime dependencies (stdlib only:
-# decimal, importlib, dbm, sqlite3, curses, py_compile, zipapp, os, struct, io).
+# -----------------------------------------------------------------------------
+# HARD CONSTRAINT (AAP 0.5 / 0.7.1):  ZERO third-party RUNTIME dependencies.
+# The runtime uses ONLY the Python standard library:
+#   decimal   (numeric.py)      importlib + sys (call.py)
+#   dbm       (fileio.py)       sqlite3         (fileio.py)
+#   curses    (screenio.py)     py_compile + zipapp (driver / distribution)
+#   os / struct / io            (as needed across modules)
+# This list MUST remain empty -- adding any package would violate the
+# non-functional standard-library-only requirement.
+# -----------------------------------------------------------------------------
 dependencies = []
 
 [project.optional-dependencies]
-# Development/test-only tooling.  ``coverage`` enforces the >=80% per-module
-# line-coverage gate (AAP 0.7.1); ``pytest`` is the test runner.  Neither is a
-# runtime dependency of the emitted/executed COBOL programs.
-test = ["pytest>=7.0", "coverage>=6.0"]
+# Development / TEST-ONLY tooling -- explicitly NOT runtime dependencies and NOT
+# installed for normal use.  The AAP itself classifies these as dev tools
+# (AAP 0.5.1: "coverage.py is a test-only development tool ... and is not a
+# runtime dependency").  `coverage` enforces the >=80% per-module line-coverage
+# gate (AAP 0.7.1); `pytest` runs the tests/libcob_py suite (AAP 0.7.2 runtime
+# regression gate).  Installed on demand via `pip install '.[test]'`.
+test = [
+    "pytest>=7.0",
+    "coverage>=6.0",
+]
 
+[project.urls]
+Homepage = "https://www.gnu.org/software/gnucobol/"
+Repository = "https://sourceforge.net/projects/gnucobol/"
+
+# =============================================================================
+# setuptools package discovery  (AAP 0.4.1 "Package discovery" / 0.3.1 tree)
+# =============================================================================
+# This pyproject.toml lives INSIDE the libcob_py/ directory, alongside
+# __init__.py and the runtime modules -- a flat layout where the project
+# directory *is* the package.  The mapping below makes the importable package
+# `libcob_py` resolve to this directory's contents, so that after install both
+#     import libcob_py
+#     from libcob_py import common, numeric, move, strings, intrinsic, \
+#                           fileio, call, screenio, termio, system
+# work (verified by building the wheel and inspecting its contents -- it ships
+# exactly the eleven runtime modules under a top-level `libcob_py/` package).
 [tool.setuptools]
-# The runtime is a single flat package; ship it as-is.
+# Explicit single-package declaration (no auto-discovery) guarantees ONLY the
+# libcob_py package is shipped; the tests live OUTSIDE this folder under
+# tests/libcob_py/ and are therefore never packaged.
 packages = ["libcob_py"]
-# The package lives in the repository root (this manifest is inside the package
-# directory), so map the package name to its own directory.
+
+# Map the `libcob_py` package to "." -- i.e. this directory (where this manifest
+# resides).  setuptools then collects the modules here as the package contents.
+# All importable code is plain ".py" collected via `packages` above; there is no
+# package-data to declare (the module set matches libcob_py/Makefile.am exactly).
 package-dir = { "libcob_py" = "." }
 
+# =============================================================================
+# coverage.py configuration  (supports the AAP 0.7.1 >=80% per-module gate)
+# =============================================================================
+# coverage is a TEST-ONLY tool (declared under the optional `test` extra above),
+# never a runtime dependency.  These settings give the tests/libcob_py suite a
+# consistent measurement target for the >=80% line-coverage gate.
 [tool.coverage.run]
-# Branch coverage over the runtime package, matching the tests/Makefile.am
-# ``check-local`` invocation (AAP 0.7.1 coverage gate).
 branch = true
 source = ["libcob_py"]
 
 [tool.coverage.report]
-# The AAP coverage gate: each module must reach >=80% line coverage.
+# The AAP coverage gate: each runtime module must reach >=80% line coverage.
 fail_under = 80
 show_missing = true
