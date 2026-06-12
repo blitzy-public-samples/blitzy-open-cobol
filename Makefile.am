@@ -76,6 +76,10 @@ dist-hook:
 	touch $(distdir)/tests/data-rep
 
 # MIGRATION (C→Python): emit COB_PYTHON (backend interpreter) in place of COB_CC/COB_CFLAGS; see configure.ac AC_SUBST(COB_PYTHON).
+# REVIEW FIX (CRITICAL #2): also emit COB_LIBPY_DIR (= $(pkgdatadir)/libcob_py, the
+# installed runtime package location) in lockstep with cobc/cobc.c, which reads it
+# (overridable via $COB_LIBPY_DIR) to bundle the libcob_py runtime into every
+# generated -m/-x ".pyz" so the archive is self-contained off the source tree.
 defaults.h: Makefile.am $(top_builddir)/config.status
 	@echo "Creating defaults.h..."
 	@{								\
@@ -85,6 +89,7 @@ defaults.h: Makefile.am $(top_builddir)/config.status
 	  echo "#define COB_LIBS         \"$(COB_LIBS)\"";		\
 	  echo "#define COB_CONFIG_DIR   \"$(COB_CONFIG_DIR)\"";	\
 	  echo "#define COB_COPY_DIR     \"$(COB_COPY_DIR)\"";		\
+	  echo "#define COB_LIBPY_DIR    \"$(pkgdatadir)/libcob_py\"";	\
 	  echo "#define COB_LIBRARY_PATH \"$(COB_LIBRARY_PATH)\"";	\
 	  echo "#define COB_MODULE_EXT   \"$(COB_MODULE_EXT)\"";	\
 	  echo "#define COB_BLD_CC       \"$(CC)\"";			\

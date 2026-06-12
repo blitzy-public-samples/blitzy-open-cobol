@@ -792,3 +792,105 @@ def test_routines_callable():
     for external, internal in system.SYSTEM_TABLE.items():
         assert hasattr(system, internal), "%r -> %s missing" % (external, internal)
         assert callable(getattr(system, internal)), internal
+
+
+# ===========================================================================
+# SECURITY - REVIEW FIX: CWE-78 (SYSTEM command injection) and CWE-22
+# (CBL_* filesystem path traversal).
+#
+# These tests pin the two security findings raised against ``system.py``:
+#   * SYSTEM truncates its operand at the first embedded NUL (C-string
+#     fidelity), so text smuggled after a NUL never reaches the shell; and
+#   * every CBL_* filesystem routine funnels its COBOL-supplied path through
+#     the centralised ``fileio._safe_path`` guard (via ``_safe_filename_arg``),
+#     rejecting NUL/ASCII-control bytes and relative ``..`` traversal escapes
+#     with each routine's *documented* failure code (35 / 128 / -1), while a
+#     legitimate relative name continues to succeed (no false positives).
+# ===========================================================================
+class TestSystemSecurityHardening:
+    """SYSTEM command-injection guardrail + CBL_* path-traversal rejection."""
+
+    # ---- CWE-78: SYSTEM NUL truncation -----------------------------------
+    def test_system_truncates_at_embedded_nul(self, work_dir, frame):
+        """An embedded NUL terminates the command; the post-NUL payload (which
+        would create ``pwned`` if it reached the shell) must never run."""
+        smuggle = work_dir / "pwned"
+        cmd = _alnum("exit 0\x00; touch pwned")
+        frame.cob_procedure_parameters[0] = cmd
+        assert system.SYSTEM(memoryview(cmd.data)) == 0
+        assert not smuggle.exists()
+
+    def test_system_only_nul_is_empty(self, frame):
+        """A command that is just a NUL (then blanks) trims to empty -> 1."""
+        cmd = _alnum("\x00   ")
+        frame.cob_procedure_parameters[0] = cmd
+        assert system.SYSTEM(memoryview(cmd.data)) == 1
+
+    # ---- CWE-22: helper-level validation ---------------------------------
+    def test_safe_filename_arg_rejects_control_byte(self):
+        with pytest.raises(OSError):
+            system._safe_filename_arg(memoryview(_alnum("foo\x01bar").data), 0)
+
+    def test_safe_filename_arg_rejects_parent_traversal(self):
+        with pytest.raises(OSError):
+            system._safe_filename_arg(memoryview(_alnum("../escape").data), 0)
+
+    def test_safe_filename_arg_allows_clean_name(self):
+        assert system._safe_filename_arg(
+            memoryview(_alnum("clean.dat").data), 0) == "clean.dat"
+
+    # ---- CWE-22: per-routine return-code contract preservation -----------
+    # The two attack shapes exercised against every routine: a path with an
+    # embedded ASCII control byte, and a relative parent-directory escape.
+    _BAD = ("foo\x01bar", "../escape")
+
+    def test_open_and_create_reject_unsafe_path(self, work_dir):
+        for bad in self._BAD:
+            handle = bytearray(4)
+            assert system.CBL_OPEN_FILE(
+                memoryview(_alnum(bad).data), memoryview(bytearray([1])),
+                memoryview(bytearray(1)), memoryview(bytearray(1)),
+                memoryview(handle)) == 35
+            assert struct.unpack("=i", bytes(handle))[0] == -1
+            assert system.CBL_CREATE_FILE(
+                memoryview(_alnum(bad).data), memoryview(bytearray([2])),
+                memoryview(bytearray(1)), memoryview(bytearray(1)),
+                memoryview(bytearray(4))) == 35
+        # No false positive: a clean relative name still creates successfully.
+        assert system.CBL_CREATE_FILE(
+            memoryview(_alnum("ok.bin").data), memoryview(bytearray([2])),
+            memoryview(bytearray(1)), memoryview(bytearray(1)),
+            memoryview(bytearray(4))) == 0
+
+    def test_delete_and_rename_reject_unsafe_path(self, work_dir):
+        for bad in self._BAD:
+            assert system.CBL_DELETE_FILE(memoryview(_alnum(bad).data)) == 128
+            assert system.CBL_RENAME_FILE(
+                memoryview(_alnum(bad).data),
+                memoryview(_alnum("ok.txt").data)) == 128
+            # An unsafe *destination* is rejected too (both operands validated).
+            assert system.CBL_RENAME_FILE(
+                memoryview(_alnum("ok.txt").data),
+                memoryview(_alnum(bad).data)) == 128
+
+    def test_copy_rejects_unsafe_source_and_destination(self, work_dir):
+        with open("real.txt", "wb") as fh:
+            fh.write(b"payload")
+        for bad in self._BAD:
+            assert system.CBL_COPY_FILE(
+                memoryview(_alnum(bad).data),
+                memoryview(_alnum("dst.txt").data)) == -1
+            assert system.CBL_COPY_FILE(
+                memoryview(_alnum("real.txt").data),
+                memoryview(_alnum(bad).data)) == -1
+
+    def test_check_file_exist_rejects_unsafe_path(self, work_dir):
+        for bad in self._BAD:
+            assert system.CBL_CHECK_FILE_EXIST(
+                memoryview(_alnum(bad).data), memoryview(bytearray(16))) == 35
+
+    def test_directory_routines_reject_unsafe_path(self, work_dir):
+        for bad in self._BAD:
+            assert system.CBL_CREATE_DIR(memoryview(_alnum(bad).data)) == 128
+            assert system.CBL_CHANGE_DIR(memoryview(_alnum(bad).data)) == 128
+            assert system.CBL_DELETE_DIR(memoryview(_alnum(bad).data)) == 128

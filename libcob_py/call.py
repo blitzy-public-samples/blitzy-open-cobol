@@ -35,8 +35,20 @@ from libcob_py import common
 # Ordered resolve paths (call.c ``resolve_path[]``); also pushed onto sys.path.
 _resolve_paths = []
 # name -> callable cache (call.c ``call_table`` / ``lookup``/``insert``).
+#
+# LIFECYCLE (REVIEW FIX, MAJOR #7): this cache is intentionally *unbounded* -
+# no LRU/size eviction.  COBOL programs are *resident* once CALLed: a program's
+# WORKING-STORAGE persists between CALLs and is only reset by an explicit
+# CANCEL (ISO 1989 / the C ``call_table``, which likewise never auto-evicts).
+# A size-bounded cache would silently drop a resident program's state and
+# violate that contract, so residency is by design.  Entries leave the cache
+# only on CANCEL (:func:`cobcancel`) or at STOP RUN/tidy (:func:`cob_exit_call`),
+# both of which evict ``_call_cache`` and ``_cancel_handlers`` *in lockstep*.
 _call_cache = {}
-# name -> cancel callable (call.c ``struct call_hash.cancel``).
+# name -> cancel callable (call.c ``struct call_hash.cancel``).  Kept strictly
+# in step with ``_call_cache`` (the C runtime stored func + cancel in one
+# ``struct call_hash`` entry); see the lockstep eviction in cobcancel /
+# cob_exit_call (REVIEW FIX, MAJOR #7).
 _cancel_handlers = {}
 # Last resolve error message (call.c ``resolve_error``).
 _resolve_error = None
@@ -260,9 +272,17 @@ def cobcancel(name):
     """CANCEL *name*: run its cancel handler and evict it (call.c L481-L510).
 
     Invokes any registered cancel routine, then drops the program from the
-    call cache and from ``sys.modules`` and invalidates the import caches so a
-    subsequent CALL re-imports a fresh module instance - the Python analogue of
-    the C uncache/``lt_dlclose`` behaviour.
+    call cache, its cancel handler, and ``sys.modules`` and invalidates the
+    import caches so a subsequent CALL re-imports a fresh module instance - the
+    Python analogue of the C uncache/``lt_dlclose`` behaviour.
+
+    REVIEW FIX (MAJOR #7): in the C runtime the entry function and its cancel
+    routine live in a *single* ``struct call_hash`` (call.c L138-L145), so
+    uncaching an entry frees both at once.  The Python port splits them across
+    the two parallel dicts ``_call_cache`` and ``_cancel_handlers``; this used
+    to pop only ``_call_cache``, leaving a *stale* cancel handler behind that a
+    later re-CALL/re-CANCEL of the same name would wrongly re-run.  Both dicts
+    are now evicted together to restore the one-entry C semantics.
     """
     if name is None:
         common.cob_runtime_error("NULL name parameter passed to 'cobcancel'")
@@ -271,8 +291,10 @@ def cobcancel(name):
     cancel = _cancel_handlers.get(name)
     if cancel is not None and callable(cancel):
         cancel(-1, None, None, None, None, None, None, None, None)
-    # Evict from the call cache and the import system.
+    # Evict from the call cache, the cancel-handler table, and the import system
+    # together (the C ``struct call_hash`` held func + cancel as one entry).
     _call_cache.pop(name, None)
+    _cancel_handlers.pop(name, None)
     modname = _apply_case(cob_encode_program_id(name))
     sys.modules.pop(modname, None)
     importlib.invalidate_caches()
@@ -281,6 +303,25 @@ def cobcancel(name):
 def cob_field_cancel(f):
     """CANCEL the program named by the contents of field *f* (call.c L510-L520)."""
     cobcancel(common.cob_field_to_string(f))
+
+
+def cob_exit_call():
+    """Tear the call subsystem down at STOP RUN / tidy (call.c ``cob_exit_call``).
+
+    REVIEW FIX (MAJOR #7, cleanup-on-stop-run).  The dynamic-loader caches are
+    deliberately unbounded for the lifetime of a run (resident-program
+    semantics - see the ``_call_cache`` note), but they MUST be released when
+    the run ends so a fresh ``cob_init`` starts from an empty table (and so no
+    cancel handler outlives the run).  This mirrors the C ``cob_exit_call``
+    freeing ``call_table``; it is invoked from
+    :func:`libcob_py.common._shutdown_runtime` (the shared STOP RUN / cobtidy
+    teardown path).  Both parallel dicts are cleared in lockstep and the import
+    caches are invalidated; ``_resolve_paths`` is left to ``cob_init_call`` to
+    re-seed.  It is idempotent and safe to call more than once.
+    """
+    _call_cache.clear()
+    _cancel_handlers.clear()
+    importlib.invalidate_caches()
 
 
 def cob_init_call():

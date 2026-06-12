@@ -1325,16 +1325,22 @@ def _run_exit_handlers():
 
 
 def _shutdown_runtime():
-    """Best-effort screen/fileio teardown shared by cob_stop_run / cobtidy.
+    """Best-effort screen/fileio/call teardown shared by cob_stop_run / cobtidy.
 
-    The C runtime calls ``cob_screen_terminate`` and ``cob_exit_fileio`` here;
-    those live in the screenio / fileio modules, so they are invoked via a
-    deferred import and skipped when unavailable.
+    The C runtime calls ``cob_screen_terminate``, ``cob_exit_fileio`` and
+    ``cob_exit_call`` here; those live in the screenio / fileio / call modules,
+    so they are invoked via a deferred import and skipped when unavailable.
+
+    REVIEW FIX (MAJOR #7): ``call.cob_exit_call`` was added to this teardown so
+    the (intentionally unbounded) dynamic-loader caches are released at STOP RUN
+    / tidy - without it the call cache and cancel handlers would outlive the run
+    and a subsequent ``cob_init`` would not start from a clean table.
     """
     import importlib
 
     for mod_name, fn_name in (("screenio", "cob_screen_terminate"),
-                              ("fileio", "cob_exit_fileio")):
+                              ("fileio", "cob_exit_fileio"),
+                              ("call", "cob_exit_call")):
         try:
             mod = importlib.import_module("libcob_py." + mod_name)
         except ImportError:

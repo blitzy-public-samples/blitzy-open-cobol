@@ -382,6 +382,13 @@ static const struct option long_options[] = {
    from $COB_PYTHON or, failing that, the COB_PYTHON macro emitted into
    defaults.h by the top-level Makefile.am (lockstep change). */
 static const char	*cob_python;				/* python3 (>=3.11) */
+/* MIGRATION (C->Python) / REVIEW FIX (CRITICAL #2): the directory holding the
+   "libcob_py" runtime package.  Generated modules do "import libcob_py", so the
+   package must be bundled into every -m/-x ".pyz" for the archive to run off the
+   source tree / installed runtime.  Resolved from $COB_LIBPY_DIR or, failing
+   that, the COB_LIBPY_DIR macro emitted into defaults.h by the top-level
+   Makefile.am (= $(pkgdatadir)/libcob_py) - a lockstep change. */
+static const char	*cob_libpy_dir;				/* libcob_py runtime package dir */
 /* MIGRATION (C->Python): "cob_cflags" no longer carries C-compiler flags - the
    COB_CFLAGS macro is removed from defaults.h.  The buffer is retained (declared
    and initialised empty) ONLY so the still-immutable -O/-A/-g/-fomit-frame
@@ -1807,7 +1814,11 @@ cobc_check_python (void)
    staged under its base name (so it remains importable, e.g. for COBOL CALL)
    and the primary/entry module is additionally staged as "__main__.py" so the
    archive runs via "python <archive>" - matching how bin/cobcrun.c launches
-   "python <module>" (AAP 0.4.1).  When "as_exec" is set a shebang for cob_python
+   "python <module>" (AAP 0.4.1).  REVIEW FIX (CRITICAL #2): the libcob_py runtime
+   package (resolved into cob_libpy_dir) is also bundled into the archive so the
+   emitted modules' "import libcob_py" resolves from inside the ".pyz" - the
+   artifact is then self-contained and runs with no source-tree PYTHONPATH.
+   When "as_exec" is set a shebang for cob_python
    is embedded and the executable bit set, yielding a directly runnable artifact
    for the "-x" mode.  The staging is performed by one argv-driven "python -c"
    command (no nested double quotes); SECURITY (CWE-78): it is dispatched
@@ -1826,22 +1837,42 @@ cobc_build_pyz (struct filename *primary, struct filename *modlist,
 	int		ret;
 
 	/* Fixed staging script.  Python's sys.argv becomes
-	   [ "-c"-script, outname, "0"/"1", mod1, mod2, ... ]: copy each module by
-	   basename, the first additionally as __main__.py, then write the archive
-	   (optionally with an interpreter shebang). */
+	   [ "-c"-script, outname, "0"/"1", libpy_dir, mod1, mod2, ... ]: copy each
+	   module by basename, the first additionally as __main__.py, bundle the
+	   libcob_py runtime package, then write the archive (optionally with an
+	   interpreter shebang).
+	   REVIEW FIX (CRITICAL #2): the emitted modules do "import libcob_py", so the
+	   runtime package is copytree'd into the staging dir as "libcob_py/" before
+	   the archive is built - zipimport then resolves it from inside the ".pyz",
+	   making the archive self-contained off the source tree.  Non-runtime files
+	   are excluded from the bundle (runtime source modules only): the __pycache__
+	   directory, compiled .pyc and .pyo files, the pyproject.toml manifest, and -
+	   when COB_LIBPY_DIR points at the in-tree source rather than the installed
+	   pkgdatadir copy - the autotools Makefile / Makefile.am / Makefile.in.
+	   If the runtime dir is absent a build-time warning is written to stderr (the
+	   archive is then NOT self-contained) rather than silently producing a broken
+	   artifact. */
 	static char	pyz_stage[] =
 		"import os,sys,shutil,tempfile,zipapp;"
-		"o=sys.argv[1];x=sys.argv[2]=='1';m=sys.argv[3:];"
+		"o=sys.argv[1];x=sys.argv[2]=='1';p=sys.argv[3];m=sys.argv[4:];"
 		"d=tempfile.mkdtemp();"
 		"[shutil.copy(s,os.path.join(d,os.path.basename(s))) for s in m];"
 		"shutil.copy(m[0],os.path.join(d,'__main__.py'));"
+		"shutil.copytree(p,os.path.join(d,'libcob_py'),"
+		"ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.pyo',"
+		"'pyproject.toml','Makefile','Makefile.am','Makefile.in')) "
+		"if os.path.isdir(p) else "
+		"sys.stderr.write('cobc: warning: libcob_py runtime not found at '+repr(p)"
+		"+'; generated .pyz is NOT self-contained\\n');"
 		"zipapp.create_archive(d,o,interpreter=(sys.executable if x else None));"
 		"shutil.rmtree(d)";
 
 	/* MIGRATION (C->Python) / SECURITY (CWE-78): build a NULL-terminated argv
 	   vector rather than a shell command string.  Count the slots first:
-	   cob_python, "-c", script, outname, flag, primary, [extra modules], NULL. */
-	nargs = 6;
+	   cob_python, "-c", script, outname, flag, libpy_dir, primary,
+	   [extra modules], NULL.  REVIEW FIX (CRITICAL #2): one extra fixed slot
+	   (libpy_dir) was added, so the base count is 7 rather than 6. */
+	nargs = 7;
 	if (modlist) {
 		for (f = modlist; f; f = f->next) {
 			if (f != primary) {
@@ -1852,15 +1883,18 @@ cobc_build_pyz (struct filename *primary, struct filename *modlist,
 	nargs++;			/* NULL terminator */
 	argv = cobc_malloc ((size_t)nargs * sizeof (*argv));
 
-	/* The primary (entry) module is sys.argv[3] - it becomes m[0]/__main__.py.
-	   The (char *) casts drop const for the execvp prototype only; execvp does
-	   not modify the strings. */
+	/* The libcob_py dir is sys.argv[3]; the primary (entry) module is sys.argv[4]
+	   - it becomes m[0]/__main__.py.  The (char *) casts drop const for the
+	   execvp prototype only; execvp does not modify the strings. */
 	argc = 0;
 	argv[argc++] = (char *)cob_python;
 	argv[argc++] = (char *)"-c";
 	argv[argc++] = pyz_stage;
 	argv[argc++] = (char *)outname;
 	argv[argc++] = (char *)(as_exec ? "1" : "0");
+	/* REVIEW FIX (CRITICAL #2): the libcob_py runtime directory is sys.argv[3]
+	   in the staging script (bundled into the archive as "libcob_py/"). */
+	argv[argc++] = (char *)cob_libpy_dir;
 	argv[argc++] = (char *)primary->translate;
 	/* Append any additional modules (multi-program -x / -b builds). */
 	if (modlist) {
@@ -2151,6 +2185,16 @@ main (int argc, char *argv[])
 	cob_python = getenv ("COB_PYTHON");
 	if (cob_python == NULL) {
 		cob_python = COB_PYTHON;
+	}
+
+	/* MIGRATION (C->Python) / REVIEW FIX (CRITICAL #2): resolve the libcob_py
+	   runtime package directory from $COB_LIBPY_DIR, falling back to the
+	   COB_LIBPY_DIR macro (= $(pkgdatadir)/libcob_py) emitted into defaults.h by
+	   the top-level Makefile.am (lockstep change).  cobc_build_pyz stages this
+	   directory into the generated ".pyz" so the archive is self-contained. */
+	cob_libpy_dir = getenv ("COB_LIBPY_DIR");
+	if (cob_libpy_dir == NULL) {
+		cob_libpy_dir = COB_LIBPY_DIR;
 	}
 
 	cob_config_dir = getenv ("COB_CONFIG_DIR");

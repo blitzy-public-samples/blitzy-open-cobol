@@ -58,11 +58,17 @@ work and the staged recipe above is the *working* form:
 
 ## Build inputs
 
-The whole [`../libcob_py/`](../libcob_py/) package: its **11**
-standard-library-only modules — `__init__.py`, `common.py`, `numeric.py`,
-`move.py`, `strings.py`, `intrinsic.py`, `fileio.py`, `call.py`, `screenio.py`,
-`termio.py`, `system.py` — plus `pyproject.toml`. Rebuild `dist/libcob_py.pyz`
-whenever anything under `libcob_py/` changes (current version: `1.1.0`).
+The archive bundles exactly the **11** standard-library-only runtime modules of
+the [`../libcob_py/`](../libcob_py/) package — `__init__.py`, `common.py`,
+`numeric.py`, `move.py`, `strings.py`, `intrinsic.py`, `fileio.py`, `call.py`,
+`screenio.py`, `termio.py`, `system.py` — matching the `cp -p libcob_py/*.py …`
+staging command above. `pyproject.toml` is **not** a build input to the `.pyz`:
+it is the setuptools manifest used only for source distribution / packaging
+metadata, and is intentionally excluded from the runtime archive (consistent with
+`libcob_py/Makefile.am`'s `cobpy_DATA`/PYZ recipe and the driver's
+`cobc_build_pyz`, which all bundle the runtime modules only). Rebuild
+`dist/libcob_py.pyz` whenever anything under `libcob_py/` changes (current
+version: `1.1.0`).
 
 ## How `cobc` consumes it
 

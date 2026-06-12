@@ -565,19 +565,28 @@ AC_CONFIG_COMMANDS([chmod1], [chmod +x bin/cob-config])
 AC_CONFIG_COMMANDS([chmod2], [chmod +x tests/atconfig])
 AC_CONFIG_COMMANDS([chmod3], [chmod +x tests/atlocal])
 
-# MIGRATION (C→Python): Build-time check that the libcob_py runtime is importable
-# using only the Python standard library (AAP 0.7.2 stdlib-only requirement).
-# We prepend $srcdir to sys.path so the in-tree, not-yet-installed package can
-# be found. This is intentionally NON-fatal: libcob_py may not yet be present
-# on sys.path during bootstrap, and the authoritative stdlib-only gate is the
-# test suite. A failure is reported only as a warning. See AAP 0.5.1 / 0.7.2.
-AC_MSG_CHECKING([for importable libcob_py (stdlib-only runtime)])
-if $COB_PYTHON -c "import sys; sys.path.insert(0, '$srcdir'); import libcob_py" >/dev/null 2>&1
+# MIGRATION (C->Python) / REVIEW FIX (MAJOR #5, R13): Build-time check that the
+# libcob_py runtime is importable using ONLY the Python standard library
+# (AAP 0.7.2 stdlib-only requirement).  This is now a BLOCKING, clean-environment
+# check: configure ABORTS (AC_MSG_ERROR, exit 1) when the runtime cannot be
+# imported, so an unimportable or non-stdlib runtime can no longer pass the build
+# configuration phase (the previous warning-only behavior is removed).
+# The interpreter is launched with "-I" (isolated mode), which removes
+# PYTHONPATH, the per-user site-packages directory, and the current working
+# directory from sys.path; the ONLY non-stdlib entry is the explicit $srcdir we
+# insert.  A successful import therefore proves the package resolves from the
+# source tree and depends on nothing beyond the standard library.
+# See AAP 0.5.1 / 0.7.2 and R13.
+AC_MSG_CHECKING([for importable stdlib-only libcob_py runtime (isolated env)])
+if $COB_PYTHON -I -c "import sys; sys.path.insert(0, '$srcdir'); import libcob_py" >/dev/null 2>&1
 then
 	AC_MSG_RESULT([yes])
 else
-	AC_MSG_RESULT([no (not yet importable; verified by the test suite)])
-	AC_MSG_WARN([libcob_py is not importable from '$srcdir' yet; the stdlib-only runtime gate is enforced by the test suite.])
+	AC_MSG_RESULT([no])
+	AC_MSG_ERROR([libcob_py is not importable from '$srcdir' in an isolated (stdlib-only) Python environment.
+The pure-Python runtime must import using only the standard library (no third-party
+packages and no PYTHONPATH or per-user site assistance).  Ensure '$srcdir/libcob_py'
+exists and imports cleanly under $COB_PYTHON -I (isolated mode).])
 fi
 
 AC_OUTPUT

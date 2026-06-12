@@ -21,7 +21,7 @@ runtime init (``cob_init_call``) so that a dynamic ``CALL "CBL_..."`` /
 
 Dependencies (AAP whitelist - standard library plus the two declared runtime
 modules ``common`` and ``fileio``).  **Standard-library only** (AAP 0.5 / 0.7.1):
-``os``, ``struct``, ``time``.  No third-party packages.  ``common`` is the
+``os``, ``struct``, ``subprocess``, ``time``.  No third-party packages.  ``common`` is the
 runtime base; the five call-frame ``C$`` helpers (``C$GETPID``/``C$NARG``/
 ``C$PARAMSIZE``/``C$SLEEP``/``C$JUSTIFY``) are re-exported from it (their C
 bodies live in ``common.c``), and the five filesystem ``C$`` routines
@@ -51,6 +51,7 @@ Each routine returns its integer return-code (0 on success), matching the C
 # --- Standard-library imports (rule: stdlib only) --------------------------
 import os
 import struct
+import subprocess  # REVIEW FIX (CWE-78): SYSTEM runs via subprocess.run, not os.system
 import time
 
 # --- Internal runtime imports (AAP whitelist: common + fileio) -------------
@@ -191,6 +192,43 @@ def _filename_arg(direct, idx=0):
     return _fld_str(direct)
 
 
+class _UnsafePath(OSError):
+    """Raised by :func:`_safe_filename_arg` when a COBOL-supplied path fails the
+    centralised CWE-22 validation.
+
+    Subclasses :class:`OSError` deliberately: every CBL_* filesystem routine
+    already wraps its ``os``/``shutil`` call in ``except OSError`` and returns a
+    documented failure code (``35`` / ``128`` / ``-1``).  An unsafe path *is* a
+    failure, so routing the rejection through ``OSError`` makes each routine
+    return its own contract code without bespoke per-routine branching.
+    """
+
+
+def _safe_filename_arg(direct, idx=0):
+    """Resolve a filename like :func:`_filename_arg`, then validate it (CWE-22).
+
+    REVIEW FIX (CWE-22, path traversal).  The original C ``fileio.c`` passed the
+    resolved name straight to ``fopen``/``os.*`` with no validation; the review
+    requires every COBOL-data-derived path in the CBL_* routines to be funnelled
+    through the same centralised guard used elsewhere in the runtime.  This
+    helper delegates to :func:`libcob_py.fileio._safe_path` with ``base=None``
+    (the COBOL-data trust level): embedded NUL / ASCII control bytes and leading
+    ``..`` traversal escapes are rejected, while absolute names remain permitted
+    so legitimate COBOL absolute-path I/O is preserved.
+
+    On rejection it raises :class:`_UnsafePath` (an ``OSError``) so each caller's
+    existing ``except OSError`` handler returns that routine's documented
+    failure code, keeping every return-code contract intact.  On success it
+    returns the canonicalised path string.
+    """
+    name = _filename_arg(direct, idx)
+    safe = fileio._safe_path(name, base=None)
+    if safe is None:
+        raise _UnsafePath(
+            "unsafe COBOL-supplied path rejected (CWE-22): %r" % (name,))
+    return safe
+
+
 def _as_field(operand, idx):
     """Resolve a filesystem operand to a :class:`common.cob_field` for fileio.
 
@@ -306,6 +344,30 @@ def SYSTEM(cmd):
     around the command (``cob_screen_set_mode(0)`` / ``(1)``) and resumed
     afterwards, exactly as the C runtime does.  Returns 1 when the command is
     empty (all blanks).
+
+    SECURITY (CWE-78, OS command injection) - REVIEW FIX.  The COBOL ``SYSTEM``
+    / ``CALL "SYSTEM"`` service is *defined by the language* to hand its operand
+    to the host command processor; the C runtime implements it verbatim as
+    ``system(command)`` (common.c), i.e. ``/bin/sh -c <command>``.  A full
+    command line - pipes, redirection, ``&&`` - is therefore a *legitimate and
+    required* feature, so an argv-vector (``shell=False``) execution would break
+    conforming COBOL programs and is disallowed by the AAP least-deviation
+    clause (0.7.2).  ``SYSTEM`` is consequently a **trusted-command-only**
+    facility: the command text originates in the running COBOL program (the
+    same trust boundary as the original toolchain), not from an untrusted
+    external channel.  The hardening applied here, consistent with those
+    semantics, is:
+
+    * the operand is truncated at the first embedded NUL (a C string passed to
+      ``system()`` ends at its NUL terminator, so bytes beyond it were never
+      part of the command - this also blocks a NUL byte from smuggling text
+      past the trailing-blank trim), and
+    * the operand length is capped at ``COB_MEDIUM_MAX`` (8192), matching the C
+      runtime's own guard.
+
+    Execution uses :func:`subprocess.run` with ``shell=True`` (replacing the
+    bare ``os.system`` flagged in review) so the shell contract is explicit and
+    the child exit status is read directly from ``returncode``.
     """
     param = _proc_param(0)
     if param is None:
@@ -316,6 +378,15 @@ def SYSTEM(cmd):
         common.cob_runtime_error(
             "Parameter to SYSTEM call is larger than 8192 characters")
         common.cob_stop_run(1)
+
+    # SECURITY (CWE-78): a C string handed to system() terminates at its first
+    # NUL, so anything past an embedded NUL was never part of the command.
+    # Truncating here restores that C-string fidelity, blocks NUL-byte smuggling
+    # past the trailing-blank trim below, and avoids the ValueError that
+    # subprocess/os raise on an embedded NUL.
+    nul = raw.find(0x00)
+    if nul != -1:
+        raw = raw[:nul]
 
     # Trim trailing blanks/NULs (common.c L1864-L1869).
     i = len(raw)
@@ -335,11 +406,13 @@ def SYSTEM(cmd):
     except Exception:  # pragma: no cover
         screen_active = False
 
-    rc = os.system(command)
-    # os.system returns a wait-status; mirror the C ``return system()`` value by
-    # extracting the child exit code on POSIX (WEXITSTATUS) where available.
-    if os.name == "posix" and os.WIFEXITED(rc):
-        rc = os.WEXITSTATUS(rc)
+    # MIGRATION (C system() -> Python): execute via subprocess.run(shell=True)
+    # rather than the bare os.system flagged in review.  shell=True preserves
+    # the mandatory COBOL command-processor semantics (see the SECURITY note);
+    # the child exit status comes straight back in ``returncode`` (0-255 on a
+    # normal exit, matching the C WEXITSTATUS(system())), so no manual
+    # wait-status decoding is needed.
+    rc = subprocess.run(command, shell=True).returncode
 
     if screen_active:  # pragma: no cover - live screen only
         from libcob_py import screenio
@@ -625,8 +698,10 @@ def _open_cbl_file(file_name, file_access, file_handle, extra_flags):
     if hasattr(os, "O_BINARY"):  # pragma: no cover - Windows only
         flags |= os.O_BINARY
 
-    name = _filename_arg(file_name, 0)
+    # REVIEW FIX (CWE-22): validate the COBOL-supplied name inside the try so a
+    # rejected path surfaces as the routine's documented open-failure code (35).
     try:
+        name = _safe_filename_arg(file_name, 0)
         fd = os.open(name, flags, 0o660)
     except OSError:
         handle[0:4] = struct.pack("=i", -1)
@@ -721,7 +796,8 @@ def CBL_DELETE_FILE(file_name):
     if _proc_param(0) is None and file_name is None:
         return -1
     try:
-        os.unlink(_filename_arg(file_name, 0))
+        # REVIEW FIX (CWE-22): centralised path validation; rejection -> 128.
+        os.unlink(_safe_filename_arg(file_name, 0))
     except OSError:
         return 128
     return 0
@@ -735,8 +811,13 @@ def CBL_COPY_FILE(fname1, fname2):
     if (_proc_param(0) is None and fname1 is None) or \
        (_proc_param(1) is None and fname2 is None):
         return -1
-    src = _filename_arg(fname1, 0)
-    dst = _filename_arg(fname2, 1)
+    # REVIEW FIX (CWE-22): validate both COBOL-supplied names; rejection -> -1
+    # (the routine's documented "name missing / cannot open" failure code).
+    try:
+        src = _safe_filename_arg(fname1, 0)
+        dst = _safe_filename_arg(fname2, 1)
+    except OSError:
+        return -1
     try:
         fd1 = os.open(src, os.O_RDONLY)
     except OSError:
@@ -770,7 +851,8 @@ def CBL_CHECK_FILE_EXIST(file_name, file_info):
     if _proc_param(0) is None and file_name is None:
         return -1
     try:
-        st = os.stat(_filename_arg(file_name, 0))
+        # REVIEW FIX (CWE-22): centralised path validation; rejection -> 35.
+        st = os.stat(_safe_filename_arg(file_name, 0))
     except OSError:
         return 35
     tm = time.localtime(st.st_mtime)
@@ -800,7 +882,8 @@ def CBL_RENAME_FILE(fname1, fname2):
        (_proc_param(1) is None and fname2 is None):
         return -1
     try:
-        os.rename(_filename_arg(fname1, 0), _filename_arg(fname2, 1))
+        # REVIEW FIX (CWE-22): validate both COBOL-supplied names; reject -> 128.
+        os.rename(_safe_filename_arg(fname1, 0), _safe_filename_arg(fname2, 1))
     except OSError:
         return 128
     return 0
@@ -844,7 +927,8 @@ def CBL_CREATE_DIR(directory):
     if _proc_param(0) is None and directory is None:
         return -1
     try:
-        os.mkdir(_filename_arg(directory, 0), 0o770)
+        # REVIEW FIX (CWE-22): centralised path validation; rejection -> 128.
+        os.mkdir(_safe_filename_arg(directory, 0), 0o770)
     except OSError:
         return 128
     return 0
@@ -855,7 +939,8 @@ def CBL_CHANGE_DIR(directory):
     if _proc_param(0) is None and directory is None:
         return -1
     try:
-        os.chdir(_filename_arg(directory, 0))
+        # REVIEW FIX (CWE-22): centralised path validation; rejection -> 128.
+        os.chdir(_safe_filename_arg(directory, 0))
     except OSError:
         return 128
     return 0
@@ -866,7 +951,8 @@ def CBL_DELETE_DIR(directory):
     if _proc_param(0) is None and directory is None:
         return -1
     try:
-        os.rmdir(_filename_arg(directory, 0))
+        # REVIEW FIX (CWE-22): centralised path validation; rejection -> 128.
+        os.rmdir(_safe_filename_arg(directory, 0))
     except OSError:
         return 128
     return 0

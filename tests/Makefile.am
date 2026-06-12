@@ -136,40 +136,69 @@ $(srcdir)/data-rep: $(data_rep_DEPENDENCIES)
 # Additive: does NOT touch the Autotest TESTS above. Interpreter = $(COB_PYTHON)
 # (AC_SUBST'd by configure.ac). pytest/coverage are dev-only tools (AAP 0.5.1).
 #
-# MIGRATION (C->Python) / strict-vs-dev coverage gate (review MINOR / R5):
-# By default (local developer workstations) a missing pytest or coverage.py is
-# reported and the suite (or the >=80% gate) is SKIPPED rather than breaking
-# `make check`, because these are dev-only tools.  In CI / release-gating
-# environments set COB_PY_STRICT_COVERAGE=1 (e.g. `make check
-# COB_PY_STRICT_COVERAGE=1`): the absence of pytest OR coverage.py then becomes
-# a HARD FAILURE so the runtime-regression (AAP 0.7.1) and >=80% per-module
-# coverage gates cannot be silently bypassed.  This documents and enforces the
-# distinction the review required between a permissible local skip and the
-# strict gate.
+# MIGRATION (C->Python) / REVIEW FIX (MAJOR #6, R5/R7): the runtime pytest suite
+# and the >=80% PER-MODULE line-coverage gate are MANDATORY by default, so the
+# delivery / default `make check` path can no longer silently skip them.  If
+# either pytest or coverage.py is unavailable, `make check` FAILS (exit 1).
+# A single, explicitly-named local opt-out -- COB_PY_SKIP_RUNTIME_TESTS=1
+# (e.g. `make check COB_PY_SKIP_RUNTIME_TESTS=1`) -- lets a developer who lacks
+# the dev-only tools run the rest of `make check`; it must NEVER be set in CI /
+# release gating.  pytest/coverage remain dev-only tools (AAP 0.5.1); they are
+# not runtime dependencies of libcob_py.
+#
+# Two further review fixes are folded in here:
+#   * Per-module enforcement (R5): instead of a single aggregate
+#     `coverage report --fail-under=80`, EACH of the 11 libcob_py modules is
+#     gated individually at >=80% LINE coverage (R5 specifies line coverage),
+#     using coverage.py's own --include + --fail-under, so any one module
+#     dropping below 80% fails the build.  Coverage is collected WITHOUT
+#     --branch so the reported/gated metric is line coverage exactly as R5
+#     requires (a blended line+branch metric would over-count and misrepresent
+#     the R5 threshold).
+#   * Collision-free import (REVIEW FIX CRITICAL #4): pytest is invoked with
+#     --import-mode=importlib -o consider_namespace_packages=true, so the test
+#     package $(abs_srcdir)/libcob_py no longer needs a tests/__init__.py marker
+#     (that out-of-scope file is removed) and `import libcob_py` resolves to the
+#     runtime package at the repo root, never the identically-named test package.
 check-local:
 	@echo "=== libcob_py runtime suite (C->Python migration) ==="; \
-	if $(COB_PYTHON) -m pytest --version >/dev/null 2>&1; then \
-	  PYTHONPATH="$(abs_top_srcdir):$$PYTHONPATH"; export PYTHONPATH; \
-	  if $(COB_PYTHON) -m coverage --version >/dev/null 2>&1; then \
-	    $(COB_PYTHON) -m coverage run --branch --source="$(abs_top_srcdir)/libcob_py" \
-	        -m pytest -q "$(abs_srcdir)/libcob_py" && \
-	    $(COB_PYTHON) -m coverage report --fail-under=80; \
-	  else \
-	    if test -n "$(COB_PY_STRICT_COVERAGE)"; then \
-	      echo "ERROR: COB_PY_STRICT_COVERAGE is set but coverage.py is not installed;" >&2; \
-	      echo "       the >=80% per-module coverage gate cannot be enforced (AAP 0.7.1 / R5)." >&2; \
-	      exit 1; \
-	    fi; \
-	    echo "NOTE: coverage.py not installed; running pytest WITHOUT the >=80% coverage gate"; \
-	    echo "      (set COB_PY_STRICT_COVERAGE=1 to make this fatal in CI)"; \
-	    $(COB_PYTHON) -m pytest -q "$(abs_srcdir)/libcob_py"; \
-	  fi; \
+	if test -n "$(COB_PY_SKIP_RUNTIME_TESTS)"; then \
+	  echo "WARNING: COB_PY_SKIP_RUNTIME_TESTS is set; SKIPPING the libcob_py runtime +"; \
+	  echo "         per-module coverage gate.  This is a LOCAL-ONLY opt-out and must"; \
+	  echo "         never be set in CI / release gating (AAP 0.7.1 / R5 / R7)."; \
 	else \
-	  if test -n "$(COB_PY_STRICT_COVERAGE)"; then \
-	    echo "ERROR: COB_PY_STRICT_COVERAGE is set but '$(COB_PYTHON) -m pytest' is unavailable;" >&2; \
-	    echo "       the runtime-regression and coverage gates cannot be enforced (AAP 0.7.1 / R5)." >&2; \
+	  if ! $(COB_PYTHON) -m pytest --version >/dev/null 2>&1; then \
+	    echo "ERROR: '$(COB_PYTHON) -m pytest' is unavailable; the runtime-regression gate" >&2; \
+	    echo "       (AAP 0.7.1 / R7) cannot run.  Install pytest, or set" >&2; \
+	    echo "       COB_PY_SKIP_RUNTIME_TESTS=1 for a local-only build without the gate." >&2; \
 	    exit 1; \
 	  fi; \
-	  echo "WARNING: '$(COB_PYTHON) -m pytest' unavailable; skipping libcob_py suite"; \
-	  echo "         (dev-only pytest not installed; set COB_PY_STRICT_COVERAGE=1 to make this fatal in CI)"; \
+	  if ! $(COB_PYTHON) -m coverage --version >/dev/null 2>&1; then \
+	    echo "ERROR: '$(COB_PYTHON) -m coverage' is unavailable; the >=80% per-module" >&2; \
+	    echo "       line-coverage gate (AAP 0.7.1 / R5) cannot run.  Install coverage.py," >&2; \
+	    echo "       or set COB_PY_SKIP_RUNTIME_TESTS=1 for a local-only build." >&2; \
+	    exit 1; \
+	  fi; \
+	  PYTHONPATH="$(abs_top_srcdir):$$PYTHONPATH"; export PYTHONPATH; \
+	  $(COB_PYTHON) -m coverage run --source="$(abs_top_srcdir)/libcob_py" \
+	      -m pytest -q --import-mode=importlib -o consider_namespace_packages=true \
+	      "$(abs_srcdir)/libcob_py" || exit 1; \
+	  echo "--- per-module line coverage (gate: each module >= 80%) ---"; \
+	  cov_fail=0; \
+	  for m in __init__ common numeric move strings intrinsic fileio call screenio termio system; do \
+	    if $(COB_PYTHON) -m coverage report --include="$(abs_top_srcdir)/libcob_py/$$m.py" --fail-under=80 >/dev/null 2>&1; then \
+	      pc=`$(COB_PYTHON) -m coverage report --include="$(abs_top_srcdir)/libcob_py/$$m.py" 2>/dev/null | awk '/TOTAL/{print $$NF}'`; \
+	      echo "  PASS libcob_py/$$m.py  $$pc"; \
+	    else \
+	      pc=`$(COB_PYTHON) -m coverage report --include="$(abs_top_srcdir)/libcob_py/$$m.py" 2>/dev/null | awk '/TOTAL/{print $$NF}'`; \
+	      echo "  FAIL libcob_py/$$m.py  $$pc (below the 80% line-coverage gate)" >&2; \
+	      cov_fail=1; \
+	    fi; \
+	  done; \
+	  if test "$$cov_fail" != "0"; then \
+	    echo "ERROR: one or more libcob_py modules are below the >=80% per-module" >&2; \
+	    echo "       line-coverage gate (AAP 0.7.1 / R5)." >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "PASS: every libcob_py module meets the >=80% per-module line-coverage gate."; \
 	fi

@@ -59,9 +59,11 @@ obtained with :func:`pytest.importorskip` so collection degrades to a clean
 yet importable.
 """
 import decimal
+import os
 import struct
 import subprocess
 import sys
+import zipfile  # REVIEW FIX (CRITICAL #2): inspect generated .pyz self-containment
 
 import pytest
 
@@ -77,8 +79,11 @@ numeric = pytest.importorskip("libcob_py.numeric")
 # the repository root on sys.path).  ``template_dir`` is a *fixture* and is
 # therefore consumed as a test argument rather than imported here.
 from tests.libcob_py.conftest import (  # noqa: E402  (after importorskip guard)
+    REPO_ROOT,
     cobc_orig_path,
+    cobc_path,
     cobc_py_path,
+    requires_cobc,
     requires_dual_cobc,
     run_cobc,
 )
@@ -710,4 +715,237 @@ def test_templates_present():
         assert template.is_file(), (
             "required read-only parity template is missing: %s" % template
         )
+
+
+# ===========================================================================
+# PRONG C - generated-program SMOKE tests (need only the refactored cobc).
+#
+# These compile a tiny COBOL program with the refactored cobc to *Python source*
+# (``-C -x``: emit a runnable main without the .pyz packaging step) and execute
+# the emitted module, asserting its on-screen output.  They prove the EMITTER's
+# generated runtime behaviour end-to-end - the layer the direct unit tests
+# cannot reach.  They SKIP cleanly (``@requires_cobc``) on a source-only tree.
+#
+# Coverage:
+#   * the CRITICAL #1 argc fix - ACCEPT FROM ARGUMENT-NUMBER / ARGUMENT-VALUE
+#     must report the real command line (the old ``cob_init(sys.argv)`` emission
+#     made ``_cob_argc`` a list, so ARGUMENT-NUMBER raised/returned garbage); and
+#   * binary (COMP / BINARY) ADD / SUBTRACT / compare arithmetic through the
+#     generated code, exercising the cob_*_binary helper family (on a
+#     little-endian host COMP storage is big-endian, i.e. the *swapped* path
+#     completed in Group A).
+# ===========================================================================
+def _generated_python_interpreter():
+    """The interpreter that runs emitted modules: COB_PYTHON, else this one."""
+    return os.environ.get("COB_PYTHON") or sys.executable
+
+
+def _translate_and_run(prog_cob, work_dir, py_name, run_args):
+    """Translate *prog_cob* to Python with the refactored cobc and run it.
+
+    Uses ``cobc -C -x`` (emit a runnable ``main`` as *Python source*, no .pyz),
+    then executes the emitted module with the runtime package made importable
+    via ``PYTHONPATH`` (REPO_ROOT).  Returns the program's stdout as text.  A
+    non-zero compile or run status is an assertion failure (genuine regression),
+    not a skip - the ``@requires_cobc`` marker already handles an absent binary.
+    """
+    cobc = cobc_path()
+    py_path = work_dir / py_name
+    # cobc inherits os.environ; pin COB_CONFIG_DIR to the in-tree dialects so
+    # the test does not depend on an installed compiler's compiled-in default.
+    prev_cfg = os.environ.get("COB_CONFIG_DIR")
+    os.environ["COB_CONFIG_DIR"] = str(REPO_ROOT / "config")
+    try:
+        comp = run_cobc(cobc, ["-C", "-x", "-o", str(py_path), str(prog_cob)],
+                        cwd=work_dir)
+    finally:
+        if prev_cfg is None:
+            os.environ.pop("COB_CONFIG_DIR", None)
+        else:
+            os.environ["COB_CONFIG_DIR"] = prev_cfg
+    assert comp.returncode == 0, (
+        "cobc translate failed:\n%s" % comp.stderr.decode("latin-1", "replace"))
+    assert py_path.is_file(), "cobc did not emit the expected .py module"
+
+    env = dict(os.environ)
+    # The emitted module does ``import libcob_py``; make the runtime importable.
+    env["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    run = subprocess.run(
+        [_generated_python_interpreter(), str(py_path), *run_args],
+        cwd=str(work_dir), capture_output=True, timeout=120, check=False,
+        env=env,
+    )
+    assert run.returncode == 0, (
+        "generated program crashed (rc=%d):\n%s"
+        % (run.returncode, run.stderr.decode("latin-1", "replace")))
+    return run.stdout.decode("latin-1", "replace")
+
+
+@requires_cobc
+def test_generated_program_command_line_args(tmp_path):
+    """CRITICAL #1: ACCEPT FROM ARGUMENT-NUMBER / ARGUMENT-VALUE in a generated
+    program reports the real argv (proves ``_cob_argc`` is an int, not a list)."""
+    prog = tmp_path / "argtest.cob"
+    prog.write_text(
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. ARGTEST.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WS-COUNT   PIC 9(4).\n"
+        "       01 WS-VALUE   PIC X(16).\n"
+        "       PROCEDURE DIVISION.\n"
+        "           ACCEPT WS-COUNT FROM ARGUMENT-NUMBER.\n"
+        "           DISPLAY \"COUNT=\" WS-COUNT.\n"
+        "           ACCEPT WS-VALUE FROM ARGUMENT-VALUE.\n"
+        "           DISPLAY \"FIRST=[\" WS-VALUE \"]\".\n"
+        "           STOP RUN.\n"
+    )
+    out = _translate_and_run(prog, tmp_path, "argtest.py", ["alpha", "beta"])
+    assert "COUNT=0002" in out, out          # two args after the program name
+    assert "FIRST=[alpha" in out, out        # first ARGUMENT-VALUE is 'alpha'
+
+
+@requires_cobc
+def test_generated_program_binary_arithmetic(tmp_path):
+    """Binary (COMP) ADD / SUBTRACT / compare round-trip through generated code,
+    exercising the cob_*_binary helper family (the swapped path on LE hosts)."""
+    prog = tmp_path / "bintest.cob"
+    prog.write_text(
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. BINTEST.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WS-A   PIC S9(8) USAGE COMP.\n"
+        "       01 WS-B   PIC S9(8) USAGE COMP.\n"
+        "       01 WS-R   PIC -(9)9.\n"
+        "       PROCEDURE DIVISION.\n"
+        "           MOVE 1000 TO WS-A.\n"
+        "           MOVE 337 TO WS-B.\n"
+        "           ADD WS-B TO WS-A.\n"
+        "           MOVE WS-A TO WS-R.\n"
+        "           DISPLAY \"SUM=\" WS-R.\n"
+        "           SUBTRACT WS-B FROM WS-A.\n"
+        "           MOVE WS-A TO WS-R.\n"
+        "           DISPLAY \"DIF=\" WS-R.\n"
+        "           IF WS-A = 1000\n"
+        "               DISPLAY \"CMP=EQ\"\n"
+        "           ELSE\n"
+        "               DISPLAY \"CMP=NE\"\n"
+        "           END-IF.\n"
+        "           STOP RUN.\n"
+    )
+    out = _translate_and_run(prog, tmp_path, "bintest.py", [])
+    # 1000 + 337 = 1337; then - 337 = 1000; the field still compares equal to 1000.
+    assert "1337" in out, out
+    assert "CMP=EQ" in out, out
+    sum_line = [ln for ln in out.splitlines() if ln.startswith("SUM=")][0]
+    dif_line = [ln for ln in out.splitlines() if ln.startswith("DIF=")][0]
+    assert sum_line.replace("SUM=", "").strip() == "1337", sum_line
+    assert dif_line.replace("DIF=", "").strip() == "1000", dif_line
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL #2: generated ".pyz" self-containment (driver packaging).
+#
+# A "cobc -x" / "cobc -m" artifact must bundle the libcob_py runtime package so
+# the emitted module's "import libcob_py" resolves from INSIDE the archive
+# (zipimport), letting the ".pyz" run with NO source-tree PYTHONPATH.  This test
+# builds an executable ".pyz" with COB_LIBPY_DIR pointed at the in-tree runtime,
+# asserts the archive carries the 11 runtime modules, and then runs it in a
+# deliberately CLEAN environment (empty PYTHONPATH, cwd != repo root) so a pass
+# can only mean the runtime was packaged, not picked up ambiently.
+# ---------------------------------------------------------------------------
+def _isolated_run_env():
+    """A minimal environment with NO source-tree PYTHONPATH (so libcob_py can
+    only resolve from inside the archive under test)."""
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "PYTHONPATH": "",          # explicitly drop any inherited repo-root entry
+    }
+
+
+@requires_cobc
+def test_generated_pyz_is_self_contained(tmp_path):
+    """CRITICAL #2: a "cobc -x" ".pyz" bundles libcob_py and runs with no
+    source-tree PYTHONPATH (import resolves from inside the archive)."""
+    prog = tmp_path / "pkgtest.cob"
+    prog.write_text(
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. PKGTEST.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WS-A   PIC S9(8) USAGE COMP.\n"
+        "       01 WS-R   PIC -(9)9.\n"
+        "       PROCEDURE DIVISION.\n"
+        "           MOVE 1000 TO WS-A.\n"
+        "           ADD 337 TO WS-A.\n"
+        "           MOVE WS-A TO WS-R.\n"
+        "           DISPLAY \"PKGTEST SUM=\" WS-R.\n"
+        "           STOP RUN.\n"
+    )
+    cobc = cobc_path()
+    interp = _generated_python_interpreter()
+    pyz = tmp_path / "pkgtest"
+
+    # Build env: COB_LIBPY_DIR -> in-tree runtime (so the archive is built from
+    # the source-tree package), COB_PYTHON -> this interpreter (it runs the
+    # py_compile/zipapp packaging step), COB_CONFIG_DIR -> in-tree dialects.
+    build_env = dict(os.environ)
+    build_env["COB_LIBPY_DIR"] = str(REPO_ROOT / "libcob_py")
+    build_env["COB_PYTHON"] = interp
+    build_env["COB_CONFIG_DIR"] = str(REPO_ROOT / "config")
+    comp = subprocess.run(
+        [cobc, "-x", "-o", str(pyz), str(prog)],
+        cwd=str(tmp_path), capture_output=True, timeout=120, check=False,
+        env=build_env,
+    )
+    assert comp.returncode == 0, (
+        "cobc -x packaging failed:\n%s" % comp.stderr.decode("latin-1", "replace"))
+    assert pyz.is_file(), "cobc -x did not emit the expected .pyz"
+
+    # The archive must carry the runtime package - the 11 runtime modules.
+    names = zipfile.ZipFile(str(pyz)).namelist()
+    runtime_mods = sorted(
+        n for n in names if n.startswith("libcob_py/") and n.endswith(".py"))
+    assert len(runtime_mods) == 11, (
+        "expected 11 bundled runtime modules, got %d: %s"
+        % (len(runtime_mods), runtime_mods))
+    # Build-only / non-runtime files must NOT be bundled.
+    assert not any("pyproject.toml" in n for n in names), names
+    assert not any("__pycache__" in n for n in names), names
+    assert not any(n.endswith(("Makefile", "Makefile.am", "Makefile.in"))
+                   for n in names), names
+
+    # Run the archive in ISOLATION: clean env, empty PYTHONPATH, cwd = tmp_path
+    # (NOT the repo root).  A pass proves "import libcob_py" came from the .pyz.
+    run = subprocess.run(
+        [interp, str(pyz)],
+        cwd=str(tmp_path), capture_output=True, timeout=120, check=False,
+        env=_isolated_run_env(),
+    )
+    out = run.stdout.decode("latin-1", "replace")
+    assert run.returncode == 0, (
+        "isolated .pyz run failed (rc=%d):\n%s"
+        % (run.returncode, run.stderr.decode("latin-1", "replace")))
+    assert "PKGTEST SUM=" in out and "1337" in out, out
+
+
+@requires_cobc
+def test_libcob_py_not_importable_without_archive(tmp_path):
+    """Negative control for CRITICAL #2: in the same clean environment used by
+    the isolation test, libcob_py is NOT importable without the archive - so the
+    self-containment pass above genuinely exercises in-archive resolution."""
+    interp = _generated_python_interpreter()
+    probe = subprocess.run(
+        [interp, "-c", "import libcob_py"],
+        cwd=str(tmp_path), capture_output=True, timeout=60, check=False,
+        env=_isolated_run_env(),
+    )
+    assert probe.returncode != 0, (
+        "libcob_py was importable from the ambient environment; the isolation "
+        "test would not prove in-archive resolution")
+    assert b"ModuleNotFoundError" in probe.stderr or b"ImportError" in probe.stderr, (
+        probe.stderr.decode("latin-1", "replace"))
 

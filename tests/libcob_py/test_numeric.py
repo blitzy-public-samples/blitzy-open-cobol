@@ -38,6 +38,8 @@ HARD CONSTRAINTS (AAP sections 0.5 / 0.7.1):
   parallel-built ``libcob_py`` package is not yet importable.
 """
 import decimal
+import pathlib
+import re
 import struct
 import sys
 
@@ -983,6 +985,103 @@ class TestBinaryFamily:
         data = bytearray((-5).to_bytes(2, sys.byteorder, signed=True))
         assert numeric.cob_cmp_s16_binary(data, -5) == 0
         assert numeric.cob_cmp_s16_binary(data, 0) < 0
+
+    # -- Swapped (byte-reversed) ADD / SUB ----------------------------------
+    # REVIEW FIX (CRITICAL #3): cob_addswp_*/cob_subswp_* operate on storage
+    # held in the *opposite* byte order to the host, so they read/modify/write
+    # big-endian regardless of sys.byteorder (mirrors libcob/codegen.h, which
+    # wraps the value in COB_BSWAP_NN before/after the integer op).  The swapped
+    # family has NO 8-bit member (swapping one byte is a no-op), hence widths
+    # start at 16.
+    @pytest.mark.parametrize("bits", [16, 24, 32, 40, 48, 56, 64])
+    def test_addswp_subswp_big_endian_roundtrip(self, bits):
+        nbytes = bits // 8
+        for prefix, signed in (("u", False), ("s", True)):
+            addswp = getattr(numeric, "cob_addswp_%s%d_binary" % (prefix, bits))
+            subswp = getattr(numeric, "cob_subswp_%s%d_binary" % (prefix, bits))
+            # Value is stored big-endian (the swapped order) on every host.
+            data = bytearray((1000).to_bytes(nbytes, "big", signed=signed))
+            addswp(data, 337)
+            assert int.from_bytes(bytes(data), "big", signed=signed) == 1337
+            subswp(data, 337)
+            assert int.from_bytes(bytes(data), "big", signed=signed) == 1000
+
+    def test_addswp_is_big_endian_not_native(self):
+        # A host-order add of 0x0102 to 0x0001 would touch the low byte only on
+        # a little-endian box; the swapped helper must instead behave big-endian
+        # so 0x0001 + 0x0102 == 0x0103 with the high byte first.
+        data = bytearray((1).to_bytes(2, "big"))
+        numeric.cob_addswp_u16_binary(data, 0x0102)
+        assert bytes(data) == bytes([0x01, 0x03])
+
+    def test_addswp_signed_negative_wraps_big_endian(self):
+        data = bytearray((-1 & 0xFFFF).to_bytes(2, "big"))      # 0xFFFF
+        numeric.cob_addswp_s16_binary(data, -1)                 # -> -2
+        assert bytes(data) == bytes([0xFF, 0xFE])
+
+    # -- Aligned swapped COMPARE --------------------------------------------
+    @pytest.mark.parametrize("bits", [16, 32, 64])
+    def test_cmpswp_align_aliases_cmpswp(self, bits):
+        """Aligned swapped compares alias the plain swapped compares - the C
+        ``cob_cmpswp_align_*`` and ``cob_cmpswp_*`` bodies are identical (the
+        alignment hint is meaningless once the value is a Python int)."""
+        for prefix in ("u", "s"):
+            assert (getattr(numeric, "cob_cmpswp_align_%s%d_binary" % (prefix, bits))
+                    is getattr(numeric, "cob_cmpswp_%s%d_binary" % (prefix, bits)))
+
+    def test_cmpswp_align_compare_big_endian(self):
+        # Stored value (big-endian) 258 vs the argument; sign of the result
+        # follows the C contract: -1 when stored < arg, +1 when stored > arg.
+        data = bytearray((258).to_bytes(4, "big"))
+        assert numeric.cob_cmpswp_align_s32_binary(data, 258) == 0
+        assert numeric.cob_cmpswp_align_s32_binary(data, 300) < 0
+        assert numeric.cob_cmpswp_align_s32_binary(data, 100) > 0
+
+
+# ===========================================================================
+# Emitter<->runtime symbol-coverage AUDIT (REVIEW FIX - CRITICAL #3).
+#
+# Every ``cob_*_binary`` helper the code generator can emit is declared in the
+# authoritative, immutable reference header ``libcob/codegen.h`` (AAP 0.2.3 /
+# 0.6.5).  ``typeck.c`` / ``codegen.c`` route these names straight to the
+# ``numeric`` module, so a helper that the header declares but ``numeric.py``
+# does not define becomes a hard ``AttributeError`` inside a *generated*
+# program - exactly the regression this checkpoint flagged (34 swapped/aligned
+# helpers were missing).  This audit parses the header and asserts the runtime
+# defines a *callable* for EVERY emitted symbol, pinning the contract so the
+# gap can never silently reopen.
+# ===========================================================================
+class TestEmittedSymbolAudit:
+    """Assert ``libcob_py.numeric`` defines every emitted ``cob_*_binary``."""
+
+    # Matches cob_cmp/add/sub[swp]_[align_]?{u,s}{8..64}_binary uniformly.
+    _SYM_RE = re.compile(r"cob_[a-z]+_(?:align_)?[us][0-9]+_binary")
+
+    def _header_symbols(self):
+        header = (pathlib.Path(__file__).resolve().parents[2]
+                  / "libcob" / "codegen.h")
+        if not header.is_file():
+            pytest.skip("libcob/codegen.h not available in this layout")
+        text = header.read_text(encoding="utf-8", errors="replace")
+        syms = set(self._SYM_RE.findall(text))
+        assert syms, "parsed zero cob_*_binary symbols from codegen.h"
+        return syms
+
+    def test_every_emitted_binary_helper_is_callable(self):
+        syms = self._header_symbols()
+        missing = sorted(s for s in syms
+                         if not callable(getattr(numeric, s, None)))
+        assert not missing, (
+            "numeric.py is missing %d emitted binary helper symbol(s) that "
+            "codegen.h declares: %s" % (len(missing), missing))
+
+    def test_full_family_cardinality_is_128(self):
+        # Guards against a header-parser change that silently matches nothing
+        # (which would make the audit pass vacuously): the documented helper
+        # family in the immutable codegen.h is exactly 128 unique symbols
+        # (cmp/add/sub x {u,s} x 8 widths = 48; *_align x {u,s} x 3 = 18;
+        # *swp x {u,s} x 7 widths = 56; cmpswp_align x {u,s} x 3 = 6).
+        assert len(self._header_symbols()) == 128
 
 
 # ===========================================================================

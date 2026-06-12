@@ -1612,13 +1612,18 @@ def cob_cmp_long_sign_numdisp(data, size, n):
 # Binary integer fast paths (codegen.h L32-L102, L505-L2675).
 #
 # The C header generates a dense family of width/sign specialised inline
-# helpers.  They all reduce to: read ``NN/8`` bytes as a native (``cob_cmp_*`` /
-# ``cob_add_*`` / ``cob_sub_*``) or big-endian (``cob_cmpswp_*`` /
-# ``cob_setswp_*``) integer of the given signedness, then compare / add / store.
-# We synthesise the exact ``cob_*_{u,s}NN_binary`` names so the emitter's
-# call-sites resolve unchanged, with the per-width parameters bound as defaults
-# to avoid closure late-binding.  Aligned variants are semantic aliases of the
-# plain ones (memory alignment is a C-only concern).
+# helpers.  They all reduce to: read ``NN/8`` bytes as a native
+# (``cob_cmp_*`` / ``cob_add_*`` / ``cob_sub_*``) or byte-swapped/big-endian
+# (``cob_cmpswp_*`` / ``cob_addswp_*`` / ``cob_subswp_*`` / ``cob_setswp_*``)
+# integer of the given signedness, then compare / add / subtract / store.
+# We synthesise the EXACT ``cob_*_{u,s}NN_binary`` names the emitter can produce
+# (the authoritative set is the 128 ``cob_*_binary`` declarations in
+# ``libcob/codegen.h``) so every call-site resolves unchanged, with the per-width
+# parameters bound as defaults to avoid closure late-binding.  Aligned variants
+# (``cob_*_align_*``, including ``cob_cmpswp_align_*``) are semantic aliases of
+# their unaligned namesakes (memory alignment is a C-only concern).  An
+# emitted-symbol audit test (tests/libcob_py/test_numeric.py) asserts this family
+# is exhaustive vs codegen.h so a missing helper can never silently recur.
 # ===========================================================================
 
 _NATIVE_ORDER = sys.byteorder
@@ -1674,11 +1679,34 @@ def _register_binary_family():
                 def _setswp(data, val, _nb=nbytes):
                     _setswp_bin(data, val, _nb)
 
+                # MIGRATION (C->Python) / REVIEW FIX: byte-swapped read-modify-write
+                # add/sub helpers (codegen.h ``cob_addswp_*`` L1940 / ``cob_subswp_*``
+                # L2237).  C reads the operand big-endian, applies +/- val, then
+                # writes it back big-endian - i.e. ``*p = COB_BSWAP(COB_BSWAP(*p)
+                # +/- val)`` with low-byte truncation on overflow.  ``_add_bin`` with
+                # order="big" reproduces this exactly (negation gives subtract).
+                # These 28 symbols (u/s x widths 16..64) were previously NOT
+                # synthesised, so a COMP/COMP-4 (BINARY-SWAP) ADD/SUBTRACT routed
+                # here by typeck.c/codegen.c raised AttributeError at run time.
+                def _addswp(data, val, _nb=nbytes, _sg=is_signed):
+                    _add_bin(data, val, _nb, _sg, "big")
+
+                def _subswp(data, val, _nb=nbytes, _sg=is_signed):
+                    _add_bin(data, -val, _nb, _sg, "big")
+
                 g["cob_cmpswp_%s%d_binary" % (prefix, bits)] = _cmpswp
                 g["cob_setswp_%s%d_binary" % (prefix, bits)] = _setswp
+                g["cob_addswp_%s%d_binary" % (prefix, bits)] = _addswp
+                g["cob_subswp_%s%d_binary" % (prefix, bits)] = _subswp
 
     # Aligned variants: identical semantics in Python (alignment is a C memory
-    # concern), so alias them to the plain helpers.
+    # concern), so alias them to the plain helpers.  This covers the native
+    # aligned family (``cob_*_align_*``) AND the byte-swapped aligned compare
+    # (``cob_cmpswp_align_*``, codegen.h L472) - in C the only difference between
+    # ``cob_cmpswp_align_sNN`` and ``cob_cmpswp_sNN`` is the (here irrelevant)
+    # alignment of the big-endian load; the value semantics are identical, so the
+    # alias is byte-for-byte correct.  REVIEW FIX: the 6 ``cob_cmpswp_align_*``
+    # symbols were previously absent.
     for bits in _ALIGN_WIDTHS:
         for prefix in ("u", "s"):
             g["cob_cmp_align_%s%d_binary" % (prefix, bits)] = (
@@ -1687,6 +1715,8 @@ def _register_binary_family():
                 g["cob_add_%s%d_binary" % (prefix, bits)])
             g["cob_sub_align_%s%d_binary" % (prefix, bits)] = (
                 g["cob_sub_%s%d_binary" % (prefix, bits)])
+            g["cob_cmpswp_align_%s%d_binary" % (prefix, bits)] = (
+                g["cob_cmpswp_%s%d_binary" % (prefix, bits)])
 
 
 _register_binary_family()

@@ -471,6 +471,13 @@ def test_cobcancel_runs_handler_and_evicts(lib_dir):
     assert flags["cancelled"] is True
     assert call.lookup("CPROG") is None
     assert "CPROG" not in sys.modules
+    # REVIEW FIX (MAJOR #7): the cancel handler is evicted too (no stale entry).
+    assert "CPROG" not in call._cancel_handlers
+
+    # A second CANCEL of the same name must NOT re-run the (now removed) handler.
+    flags["cancelled"] = False
+    call.cobcancel("CPROG")
+    assert flags["cancelled"] is False
 
 
 def test_cobcancel_none_name_aborts():
@@ -488,6 +495,56 @@ def test_field_cancel(lib_dir):
     call.cob_field_cancel(_name_field("DPROG", 16))
     assert call.lookup("DPROG") is None
     assert "DPROG" not in sys.modules
+
+
+# ===========================================================================
+# Phase 2b - STOP RUN / tidy teardown of the (unbounded-by-design) caches
+# (cob_exit_call, REVIEW FIX MAJOR #7)
+# ===========================================================================
+def test_cob_exit_call_clears_both_caches():
+    """cob_exit_call releases the call cache AND the cancel-handler table."""
+    call._call_cache["A"] = lambda: 0
+    call._call_cache["B"] = lambda: 0
+    call._cancel_handlers["A"] = lambda *a: 0
+    call.cob_exit_call()
+    assert call._call_cache == {}
+    assert call._cancel_handlers == {}
+    # Idempotent: a second call is a harmless no-op.
+    call.cob_exit_call()
+    assert call._call_cache == {}
+
+
+def test_cob_exit_call_is_invoked_by_runtime_shutdown():
+    """common._shutdown_runtime (the STOP RUN / cobtidy teardown) evicts the
+    loader caches via cob_exit_call - so the caches never outlive the run."""
+    call._call_cache["RESIDENT"] = lambda: 0
+    call._cancel_handlers["RESIDENT"] = lambda *a: 0
+    common._shutdown_runtime()
+    assert "RESIDENT" not in call._call_cache
+    assert "RESIDENT" not in call._cancel_handlers
+
+
+def test_cobtidy_clears_loader_caches():
+    """cobtidy() (STOP RUN without process exit) tears the caches down too."""
+    call._call_cache["TIDYP"] = lambda: 0
+    call._cancel_handlers["TIDYP"] = lambda *a: 0
+    assert common.cobtidy() == 0
+    assert call._call_cache == {}
+    assert call._cancel_handlers == {}
+
+
+def test_call_cache_is_unbounded_by_design(lib_dir):
+    """Residency contract: repeated distinct inserts all persist (no eviction).
+
+    A bounded/LRU cache would silently drop a resident program's WORKING-STORAGE
+    state; the runtime must keep every entry until CANCEL or STOP RUN.
+    """
+    for i in range(64):
+        call.insert("PROG%02d" % i, (lambda i=i: i))
+    assert len(call._call_cache) >= 64
+    # Every entry is still individually resolvable (none evicted).
+    for i in range(64):
+        assert call.lookup("PROG%02d" % i) is not None
 
 
 # ===========================================================================

@@ -62,13 +62,25 @@ COBPY_FILES = $(COBPY_MODULES) pyproject.toml
 # Automake's AM_PATH_PYTHON, so no $(pythondir) is defined.  Consumers locate
 # the package by placing this directory on COB_LIBRARY_PATH / PYTHONPATH.
 cobpydir = $(pkgdatadir)/libcob_py
-cobpy_DATA = $(COBPY_FILES)
+# REVIEW FIX (MINOR #10): install EXACTLY the 11 runtime Python modules as
+# package data.  pyproject.toml is a setuptools build manifest, not a runtime
+# module, so it must NOT be installed alongside the runtime (it is distributed
+# only via EXTRA_DIST below).  This also keeps the installed layout consistent
+# with the self-contained ".pyz" staging (cobc_build_pyz / the PYZ recipe), both
+# of which bundle modules only.  The "dist_" prefix is required because Automake
+# does NOT distribute plain *_DATA files by default; it makes the 11 modules part
+# of BOTH the install set and the "make dist" tarball (the previous
+# "EXTRA_DIST = $(COBPY_FILES)" had distributed them, so dropping that line
+# without "dist_" here would silently remove them from the source distribution).
+dist_cobpy_DATA = $(COBPY_MODULES)
 
-# MIGRATION (C->Python): ship every package source (and the manifest) in the
-# distribution tarball so "make dist" packages the runtime alongside the
-# compiler.  Also distribute the package README placeholder directory marker is
-# unnecessary here because cobpy_DATA already covers all sources.
-EXTRA_DIST = $(COBPY_FILES)
+# MIGRATION (C->Python): ship the setuptools manifest in the distribution tarball
+# so "make dist" packages it alongside the runtime.  REVIEW FIX (MINOR #10):
+# pyproject.toml lives ONLY here (source-distribution input), never in
+# (dist_)cobpy_DATA (installed runtime data).  The 11 runtime modules are
+# distributed via the dist_cobpy_DATA primary above; pyproject.toml is added
+# explicitly so the manifest is not dropped from the tarball.
+EXTRA_DIST = pyproject.toml
 
 # MIGRATION (C->Python): build the self-contained runtime archive
 # dist/libcob_py.pyz (AAP 0.3.1 / 0.5.1) with the standard-library zipapp
@@ -85,12 +97,16 @@ EXTRA_DIST = $(COBPY_FILES)
 # not be committed.
 PYZ_ARCHIVE = $(top_builddir)/dist/libcob_py.pyz
 
-$(PYZ_ARCHIVE): $(COBPY_FILES)
+# REVIEW FIX (MINOR #10 / MINOR #11): stage ONLY the 11 runtime modules into the
+# archive (no pyproject.toml) so the .pyz build inputs match dist/README.md and
+# the driver's cobc_build_pyz behaviour - the manifest is a source-distribution
+# input, not a runtime module bundled into the archive.
+$(PYZ_ARCHIVE): $(COBPY_MODULES)
 	@$(MKDIR_P) "$(top_builddir)/dist"
 	@echo "Creating dist/libcob_py.pyz (zipapp) ..."
 	@stagedir=`mktemp -d`; \
 	$(MKDIR_P) "$$stagedir/libcob_py"; \
-	for f in $(COBPY_FILES); do \
+	for f in $(COBPY_MODULES); do \
 		cp "$(srcdir)/$$f" "$$stagedir/libcob_py/$$f"; \
 	done; \
 	printf '%s\n' \

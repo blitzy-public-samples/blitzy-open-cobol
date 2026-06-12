@@ -43,21 +43,23 @@ CONVENTIONS FOR TEST MODULES IN THIS SUITE
 
   This yields a clean *skip* (not a collection error) when the parallel-built
   runtime - or a specific runtime sub-module - is not yet importable.
-* The suite is intended to run from the ``tests/`` directory with the repository
-  root on ``sys.path`` (placed there by this ``conftest.py``), matching the
-  ``tests/Makefile.am`` ``check-local`` invocation::
+* The suite is intended to run with the repository root on ``sys.path`` (placed
+  there by this ``conftest.py``), matching the ``tests/Makefile.am``
+  ``check-local`` invocation.  That invocation uses importlib import mode plus
+  namespace packages so this test package never shadows the runtime package, and
+  gates each module at >=80% LINE coverage individually::
 
-      $(COB_PYTHON) -m coverage run --branch --source=<repo>/libcob_py \\
-          -m pytest -q <repo>/tests/libcob_py
-      coverage report --fail-under=80
+      $(COB_PYTHON) -m coverage run --source=<repo>/libcob_py \\
+          -m pytest -q --import-mode=importlib \\
+          -o consider_namespace_packages=true <repo>/tests/libcob_py
+      # then a per-module >=80% line-coverage gate (see tests/Makefile.am)
 
 * The skip markers defined below (``requires_libcob_py``, ``requires_cobc``,
   ``requires_dual_cobc``, ``requires_curses``) are exposed as module-level names
-  *and* registered as named pytest markers.  Because ``tests/`` is a package
-  (see ``tests/__init__.py``), test modules in this suite may import them with
-  ``from tests.libcob_py.conftest import requires_curses`` when convenient; the
-  rootdir-safe ``pytest.importorskip`` pattern above is preferred for the
-  runtime dependency itself.
+  *and* registered as named pytest markers.  Under the suite's importlib import
+  mode the rootdir-safe ``pytest.importorskip`` pattern above is the preferred
+  way to reach the runtime dependency; an intra-package relative import such as
+  ``from .conftest import requires_curses`` also works for the markers.
 """
 
 from __future__ import annotations
@@ -89,12 +91,16 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # Insert the repository root at the FRONT of ``sys.path`` if it is not already
-# present.  When ``tests/`` is a package (it is - see ``tests/__init__.py``),
-# pytest already discovers the repository root as its rootdir and places it on
-# ``sys.path``; this insertion is then a harmless no-op.  It still guarantees
-# correctness for alternative invocation styles (e.g. running a single test
-# file directly, or from a different working directory) where pytest might not
-# have added the repository root.
+# present.  This is the mechanism that guarantees ``import libcob_py`` resolves
+# to the pure-Python runtime package at ``<repo>/libcob_py`` rather than to this
+# identically-stemmed test package: under the suite's importlib import mode
+# (``--import-mode=importlib -o consider_namespace_packages=true``, configured in
+# ``tests/Makefile.am`` - REVIEW FIX CRITICAL #4) test modules are imported by
+# unique path-derived names, and placing the repository root first on
+# ``sys.path`` makes the runtime package importable by its plain name.  The
+# insertion also keeps alternative invocation styles correct (e.g. running a
+# single test file directly, or from a different working directory) where pytest
+# might not have added the repository root.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

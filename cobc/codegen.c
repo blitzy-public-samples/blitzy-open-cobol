@@ -5221,7 +5221,13 @@ output_main_function (struct cb_program *prog)
 	output_comment ("Main entry point");
 	output_line ("def main ():");
 	output_block_open ();
-	output_line ("common.cob_init (sys.argv)");
+	/* MIGRATION / REVIEW FIX (CRITICAL #1): common.cob_init has the C-style
+	   signature cob_init(argc=0, argv=None).  Emitting "cob_init (sys.argv)"
+	   passed the argv LIST as the argc parameter, corrupting _cob_argc (it
+	   became a list, breaking ACCEPT FROM ARGUMENT-NUMBER / COMMAND-LINE and any
+	   cob_get_environment/argument API).  Pass the count and the vector
+	   explicitly, mirroring the C "main (argc, argv) -> cob_init (argc, argv)". */
+	output_line ("common.cob_init (len (sys.argv), sys.argv)");
 	output_line ("common.cob_stop_run (%s ())", prog->program_id);
 	output_block_close ();
 	output_newline ();
