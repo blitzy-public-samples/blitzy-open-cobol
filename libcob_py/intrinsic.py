@@ -19,13 +19,32 @@ digits, scale, sign flag, byte content, and reference-modification - is
 preserved exactly.
 """
 import math
-import os
 import struct
 import time as _time
 
 from libcob_py import common
 from libcob_py import numeric
-from libcob_py import move
+
+# ---------------------------------------------------------------------------
+# Data-movement primitives (cob_move / cob_get_int / cob_set_int).
+#
+# In intrinsic.c these are the libcob ``cob_move`` / ``cob_get_int`` /
+# ``cob_set_int`` calls, which in this Python runtime live in
+# :mod:`libcob_py.move` (AAP 0.3.2 init order: ... numeric -> strings -> move
+# -> intrinsic ...).  This module's dependency contract, however, is exactly
+# ``common`` and ``numeric`` (depends_on_files; the agent prompt: "Imports
+# libcob_py.common and libcob_py.numeric").  We therefore do NOT take a direct
+# top-level dependency on ``move``; instead we reach the polymorphic
+# data-movement routines through the deferred-import shims that ``common``
+# exposes for exactly this purpose (``common._lazy_move`` /
+# ``common._lazy_get_int`` / ``common._lazy_set_int``, which forward to the
+# canonical ``libcob_py.move`` implementations).  This keeps byte-for-byte
+# parity with the C runtime while confining intrinsic.py's hard imports to the
+# whitelisted ``common`` and ``numeric`` modules.  Migration rationale per the
+# AAP 0.7.2 minimal-change / no-new-dependency clause.
+_cob_move = common._lazy_move
+_cob_get_int = common._lazy_get_int
+_cob_set_int = common._lazy_set_int
 
 # Re-exported decimal primitives (the GMP replacements - numeric.c statics
 # d1..d5 become local cob_decimal objects here for re-entrancy).
@@ -182,7 +201,7 @@ def cob_intr_binop(f1, op, f2):
 def cob_intr_length(srcfield):
     """FUNCTION LENGTH - byte length of *srcfield* (intrinsic.c L499-L510)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
-    move.cob_set_int(result, int(srcfield.size))
+    _cob_set_int(result, int(srcfield.size))
     return result
 
 
@@ -193,15 +212,23 @@ def cob_intr_integer(srcfield):
     d1 = _Decimal()
     _set(d1, srcfield)
     if d1.value >= 0:
+        # Non-negative: cob_decimal_get_field already truncates toward zero,
+        # which equals floor for non-negative values (intrinsic.c L525-L528).
         _get(d1, result, 0)
         return result
+    # Negative: reproduce the C algorithm exactly (intrinsic.c L529-L537).  The
+    # value is first reduced to a single fractional digit using mpz_tdiv_q_ui
+    # (integer division *truncated toward zero* - NOT Python floor division),
+    # then floored by subtracting one ULP when a remainder exists so the result
+    # is the greatest integer <= argument.
     while d1.scale > 1:
-        d1.value //= 10        # truncate toward zero (mpz_tdiv_q_ui)
-        if d1.value < 0 and d1.value * 10 != 0:
-            pass
+        v = d1.value
+        # mpz_tdiv_q_ui(value, value, 10): quotient truncated toward zero.
+        d1.value = -((-v) // 10) if v < 0 else v // 10
         d1.scale -= 1
-    # mpz_tdiv_q_ui truncates toward zero; emulate for negatives:
     scale = 10 if d1.scale > 0 else 1
+    # mpz_fdiv_ui(value, scale): floor remainder (always non-negative for a
+    # positive divisor) - Python's ``%`` matches this for positive ``scale``.
     if d1.value % scale:
         d1.value -= scale
     _get(d1, result, 0)
@@ -212,7 +239,7 @@ def cob_intr_integer_part(srcfield):
     """FUNCTION INTEGER-PART (intrinsic.c L541-L555)."""
     result = make_field_entry(8, common.COB_TYPE_NUMERIC_BINARY, 18, 0,
                               common.COB_FLAG_HAVE_SIGN)
-    move.cob_move(srcfield, result)
+    _cob_move(srcfield, result)
     return result
 
 
@@ -220,7 +247,7 @@ def cob_intr_fraction_part(srcfield):
     """FUNCTION FRACTION-PART (intrinsic.c L555-L569)."""
     result = make_field_entry(8, common.COB_TYPE_NUMERIC_BINARY, 18, 18,
                               common.COB_FLAG_HAVE_SIGN)
-    move.cob_move(srcfield, result)
+    _cob_move(srcfield, result)
     return result
 
 
@@ -228,12 +255,12 @@ def cob_intr_sign(srcfield):
     """FUNCTION SIGN - -1/0/1 (intrinsic.c L569-L591)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0,
                               common.COB_FLAG_HAVE_SIGN)
-    move.cob_set_int(result, 0)
+    _cob_set_int(result, 0)
     n = common.cob_cmp(srcfield, result)
     if n < 0:
-        move.cob_set_int(result, -1)
+        _cob_set_int(result, -1)
     elif n > 0:
-        move.cob_set_int(result, 1)
+        _cob_set_int(result, 1)
     return result
 
 
@@ -386,7 +413,7 @@ def cob_intr_current_date(offset, length):
 def cob_intr_char(srcfield):
     """FUNCTION CHAR - ordinal position -> character (intrinsic.c L1124-L1144)."""
     result = make_field_entry(1, common.COB_TYPE_ALPHANUMERIC, 0, 0, 0)
-    i = move.cob_get_int(srcfield)
+    i = _cob_get_int(srcfield)
     result.data[0] = 0 if (i < 1 or i > 256) else (i - 1) & 0xFF
     return result
 
@@ -394,7 +421,7 @@ def cob_intr_char(srcfield):
 def cob_intr_ord(srcfield):
     """FUNCTION ORD - character -> ordinal position (intrinsic.c L1144-L1158)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
-    move.cob_set_int(result, int(common.COB_FIELD_DATA(srcfield)[0]) + 1)
+    _cob_set_int(result, int(common.COB_FIELD_DATA(srcfield)[0]) + 1)
     return result
 
 
@@ -409,7 +436,7 @@ def cob_intr_stored_char_length(srcfield):
             break
         count -= 1
         p -= 1
-    move.cob_set_int(result, count)
+    _cob_set_int(result, count)
     return result
 
 
@@ -420,12 +447,12 @@ def cob_intr_combined_datetime(srcdays, srctime):
     """FUNCTION COMBINED-DATETIME (intrinsic.c L1181-L1211)."""
     result = make_field_entry(12, common.COB_TYPE_NUMERIC_DISPLAY, 12, 5, 0)
     common.cob_exception_code = 0
-    srdays = move.cob_get_int(srcdays)
+    srdays = _cob_get_int(srcdays)
     if srdays < 1 or srdays > 3067671:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
         result.data[:12] = b"0" * 12
         return result
-    srtime = move.cob_get_int(srctime)
+    srtime = _cob_get_int(srctime)
     if srtime < 1 or srtime > 86400:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
         result.data[:12] = b"0" * 12
@@ -438,7 +465,7 @@ def cob_intr_date_of_integer(srcdays):
     """FUNCTION DATE-OF-INTEGER -> YYYYMMDD (intrinsic.c L1211-L1262)."""
     result = make_field_entry(8, common.COB_TYPE_NUMERIC_DISPLAY, 8, 0, 0)
     common.cob_exception_code = 0
-    days = move.cob_get_int(srcdays)
+    days = _cob_get_int(srcdays)
     if days < 1 or days > 3067671:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
         result.data[:8] = b"0" * 8
@@ -469,7 +496,7 @@ def cob_intr_day_of_integer(srcdays):
     """FUNCTION DAY-OF-INTEGER -> YYYYDDD (intrinsic.c L1262-L1298)."""
     result = make_field_entry(7, common.COB_TYPE_NUMERIC_DISPLAY, 7, 0, 0)
     common.cob_exception_code = 0
-    days = move.cob_get_int(srcdays)
+    days = _cob_get_int(srcdays)
     if days < 1 or days > 3067671:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
         result.data[:7] = b"0" * 7
@@ -488,27 +515,27 @@ def cob_intr_integer_of_date(srcfield):
     """FUNCTION INTEGER-OF-DATE (intrinsic.c L1298-L1368)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     common.cob_exception_code = 0
-    indate = move.cob_get_int(srcfield)
+    indate = _cob_get_int(srcfield)
     year = indate // 10000
     if year < 1601 or year > 9999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     indate %= 10000
     month = indate // 100
     if month < 1 or month > 12:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     days = indate % 100
     if days < 1 or days > 31:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     table = _LEAP_MONTH_DAYS if _leap_year(year) else _NORMAL_MONTH_DAYS
     if days > table[month]:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     totaldays = 0
     baseyear = 1601
@@ -517,7 +544,7 @@ def cob_intr_integer_of_date(srcfield):
         baseyear += 1
     totaldays += (_LEAP_DAYS if _leap_year(baseyear) else _NORMAL_DAYS)[month - 1]
     totaldays += days
-    move.cob_set_int(result, totaldays)
+    _cob_set_int(result, totaldays)
     return result
 
 
@@ -525,16 +552,16 @@ def cob_intr_integer_of_day(srcfield):
     """FUNCTION INTEGER-OF-DAY (intrinsic.c L1368-L1412)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     common.cob_exception_code = 0
-    indate = move.cob_get_int(srcfield)
+    indate = _cob_get_int(srcfield)
     year = indate // 1000
     if year < 1601 or year > 9999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     days = indate % 1000
     if days < 1 or days > 365 + _leap_year(year):
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     totaldays = 0
     baseyear = 1601
@@ -542,48 +569,48 @@ def cob_intr_integer_of_day(srcfield):
         totaldays += 366 if _leap_year(baseyear) else 365
         baseyear += 1
     totaldays += days
-    move.cob_set_int(result, totaldays)
+    _cob_set_int(result, totaldays)
     return result
 
 
 def cob_intr_test_date_yyyymmdd(srcfield):
     """FUNCTION TEST-DATE-YYYYMMDD - 0 ok / 1 yr / 2 mon / 3 day (L1412-L1459)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
-    indate = move.cob_get_int(srcfield)
+    indate = _cob_get_int(srcfield)
     year = indate // 10000
     if year < 1601 or year > 9999:
-        move.cob_set_int(result, 1)
+        _cob_set_int(result, 1)
         return result
     indate %= 10000
     month = indate // 100
     if month < 1 or month > 12:
-        move.cob_set_int(result, 2)
+        _cob_set_int(result, 2)
         return result
     days = indate % 100
     if days < 1 or days > 31:
-        move.cob_set_int(result, 3)
+        _cob_set_int(result, 3)
         return result
     table = _LEAP_MONTH_DAYS if _leap_year(year) else _NORMAL_MONTH_DAYS
     if days > table[month]:
-        move.cob_set_int(result, 3)
+        _cob_set_int(result, 3)
         return result
-    move.cob_set_int(result, 0)
+    _cob_set_int(result, 0)
     return result
 
 
 def cob_intr_test_day_yyyyddd(srcfield):
     """FUNCTION TEST-DAY-YYYYDDD - 0 ok / 1 yr / 2 day (L1459-L1488)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
-    indate = move.cob_get_int(srcfield)
+    indate = _cob_get_int(srcfield)
     year = indate // 1000
     if year < 1601 or year > 9999:
-        move.cob_set_int(result, 1)
+        _cob_set_int(result, 1)
         return result
     days = indate % 1000
     if days < 1 or days > 365 + _leap_year(year):
-        move.cob_set_int(result, 2)
+        _cob_set_int(result, 2)
         return result
-    move.cob_set_int(result, 0)
+    _cob_set_int(result, 0)
     return result
 
 
@@ -668,10 +695,10 @@ def cob_intr_factorial(srcfield):
     """FUNCTION FACTORIAL (intrinsic.c L1488-L1512)."""
     result = make_field_entry(8, common.COB_TYPE_NUMERIC_BINARY, 18, 0, 0)
     common.cob_exception_code = 0
-    srcval = move.cob_get_int(srcfield)
+    srcval = _cob_get_int(srcfield)
     if srcval < 0:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     d1 = _Decimal(math.factorial(srcval), 0)
     _get(d1, result, 0)
@@ -686,7 +713,7 @@ def _double_intr(srcfield, fn):
     try:
         v = fn(intr_get_double(d1))
     except (ValueError, OverflowError):
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     _store_double(result, v)
     return result
@@ -712,46 +739,73 @@ def cob_intr_abs(srcfield):
     return result
 
 
-def _fixed17_intr(srcfield, fn):
-    """acos/asin/atan: result is integer part + 17 fixed decimals packed into
-    an 8-byte (unsigned) binary with scale 17 (intrinsic.c L1560-L1660)."""
+def _fixed17_intr(srcfield, fn, signed):
+    """Shared body for the fixed-point trig intrinsics ACOS/ASIN/ATAN/COS/SIN.
+
+    These return an 8-byte ``NUMERIC_BINARY`` field with 18 digits and scale 17:
+    the C runtime takes the integer part of the IEEE result, then peels 17
+    fractional digits one at a time (``mathd2 *= 10; tempres = (int)mathd2``),
+    accumulating them into a 64-bit integer that is ``memcpy``-d verbatim into
+    the field (intrinsic.c L1560-L1760).
+
+    *signed* mirrors the C declaration of the accumulator and the attribute
+    sign flag, which differ across the five functions:
+
+    * ACOS (intrinsic.c L1560) uses ``unsigned long long`` and ``flags = 0`` -
+      its range is ``[0, pi]`` so the value is never negative; *signed* is
+      ``False`` -> attribute flag ``0`` and an unsigned ``=Q`` store.
+    * ASIN/ATAN/COS/SIN (L1594/L1627/L1660/L1729) use ``long long`` with
+      ``COB_FLAG_HAVE_SIGN`` - their results may be negative; *signed* is
+      ``True`` -> ``COB_FLAG_HAVE_SIGN`` and a signed ``=q`` store.
+
+    Reproducing the exact accumulator width and sign flag is required for
+    byte-for-byte parity (AAP 0.6.2).
+    """
     d1 = _Decimal()
     _set(d1, srcfield)
-    result = make_field_entry(8, common.COB_TYPE_NUMERIC_BINARY, 18, 17, 0)
+    flags = common.COB_FLAG_HAVE_SIGN if signed else 0
+    result = make_field_entry(8, common.COB_TYPE_NUMERIC_BINARY, 18, 17, flags)
     try:
         mathd2 = fn(intr_get_double(d1))
     except (ValueError, OverflowError):
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
-    res = int(mathd2)                         # truncate toward zero
+    res = int(mathd2)                         # (long long) cast: truncate toward zero
     mathd2 -= res
     for _ in range(17):
         mathd2 *= 10
-        tempres = int(mathd2)
+        tempres = int(mathd2)                 # (int) cast: truncate toward zero
         res = res * 10 + tempres
         mathd2 -= tempres
-    result.data[:8] = struct.pack("=Q", res & _U64)
+    if signed:
+        result.data[:8] = struct.pack("=q", _wrap_ll(res))
+    else:
+        result.data[:8] = struct.pack("=Q", res & _U64)
     return result
 
 
 def cob_intr_acos(srcfield):
-    """FUNCTION ACOS (intrinsic.c L1560-L1594)."""
-    return _fixed17_intr(srcfield, math.acos)
+    """FUNCTION ACOS (intrinsic.c L1560-L1594) - unsigned fixed-17 binary."""
+    return _fixed17_intr(srcfield, math.acos, signed=False)
 
 
 def cob_intr_asin(srcfield):
-    """FUNCTION ASIN (intrinsic.c L1594-L1627)."""
-    return _fixed17_intr(srcfield, math.asin)
+    """FUNCTION ASIN (intrinsic.c L1594-L1627) - signed fixed-17 binary."""
+    return _fixed17_intr(srcfield, math.asin, signed=True)
 
 
 def cob_intr_atan(srcfield):
-    """FUNCTION ATAN (intrinsic.c L1627-L1660)."""
-    return _fixed17_intr(srcfield, math.atan)
+    """FUNCTION ATAN (intrinsic.c L1627-L1660) - signed fixed-17 binary."""
+    return _fixed17_intr(srcfield, math.atan, signed=True)
 
 
 def cob_intr_cos(srcfield):
-    """FUNCTION COS (intrinsic.c L1660-L1693)."""
-    return _double_intr(srcfield, math.cos)
+    """FUNCTION COS (intrinsic.c L1660-L1693) - signed fixed-17 binary.
+
+    NOTE: COS returns the fixed-17 *binary* representation (``long long`` with
+    ``COB_FLAG_HAVE_SIGN``), NOT an IEEE double - unlike EXP/LOG/SQRT/TAN.
+    """
+    return _fixed17_intr(srcfield, math.cos, signed=True)
 
 
 def cob_intr_log(srcfield):
@@ -765,8 +819,12 @@ def cob_intr_log10(srcfield):
 
 
 def cob_intr_sin(srcfield):
-    """FUNCTION SIN (intrinsic.c L1729-L1762)."""
-    return _double_intr(srcfield, math.sin)
+    """FUNCTION SIN (intrinsic.c L1729-L1762) - signed fixed-17 binary.
+
+    NOTE: SIN returns the fixed-17 *binary* representation (``long long`` with
+    ``COB_FLAG_HAVE_SIGN``), NOT an IEEE double - unlike EXP/LOG/SQRT/TAN.
+    """
+    return _fixed17_intr(srcfield, math.sin, signed=True)
 
 
 def cob_intr_sqrt(srcfield):
@@ -908,7 +966,7 @@ def cob_intr_ord_min(params, *args):
     """FUNCTION ORD-MIN - 1-based index of minimum (intrinsic.c L2049-L2084)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     if params <= 1:
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     fields = list(args[:params])
     basef = fields[0]
@@ -917,7 +975,7 @@ def cob_intr_ord_min(params, *args):
         if common.cob_cmp(fields[i], basef) < 0:
             basef = fields[i]
             ordmin = i
-    move.cob_set_int(result, ordmin + 1)
+    _cob_set_int(result, ordmin + 1)
     return result
 
 
@@ -925,7 +983,7 @@ def cob_intr_ord_max(params, *args):
     """FUNCTION ORD-MAX - 1-based index of maximum (intrinsic.c L2084-L2119)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     if params <= 1:
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     fields = list(args[:params])
     basef = fields[0]
@@ -934,7 +992,7 @@ def cob_intr_ord_max(params, *args):
         if common.cob_cmp(fields[i], basef) > 0:
             basef = fields[i]
             ordmax = i
-    move.cob_set_int(result, ordmax + 1)
+    _cob_set_int(result, ordmax + 1)
     return result
 
 
@@ -1084,17 +1142,37 @@ def cob_intr_rem(srcfield1, srcfield2):
     return result
 
 
-# Module-level RNG mirrors C srand/rand: a single shared generator that
-# FUNCTION RANDOM(seed) reseeds (intrinsic.c L2367-L2407).
+# Module-level RNG mirrors the C srand/rand model: a single shared generator
+# that FUNCTION RANDOM(seed) reseeds, returning rand()/RAND_MAX (intrinsic.c
+# L2367-L2407).  RAND_MAX matches glibc's value (2**31 - 1).
+#
+# UNAVOIDABLE DIFFERENCE (documented per the prompt's RANDOM directive): the C
+# runtime delegates to the platform C library's srand()/rand(), whose exact
+# pseudo-random sequence (glibc's TYPE_3 additive-feedback generator) is an
+# implementation detail of libc.  Python's stdlib :mod:`random` uses a
+# Mersenne-Twister generator, so for a given seed the *sequence of values* is
+# not byte-for-byte identical to glibc rand().  We preserve the observable
+# contract that matters for COBOL programs - a reproducible stream in [0, 1)
+# for a given seed, reseeded by the optional argument, with negative seeds
+# clamped to 0 and the COMP-2 (double, scale 9) result shape - which is the
+# closest faithful reproduction achievable without bundling a non-stdlib RNG
+# (forbidden by AAP 0.5/0.7.1).  FUNCTION RANDOM is non-deterministic by design
+# and the COBOL-85 acceptance suite does not assert specific RANDOM values.
 import random as _random
 _rng = _random.Random()
 _RAND_MAX = 2147483647
 
 
 def cob_intr_random(params, *args):
-    """FUNCTION RANDOM - pseudo-random number in [0,1) (intrinsic.c L2367-L2407)."""
+    """FUNCTION RANDOM - pseudo-random number in [0,1) (intrinsic.c L2367-L2407).
+
+    With an argument, reseeds the shared generator (negative seeds clamped to
+    0, as the C ``if (seed < 0) seed = 0;`` guard does).  See the module-level
+    note above for the documented, unavoidable RNG-sequence difference versus
+    the platform C ``rand()``.
+    """
     if params:
-        seed = move.cob_get_int(args[0])
+        seed = _cob_get_int(args[0])
         if seed < 0:
             seed = 0
         _rng.seed(seed)
@@ -1111,7 +1189,7 @@ def cob_intr_variance(params, *args):
     result = make_field_entry(8, common.COB_TYPE_NUMERIC_BINARY, 18, 0,
                               common.COB_FLAG_HAVE_SIGN)
     if params == 1:
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     mean = _mean_decimal(fields)
     d4 = _Decimal(0, 0)
@@ -1142,7 +1220,7 @@ def cob_intr_standard_deviation(params, *args):
     fields = list(args[:params])
     if params == 1:
         result = make_double_entry()
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     mean = _mean_decimal(fields)
     d4 = _Decimal(0, 0)
@@ -1162,7 +1240,7 @@ def cob_intr_present_value(params, *args):
     """FUNCTION PRESENT-VALUE (intrinsic.c L2542-L2587)."""
     result = make_double_entry()
     if params < 2:
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     fields = list(args[:params])
     d1 = _Decimal()
@@ -1197,23 +1275,23 @@ def cob_intr_year_to_yyyy(params, *args):
     """FUNCTION YEAR-TO-YYYY (intrinsic.c L2587-L2650)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     common.cob_exception_code = 0
-    year = move.cob_get_int(args[0])
-    interval = move.cob_get_int(args[1]) if params > 1 else 50
-    xqtyear = move.cob_get_int(args[2]) if params > 2 else _time.localtime().tm_year
+    year = _cob_get_int(args[0])
+    interval = _cob_get_int(args[1]) if params > 1 else 50
+    xqtyear = _cob_get_int(args[2]) if params > 2 else _time.localtime().tm_year
     if year < 0 or year > 99:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     if xqtyear < 1601 or xqtyear > 9999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     full = _sliding_year(year, interval, xqtyear)
     if full is None:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
-    move.cob_set_int(result, full)
+    _cob_set_int(result, full)
     return result
 
 
@@ -1221,25 +1299,25 @@ def cob_intr_date_to_yyyymmdd(params, *args):
     """FUNCTION DATE-TO-YYYYMMDD (intrinsic.c L2650-L2718)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     common.cob_exception_code = 0
-    arg0 = move.cob_get_int(args[0])
+    arg0 = _cob_get_int(args[0])
     mmdd = arg0 % 10000
     year = arg0 // 10000
-    interval = move.cob_get_int(args[1]) if params > 1 else 50
-    xqtyear = move.cob_get_int(args[2]) if params > 2 else _time.localtime().tm_year
+    interval = _cob_get_int(args[1]) if params > 1 else 50
+    xqtyear = _cob_get_int(args[2]) if params > 2 else _time.localtime().tm_year
     if year < 0 or year > 999999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     if xqtyear < 1601 or xqtyear > 9999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     full = _sliding_year(year, interval, xqtyear)
     if full is None:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
-    move.cob_set_int(result, full * 10000 + mmdd)
+    _cob_set_int(result, full * 10000 + mmdd)
     return result
 
 
@@ -1247,25 +1325,25 @@ def cob_intr_day_to_yyyyddd(params, *args):
     """FUNCTION DAY-TO-YYYYDDD (intrinsic.c L2718-L2786)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     common.cob_exception_code = 0
-    arg0 = move.cob_get_int(args[0])
+    arg0 = _cob_get_int(args[0])
     days = arg0 % 1000
     year = arg0 // 1000
-    interval = move.cob_get_int(args[1]) if params > 1 else 50
-    xqtyear = move.cob_get_int(args[2]) if params > 2 else _time.localtime().tm_year
+    interval = _cob_get_int(args[1]) if params > 1 else 50
+    xqtyear = _cob_get_int(args[2]) if params > 2 else _time.localtime().tm_year
     if year < 0 or year > 999999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     if xqtyear < 1601 or xqtyear > 9999:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     full = _sliding_year(year, interval, xqtyear)
     if full is None:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
-    move.cob_set_int(result, full * 1000 + days)
+    _cob_set_int(result, full * 1000 + days)
     return result
 
 
@@ -1276,7 +1354,7 @@ def cob_intr_seconds_past_midnight():
     """FUNCTION SECONDS-PAST-MIDNIGHT (intrinsic.c L2786-L2807)."""
     result = make_field_entry(4, common.COB_TYPE_NUMERIC_BINARY, 8, 0, 0)
     now = _time.localtime()
-    move.cob_set_int(result, now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec)
+    _cob_set_int(result, now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec)
     return result
 
 
@@ -1286,7 +1364,7 @@ def cob_intr_seconds_from_formatted_time(fmt, value):
     common.cob_exception_code = 0
     if value.size < fmt.size:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
-        move.cob_set_int(result, 0)
+        _cob_set_int(result, 0)
         return result
     p1 = bytes(common.COB_FIELD_DATA(fmt)[:fmt.size])
     p2 = bytes(common.COB_FIELD_DATA(value)[:value.size])
@@ -1312,7 +1390,7 @@ def cob_intr_seconds_from_formatted_time(fmt, value):
     else:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)
         seconds = 0
-    move.cob_set_int(result, seconds)
+    _cob_set_int(result, seconds)
     return result
 
 
@@ -1325,7 +1403,7 @@ def cob_intr_locale_date(offset, length, srcfield, locale_field):
     Formats an 8-digit ``YYYYMMDD`` argument using the active locale's date
     representation (``%x``), mirroring the C runtime's locale-formatted output.
     """
-    indate = move.cob_get_int(srcfield)
+    indate = _cob_get_int(srcfield)
     year, md = divmod(indate, 10000)
     month, day = divmod(md, 100)
     common.cob_exception_code = 0
@@ -1349,7 +1427,7 @@ def cob_intr_locale_time(offset, length, srcfield, locale_field):
     Formats an ``HHMMSS`` argument using the active locale's time
     representation (``%X``).
     """
-    intime = move.cob_get_int(srcfield)
+    intime = _cob_get_int(srcfield)
     hh, ms = divmod(intime, 10000)
     mm, ss = divmod(ms, 100)
     common.cob_exception_code = 0
@@ -1373,7 +1451,7 @@ def cob_intr_lcl_time_from_secs(offset, length, srcfield, locale_field):
     Interprets *srcfield* as seconds-past-midnight and formats it as a
     locale time (``%X``).
     """
-    secs = move.cob_get_int(srcfield)
+    secs = _cob_get_int(srcfield)
     common.cob_exception_code = 0
     if secs < 0 or secs > 86400:
         common.cob_set_exception(common.COB_EC_ARGUMENT_FUNCTION)

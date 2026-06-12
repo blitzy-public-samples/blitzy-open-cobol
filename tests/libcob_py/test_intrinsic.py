@@ -188,9 +188,17 @@ def test_log_log10():
 
 
 def test_trig_functions():
-    assert rdouble(intrinsic.cob_intr_sin(numdisp("0"))) == pytest.approx(0.0, abs=1e-9)
-    assert rdouble(intrinsic.cob_intr_cos(numdisp("0"))) == pytest.approx(1.0, abs=1e-9)
+    # SIN and COS return the fixed-17 *binary* representation (signed long long
+    # with COB_FLAG_HAVE_SIGN), matching intrinsic.c L1660/L1729 - so decode
+    # them with rdec, not rdouble.  TAN returns an IEEE COMP-2 double.
+    assert float(rdec(intrinsic.cob_intr_sin(numdisp("0")))) == pytest.approx(0.0, abs=1e-9)
+    assert float(rdec(intrinsic.cob_intr_cos(numdisp("0")))) == pytest.approx(1.0, abs=1e-9)
     assert rdouble(intrinsic.cob_intr_tan(numdisp("0"))) == pytest.approx(0.0, abs=1e-9)
+    # The fixed-17 SIN/COS fields carry the sign flag and scale 17.
+    sin0 = intrinsic.cob_intr_sin(numdisp("0"))
+    assert common.COB_FIELD_TYPE(sin0) == common.COB_TYPE_NUMERIC_BINARY
+    assert common.COB_FIELD_SCALE(sin0) == 17
+    assert common.COB_FIELD_HAVE_SIGN(sin0)
 
 
 def test_inverse_trig_fixed17():
@@ -510,3 +518,336 @@ def test_variance_single_element_is_zero():
 def test_cob_init_intrinsic_is_callable():
     # Must be callable and not raise (it seeds the RNG / static state).
     intrinsic.cob_init_intrinsic()
+
+
+# ===========================================================================
+# Additional branch coverage - expected values verified against the original
+# C ``cobc`` 1.1.0 toolchain (see AAP 0.6.2 numeric-parity strategy).  These
+# exercise the variadic default-argument paths, the exception branches, the
+# BINOP operator dispatch + result-type selection, and the NUMVAL CR/DB and
+# big-magnitude fall-throughs that the baseline suite did not reach.
+# ===========================================================================
+def _negdisp(digits, scale=0):
+    """Signed zoned-DISPLAY field carrying a negative value."""
+    f = numdisp(digits, scale=scale, signed=True)
+    common.cob_put_sign(f, -1)
+    return f
+
+
+# --- BINOP: all five operators + the three result-type branches -----------
+def test_binop_all_operators():
+    # + - * / ^  (op passed as the operator-byte ordinal, per the emitter).
+    assert rdec(intrinsic.cob_intr_binop(numdisp("12"), ord("+"), numdisp("8"))) == Decimal("20")
+    assert rdec(intrinsic.cob_intr_binop(numdisp("12"), ord("-"), numdisp("8"))) == Decimal("4")
+    assert rdec(intrinsic.cob_intr_binop(numdisp("6"), ord("*"), numdisp("7"))) == Decimal("42")
+    assert rdec(intrinsic.cob_intr_binop(numdisp("20"), ord("/"), numdisp("4"))) == Decimal("5")
+    assert rdec(intrinsic.cob_intr_binop(numdisp("2"), ord("^"), numdisp("10"))) == Decimal("1024")
+
+
+def test_binop_negative_result_sets_sign_flag():
+    # 8 - 11 = -3 -> result field must carry COB_FLAG_HAVE_SIGN.
+    res = intrinsic.cob_intr_binop(numdisp("8"), ord("-"), numdisp("11"))
+    assert rdec(res) == Decimal("-3")
+    assert common.COB_FIELD_HAVE_SIGN(res)
+
+
+def test_binop_eight_byte_and_display_result_branches():
+    # 8-byte binary branch: 1,000,000 * 1,000,000 = 10**12 (needs > 32 bits).
+    res8 = intrinsic.cob_intr_binop(numdisp("1000000"), ord("*"), numdisp("1000000"))
+    assert rdec(res8) == Decimal("1000000000000")
+    assert common.COB_FIELD_TYPE(res8) == common.COB_TYPE_NUMERIC_BINARY
+    # DISPLAY branch: a value too wide for 8 bytes (> ~1.8e19) falls back to
+    # a NUMERIC_DISPLAY result field.
+    big = numdisp("99999999999999999999")  # 20 nines
+    resd = intrinsic.cob_intr_binop(big, ord("*"), numdisp("1000000000"))
+    assert common.COB_FIELD_TYPE(resd) == common.COB_TYPE_NUMERIC_DISPLAY
+    assert rdec(resd) == Decimal("99999999999999999999") * Decimal("1000000000")
+
+
+# --- NUMVAL: CR/DB negative suffix, and the > 18-digit double fall-back ----
+def test_numval_cr_db_negative_suffix():
+    # Verified against C cobc 1.1.0: trailing CR/DB denote a negative value.
+    assert rdec(intrinsic.cob_intr_numval(alnum("123CR"))) == Decimal("-123")
+    assert rdec(intrinsic.cob_intr_numval(alnum("456DB"))) == Decimal("-456")
+
+
+def test_numval_more_than_18_digits_falls_back_to_double():
+    # 20 integer digits exceeds the 18-digit COMP path -> COMP-2 double result.
+    res = intrinsic.cob_intr_numval(alnum("12345678901234567890"))
+    assert rdouble(res) == pytest.approx(12345678901234567890.0)
+
+
+# --- Sliding-window date intrinsics: 1-argument default paths --------------
+def test_year_to_yyyy_single_arg_default_window():
+    # YEAR-TO-YYYY(24) with the default 50-year window -> 2024 (C-verified).
+    assert rint(intrinsic.cob_intr_year_to_yyyy(1, numdisp("24"))) == 2024
+
+
+def test_date_to_yyyymmdd_single_arg():
+    # DATE-TO-YYYYMMDD(240229) default window -> 20240229 (C-verified).
+    assert rint(intrinsic.cob_intr_date_to_yyyymmdd(1, numdisp("240229"))) == 20240229
+
+
+def test_day_to_yyyyddd_single_arg():
+    # DAY-TO-YYYYDDD(24060) default window -> 2024060 (C-verified).
+    assert rint(intrinsic.cob_intr_day_to_yyyyddd(1, numdisp("24060"))) == 2024060
+
+
+def test_year_to_yyyy_invalid_year_sets_exception():
+    # year > 99 is invalid -> exception set, result 0.
+    common.cob_exception_code = 0
+    res = intrinsic.cob_intr_year_to_yyyy(1, numdisp("150"))
+    assert rint(res) == 0
+    assert common.cob_exception_code != 0
+
+
+# --- Date conversion exception branches ------------------------------------
+def test_integer_of_date_invalid_day_sets_exception():
+    # 2024-02-30 is not a real date (Feb has 29 days in 2024) -> 0 + exception.
+    common.cob_exception_code = 0
+    res = intrinsic.cob_intr_integer_of_date(numdisp("20240230"))
+    assert rint(res) == 0
+    assert common.cob_exception_code != 0
+
+
+def test_integer_of_date_bad_year_and_month():
+    # year < 1601 -> exception.
+    common.cob_exception_code = 0
+    assert rint(intrinsic.cob_intr_integer_of_date(numdisp("15001201"))) == 0
+    assert common.cob_exception_code != 0
+    # month 13 -> exception.
+    common.cob_exception_code = 0
+    assert rint(intrinsic.cob_intr_integer_of_date(numdisp("20241301"))) == 0
+    assert common.cob_exception_code != 0
+
+
+def test_integer_of_day_round_trip_and_error():
+    # 2024060 (Julian) <-> integer 154557, mirroring DAY-OF-INTEGER.
+    iod = intrinsic.cob_intr_integer_of_day(numdisp("2024060"))
+    assert rint(iod) == 154557
+    # invalid day-of-year 367 -> exception.
+    common.cob_exception_code = 0
+    assert rint(intrinsic.cob_intr_integer_of_day(numdisp("2024367"))) == 0
+    assert common.cob_exception_code != 0
+
+
+# --- COMBINED-DATETIME -----------------------------------------------------
+def test_combined_datetime_value_and_bounds():
+    # COMBINED-DATETIME(154557, 43200) -> "015455743200" (= 154557.43200).
+    res = intrinsic.cob_intr_combined_datetime(numdisp("154557"), numdisp("43200"))
+    assert rtext(res) == b"015455743200"
+    # out-of-range day -> all-zero payload + exception.
+    common.cob_exception_code = 0
+    res0 = intrinsic.cob_intr_combined_datetime(numdisp("0"), numdisp("43200"))
+    assert rtext(res0) == b"000000000000"
+    assert common.cob_exception_code != 0
+
+
+# --- INTEGER-PART / FRACTION-PART (well-defined, non-overflow regime) -------
+def test_integer_and_fraction_part():
+    # INTEGER-PART(12.789) -> 12 (C-verified).
+    assert rint(intrinsic.cob_intr_integer_part(numdisp("12789", scale=3))) == 12
+    # FRACTION-PART in its well-defined regime (|v| < ~9.22, no 8-byte overflow):
+    # FRACTION-PART(0.789) -> 0.789.
+    assert rdec(intrinsic.cob_intr_fraction_part(numdisp("0789", scale=3))) == Decimal("0.789000000000000000")
+    # Negative integer part preserved by INTEGER-PART.
+    assert rint(intrinsic.cob_intr_integer_part(_negdisp("4567", scale=2))) == -45
+
+
+# --- ABS / SIGN ------------------------------------------------------------
+def test_abs_and_sign_negative():
+    assert rint(intrinsic.cob_intr_abs(_negdisp("42"))) == 42
+    assert rint(intrinsic.cob_intr_sign(_negdisp("7"))) == -1
+    assert rint(intrinsic.cob_intr_sign(numdisp("7"))) == 1
+    assert rint(intrinsic.cob_intr_sign(numdisp("0"))) == 0
+
+
+# --- TEST-DATE / TEST-DAY validity probes ----------------------------------
+def test_test_date_and_day_validity():
+    # TEST-DATE-YYYYMMDD: 0 = valid, non-zero = the offending component.
+    assert rint(intrinsic.cob_intr_test_date_yyyymmdd(numdisp("20240229"))) == 0
+    assert rint(intrinsic.cob_intr_test_date_yyyymmdd(numdisp("20240230"))) != 0
+    # TEST-DAY-YYYYDDD: 0 = valid.
+    assert rint(intrinsic.cob_intr_test_day_yyyyddd(numdisp("2024060"))) == 0
+    assert rint(intrinsic.cob_intr_test_day_yyyyddd(numdisp("2024367"))) != 0
+
+
+# --- Exception location/file/statement/status text -------------------------
+def test_exception_information_functions():
+    # These read the common.py exception globals; they must return alphanumeric
+    # fields without raising regardless of whether an exception is pending.
+    common.cob_exception_code = 0
+    for fn in (intrinsic.cob_intr_exception_file,
+               intrinsic.cob_intr_exception_location,
+               intrinsic.cob_intr_exception_statement,
+               intrinsic.cob_intr_exception_status):
+        res = fn()
+        assert common.COB_FIELD_TYPE(res) == common.COB_TYPE_ALPHANUMERIC
+        assert isinstance(rtext(res), (bytes, bytearray))
+
+
+# --- SUM over several arguments (multi-arg accumulation path) --------------
+def test_sum_many_args_with_scale():
+    res = intrinsic.cob_intr_sum(3, numdisp("125", scale=2),
+                                 numdisp("250", scale=2), numdisp("125", scale=2))
+    assert rdec(res) == Decimal("5.00")
+
+
+# --- STORED-CHAR-LENGTH (trailing-space-insensitive length) ----------------
+def test_stored_char_length():
+    assert rint(intrinsic.cob_intr_stored_char_length(alnum("abc   "))) == 3
+    assert rint(intrinsic.cob_intr_stored_char_length(alnum("   "))) == 0
+
+
+# --- FACTORIAL edge cases --------------------------------------------------
+def test_factorial_zero_and_large():
+    # 0! = 1 (boundary).
+    assert rint(intrinsic.cob_intr_factorial(numdisp("0"))) == 1
+    # 20! = 2432902008176640000 - exact via decimal (no float drift).
+    assert rdec(intrinsic.cob_intr_factorial(numdisp("20"))) == Decimal("2432902008176640000")
+
+
+# --- Double-path intrinsic error branch (domain errors -> 0) ---------------
+def test_double_intr_domain_errors_return_zero():
+    # LOG(0) and SQRT(-1) are math-domain errors -> the C runtime yields 0.
+    assert rdouble(intrinsic.cob_intr_log(numdisp("0"))) == 0.0
+    assert rdouble(intrinsic.cob_intr_sqrt(_negdisp("1"))) == 0.0
+
+
+# --- SUM big-magnitude DISPLAY result branch -------------------------------
+def test_sum_overflows_to_display_field():
+    # Sum exceeding 18 digits -> NUMERIC_DISPLAY result field.
+    big = numdisp("999999999999999999")  # 18 nines
+    res = intrinsic.cob_intr_sum(2, big, big)
+    assert common.COB_FIELD_TYPE(res) == common.COB_TYPE_NUMERIC_DISPLAY
+    assert rdec(res) == Decimal("1999999999999999998")
+
+
+# --- Sliding-window date intrinsics: 3-arg + error branches ----------------
+def test_year_to_yyyy_three_args_and_bad_execution_year():
+    # Explicit window + current-year: YEAR-TO-YYYY(40, 20, 2024).
+    # maxyear = 2044; 2044 % 100 = 44 >= 40 -> 40 + 2000 = 2040.
+    assert rint(intrinsic.cob_intr_year_to_yyyy(3, numdisp("40"),
+                numdisp("20"), numdisp("2024"))) == 2040
+    # execution year < 1601 -> exception, 0.
+    common.cob_exception_code = 0
+    res = intrinsic.cob_intr_year_to_yyyy(3, numdisp("40"),
+            numdisp("20"), numdisp("1500"))
+    assert rint(res) == 0 and common.cob_exception_code != 0
+
+
+def test_date_to_yyyymmdd_three_args_and_sliding_out_of_range():
+    # 3-arg explicit form.
+    assert rint(intrinsic.cob_intr_date_to_yyyymmdd(3, numdisp("240229"),
+                numdisp("20"), numdisp("2024"))) == 20240229
+    # A window pushing maxyear past 9999 makes the sliding result invalid -> 0.
+    common.cob_exception_code = 0
+    res = intrinsic.cob_intr_date_to_yyyymmdd(3, numdisp("240229"),
+            numdisp("9000"), numdisp("9999"))
+    assert rint(res) == 0 and common.cob_exception_code != 0
+
+
+def test_day_to_yyyyddd_three_args():
+    assert rint(intrinsic.cob_intr_day_to_yyyyddd(3, numdisp("24060"),
+                numdisp("20"), numdisp("2024"))) == 2024060
+
+
+# --- LOCALE-DATE / LOCALE-TIME / LOCALE-TIME-FROM-SECONDS -------------------
+def test_locale_date_time_and_from_secs():
+    # Valid inputs produce non-empty locale-formatted alphanumeric text.
+    d = intrinsic.cob_intr_locale_date(0, 0, numdisp("20240229"), None)
+    assert common.COB_FIELD_TYPE(d) == common.COB_TYPE_ALPHANUMERIC
+    assert len(rtext(d)) > 1
+    t = intrinsic.cob_intr_locale_time(0, 0, numdisp("133045"), None)
+    assert len(rtext(t)) > 1
+    s = intrinsic.cob_intr_lcl_time_from_secs(0, 0, numdisp("43200"), None)
+    assert len(rtext(s)) > 1
+    # Out-of-range seconds -> exception + blank.
+    common.cob_exception_code = 0
+    bad = intrinsic.cob_intr_lcl_time_from_secs(0, 0, numdisp("99999"), None)
+    assert common.cob_exception_code != 0
+    assert rtext(bad).strip() == b""
+    # Invalid calendar date -> exception.
+    common.cob_exception_code = 0
+    intrinsic.cob_intr_locale_date(0, 0, numdisp("20240230"), None)
+    assert common.cob_exception_code != 0
+
+
+# --- EXCEPTION-LOCATION text format branches -------------------------------
+def test_exception_location_format_variants():
+    saved = (common.cob_got_exception, common.cob_orig_program_id,
+             common.cob_orig_section, common.cob_orig_paragraph,
+             common.cob_orig_line)
+    try:
+        common.cob_got_exception = 1
+        common.cob_orig_program_id = "PROG1"
+        common.cob_orig_line = 42
+        # Both section and paragraph present.
+        common.cob_orig_section = "SEC1"
+        common.cob_orig_paragraph = "PARA1"
+        txt = rtext(intrinsic.cob_intr_exception_location()).decode("latin-1")
+        assert "PROG1" in txt and "PARA1" in txt and "SEC1" in txt
+        # Section only.
+        common.cob_orig_paragraph = None
+        assert b"SEC1" in rtext(intrinsic.cob_intr_exception_location())
+        # Paragraph only.
+        common.cob_orig_section = None
+        common.cob_orig_paragraph = "PARA1"
+        assert b"PARA1" in rtext(intrinsic.cob_intr_exception_location())
+        # Neither.
+        common.cob_orig_paragraph = None
+        assert b"PROG1" in rtext(intrinsic.cob_intr_exception_location())
+    finally:
+        (common.cob_got_exception, common.cob_orig_program_id,
+         common.cob_orig_section, common.cob_orig_paragraph,
+         common.cob_orig_line) = saved
+
+
+# --- ATAN of a large magnitude exercises the fixed17 integer-part peel ------
+def test_atan_large_value_fixed17_integer_part():
+    # ATAN(1000) ~= 1.5698 -> integer part 1, signed fixed17 result.
+    res = intrinsic.cob_intr_atan(numdisp("1000"))
+    assert common.COB_FIELD_SCALE(res) == 17
+    assert common.COB_FIELD_HAVE_SIGN(res)
+    assert float(rdec(res)) == pytest.approx(1.56979632712, abs=1e-9)
+
+
+# --- DATE-OF-INTEGER / DAY-OF-INTEGER out-of-range error branches ----------
+def test_date_of_integer_out_of_range():
+    # day 0 and day > 3067671 are invalid -> all-zero payload + exception.
+    common.cob_exception_code = 0
+    assert rtext(intrinsic.cob_intr_date_of_integer(numdisp("0"))) == b"00000000"
+    assert common.cob_exception_code != 0
+    common.cob_exception_code = 0
+    assert rtext(intrinsic.cob_intr_date_of_integer(numdisp("9999999"))) == b"00000000"
+    assert common.cob_exception_code != 0
+
+
+def test_day_of_integer_out_of_range():
+    common.cob_exception_code = 0
+    assert rtext(intrinsic.cob_intr_day_of_integer(numdisp("0"))) == b"0000000"
+    assert common.cob_exception_code != 0
+
+
+# --- TEST-DATE-YYYYMMDD distinct error codes (1=year, 2=month, 3=day) ------
+def test_test_date_distinct_error_codes():
+    # Bad year (< 1601) -> 1.
+    assert rint(intrinsic.cob_intr_test_date_yyyymmdd(numdisp("15000101"))) == 1
+    # Bad month (13) -> 2.
+    assert rint(intrinsic.cob_intr_test_date_yyyymmdd(numdisp("20241301"))) == 2
+    # Bad day (00) -> 3.
+    assert rint(intrinsic.cob_intr_test_date_yyyymmdd(numdisp("20240100"))) == 3
+
+
+def test_test_day_distinct_error_codes():
+    # Bad year -> 1; bad day-of-year (367) -> non-zero.
+    assert rint(intrinsic.cob_intr_test_day_yyyyddd(numdisp("1500001"))) == 1
+    assert rint(intrinsic.cob_intr_test_day_yyyyddd(numdisp("2024367"))) != 0
+
+
+# --- FACTORIAL of a genuinely negative argument sets the exception ---------
+def test_factorial_negative_argument():
+    common.cob_exception_code = 0
+    res = intrinsic.cob_intr_factorial(_negdisp("5"))
+    assert rint(res) == 0
+    assert common.cob_exception_code != 0
