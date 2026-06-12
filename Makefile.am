@@ -23,7 +23,18 @@
 # Boston, MA 02110-1301 USA
 
 
-bin_SCRIPTS=cob-config
+# MIGRATION (build-system tooling compatibility): The redundant top-level
+# `bin_SCRIPTS=cob-config` declaration was removed. The cob-config script template
+# (bin/cob-config.in) lives in bin/, AC_CONFIG_FILES generates bin/cob-config, and
+# bin/Makefile.am carries its own (canonical) `bin_SCRIPTS=cob-config` that builds and
+# installs it to $(bindir). The duplicate top-level declaration named a nonexistent
+# ./cob-config: modern Automake adds `cob-config` as an `all-am` prerequisite with no
+# config-file rule at the top level, failing the build with
+# "No rule to make target 'cob-config'". The top-level entry was already a no-op at
+# install time (install-binSCRIPTS skips files failing its `test -f` guard), so removing
+# it is behavior-preserving — cob-config is still built and installed exactly as before
+# by the bin/ subdirectory. This unblocks the autoreconf/configure/make path the
+# C->Python backend migration requires.
 
 include_HEADERS = libcob.h
 

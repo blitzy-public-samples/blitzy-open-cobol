@@ -1466,7 +1466,14 @@ output_param (cb_tree x, int id)
 		output ("%s%d", CB_PREFIX_CONST, lookup_literal (x));
 		break;
 	case CB_TAG_FIELD:
-		/* TODO: remove me */
+		/* MIGRATION (C -> Python): normalise a raw CB_FIELD operand into a
+		   field REFERENCE before emission.  output_param's emission logic is
+		   driven by cb_reference nodes (they carry the subscript/ref-mod and
+		   bounds-check chain), so a bare field is wrapped via
+		   cb_build_field_reference and re-dispatched through the
+		   CB_TAG_REFERENCE arm below.  (Inherited verbatim from the C emitter,
+		   where this arm was tagged with a "remove me" note; the wrap is still
+		   required because some callers pass unwrapped fields.) */
 		output_param (cb_build_field_reference (CB_FIELD (x), NULL), id);
 		break;
 	case CB_TAG_REFERENCE:
@@ -4535,9 +4542,11 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 	struct cb_file		*fl;
 	char			*p;
 	struct handler_struct	*hstr;
-#ifndef	__GNUC__
-	struct label_list	*pl;
-#endif
+	/* MIGRATION (C -> Python): the non-GCC "struct label_list *pl" cursor that
+	   drove the perform-frame jump table is removed -- the Python backend has
+	   no jump table (control flow is the _dispatch loop plus _CobGoto/_CobExit),
+	   so the cursor is dead on every compiler build.  See the matching removal
+	   at the end of this function. */
 	int			i;
 	int			n;
 	int			parmnum = 0;
@@ -5073,23 +5082,19 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 	output_integer (current_prog->cb_return_code);
 	output ("\n");
 
-#ifndef	__GNUC__
-	/* Non-GCC perform-frame jump table (excluded from GCC builds of cobc;
-	   retained verbatim for portability of the compiler itself). */
-	output_newline ();
-	output_line ("# Frame stack jump table");
-	output_line ("P_switch:");
-	if (label_cache) {
-		output_line (" switch (frame_ptr->return_address) {");
-		for (pl = label_cache; pl; pl = pl->next) {
-			output_line (" case %d:", pl->call_num);
-			output_line ("   goto %s%d;", CB_PREFIX_LABEL, pl->id);
-		}
-		output_line (" }");
-	}
-	output_line (" cob_fatal_error (COB_FERROR_CODEGEN);");
-	output_newline ();
-#endif
+	/* MIGRATION (C -> Python): the C emitter closed each program with a
+	   "#ifndef __GNUC__" perform-frame jump table -- a "P_switch:" label, a
+	   "switch (frame_ptr->return_address)" with one "case N: goto l_M;" per
+	   PERFORM target, and a trailing "cob_fatal_error(COB_FERROR_CODEGEN)".
+	   That fallback existed only for C compilers lacking GCC's computed-goto
+	   ("&&label") extension, and it emitted C tokens (switch/case/goto) that
+	   are not valid Python.  The Python backend models every PERFORM/GO TO
+	   through the _dispatch loop and the _CobGoto / _CobExit / _CobPerformExit
+	   exception classes emitted in the preamble -- a single representation that
+	   is identical regardless of which C compiler builds cobc.  The jump table
+	   is therefore dead and is removed for ALL compiler builds, satisfying the
+	   Python-only emitted-code requirement (it would otherwise leak C tokens
+	   into generated .py output when cobc is built with a non-GCC compiler). */
 
 	output_block_close ();		/* close def <pid>_ */
 	output_newline ();
@@ -5417,6 +5422,13 @@ codegen (struct cb_program *prog, const int nested)
 		   recurses through _dispatch), the control-flow exception classes used
 		   by the dispatch model, and the module-level provenance constants. */
 		output_line ("import sys");
+		/* MIGRATION (C -> Python): bind the libcob_py package name itself in
+		   addition to the ten submodules.  codegen_pymod() rule 15 routes any
+		   symbol it cannot classify through the package facade, emitting
+		   "libcob_py.<name>(...)"; libcob_py/__init__.py re-exports the whole
+		   cob_* surface, so this import makes that fallback reference resolvable
+		   at runtime (without it the bare "libcob_py" name would be undefined). */
+		output_line ("import libcob_py");
 		output_line ("from libcob_py import common, numeric, move, strings, "
 			     "intrinsic, fileio, call, screenio, termio, system");
 		output_newline ();

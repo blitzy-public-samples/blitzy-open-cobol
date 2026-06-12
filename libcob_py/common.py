@@ -39,6 +39,7 @@ import inside the function body.
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import time
 # NOTE: ``struct`` and ``io`` are part of the runtime's standard-library surface
@@ -332,9 +333,21 @@ class cob_field(object):
     Attributes:
 
     * ``size`` - the field size in bytes.
-    * ``data`` - the field storage.  Always normalised to a mutable
-                 ``bytearray`` so that in-place operations (sign overpunch,
-                 editing, MOVE) behave like the C pointer writes.  ``None`` is
+    * ``data`` - the field storage.  This MUST alias the underlying storage the
+                 way the C ``cob_field.data`` pointer points INTO a program's
+                 WORKING-STORAGE / record buffer: a ``bytearray`` is kept by
+                 reference, and a ``memoryview`` (which the cobc emitter passes
+                 as ``memoryview(b_N)[off:]`` so an elementary item points into
+                 its owning record bytearray) is ALSO kept by reference -- never
+                 copied -- so writes performed directly on the storage buffer
+                 (the ``memcpy``/``memset``/``cob_setswp_*`` the emitter
+                 generates for VALUE-clause and group initialisation) are
+                 visible through this field, and writes through this field are
+                 visible to any REDEFINES/overlapping field sharing the buffer.
+                 In-place operations (sign overpunch, editing, MOVE) work on both
+                 ``bytearray`` and a writable ``memoryview``.  An immutable
+                 ``bytes`` literal (emitted constants) is copied into a private
+                 ``bytearray`` so edit/sign writes remain possible.  ``None`` is
                  preserved (used to model an OMITTED argument).
     * ``attr`` - the associated :class:`cob_field_attr`.
     """
@@ -347,7 +360,22 @@ class cob_field(object):
             self.data = None
         elif isinstance(data, bytearray):
             self.data = data
-        elif isinstance(data, (bytes, memoryview)):
+        elif isinstance(data, memoryview):
+            # MIGRATION (C->Python): a memoryview aliases its underlying storage
+            # buffer, mirroring the C cob_field.data pointer that points INTO a
+            # program's WORKING-STORAGE/record image.  Store it BY REFERENCE --
+            # copying it (the previous behaviour) silently broke the aliasing
+            # contract: VALUE-clause and group initialisation that the emitter
+            # performs with memcpy/memset/cob_setswp_* directly on the storage
+            # bytearray became invisible to the field, and REDEFINES/overlapping
+            # items stopped sharing storage.  A memoryview of a bytearray is
+            # writable and supports the indexed and equal-length slice writes the
+            # runtime performs, so no copy is needed or wanted.
+            self.data = data
+        elif isinstance(data, bytes):
+            # Immutable literal (emitted constants / figurative values): take a
+            # private mutable copy so in-place sign/edit writes are possible
+            # without mutating a shared read-only object.
             self.data = bytearray(data)
         elif isinstance(data, str):
             # Convenience for the figurative constants and literals; COBOL
@@ -1146,8 +1174,14 @@ def cob_check_version(prog, packver, patchlev):
 # ===========================================================================
 
 #: Package/patch identification used by cob_check_version.  Mirrors the C
-#: PACKAGE_VERSION / PATCH_LEVEL macros generated into defaults.h.
-PACKAGE_VERSION = "1.1.0"
+#: PACKAGE_VERSION / PATCH_LEVEL macros.  PACKAGE_VERSION MUST byte-match the
+#: value the cobc emitter writes as COB_PACKAGE_VERSION (codegen.c emits
+#: PACKAGE_VERSION verbatim), which is the autoconf AC_INIT version in
+#: configure.ac ("1.1") and the config.h "#define PACKAGE_VERSION \"1.1\"".
+#: cob_check_version does an exact strcmp (libcob/common.c L920), so a value of
+#: "1.1.0" here would spuriously fail the version check against the emitted
+#: "1.1" and abort every generated program with cob_stop_run(1).
+PACKAGE_VERSION = "1.1"
 PATCH_LEVEL = 0
 
 #: Subsystem initialisation order (common.c L784-L790).  The presence of
@@ -1158,22 +1192,61 @@ COB_INIT_ORDER = (
 )
 
 
+#: Environment flag that relaxes :func:`_run_subsystem_initializers` so that a
+#: genuinely-absent subsystem module is skipped instead of raising.  This is the
+#: *test-only* escape hatch: a unit test that exercises ``common`` (or one
+#: sibling) in isolation, in an environment where the other runtime modules are
+#: deliberately not importable, sets ``COB_PY_INIT_OPTIONAL=1``.  Production code
+#: never sets it, so a missing required module is always a hard error.
+_INIT_OPTIONAL_ENV = "COB_PY_INIT_OPTIONAL"
+
+
 def _run_subsystem_initializers():
-    """Invoke each subsystem's ``cob_init_<name>`` in the fixed order.
+    """Invoke each subsystem's ``cob_init_<name>`` in the fixed canonical order.
 
     Performs a *deferred* import of each sibling module so that ``common`` has
     no import-time dependency on them (it is the base module they all import).
-    A module or initializer that is not present is silently skipped, which lets
-    ``common`` initialise correctly in isolation (e.g. during unit testing)
-    while still reproducing the exact C ordering once the full package exists.
+
+    Every module named in :data:`COB_INIT_ORDER` is a *required* runtime
+    component (the AAP mandates reproducing the full C initialization sequence
+    ``numeric -> strings -> move -> intrinsic -> fileio -> termio -> call``).  A
+    missing module therefore means the runtime package is incomplete, and a
+    generated program would otherwise run against a partially-initialised
+    runtime; this is reported as a clear :class:`RuntimeError` rather than being
+    silently skipped (resolves the review finding on silent ``ImportError``
+    swallowing).  The only exception is when the test-only ``COB_PY_INIT_OPTIONAL``
+    flag is set, in which case a genuinely-absent module is skipped.
+
+    Crucially, an :class:`ImportError` raised *inside* a present module (i.e. a
+    real defect in that module) is never swallowed -- presence is probed with
+    :func:`importlib.util.find_spec` (which does not execute the module), so only
+    a truly missing module is eligible for the test-mode skip; any error during
+    the subsequent import always propagates.
     """
     import importlib
+    import importlib.util
+
+    optional = os.environ.get(_INIT_OPTIONAL_ENV) == "1"
 
     for name in COB_INIT_ORDER:
-        try:
-            mod = importlib.import_module("libcob_py." + name)
-        except ImportError:
-            continue
+        qualified = "libcob_py." + name
+        # Probe for the module file without executing it.  ``find_spec`` returns
+        # ``None`` only when the module genuinely does not exist; a defect inside
+        # a present module surfaces later at ``import_module`` and propagates.
+        if importlib.util.find_spec(qualified) is None:
+            if optional:
+                # Test-isolation mode: the absent sibling is intentionally
+                # unavailable, so skip its initializer.
+                continue
+            # Production: an incomplete runtime is fatal -- refuse to run a
+            # generated program against a partially-initialised runtime.
+            raise RuntimeError(
+                "libcob_py runtime initialization failed: required subsystem "
+                "module '%s' is not available. The libcob_py runtime package is "
+                "incomplete; reinstall or rebuild it. (Set %s=1 only for "
+                "isolated unit testing.)" % (qualified, _INIT_OPTIONAL_ENV)
+            )
+        mod = importlib.import_module(qualified)
         init_fn = getattr(mod, "cob_init_" + name, None)
         if callable(init_fn):
             init_fn()
@@ -2117,19 +2190,298 @@ def cob_chain_setup(data, parm, size):
 # Pointers / source location / trace (common.c L659-L706)
 # ===========================================================================
 
-def cob_get_pointer(srcptr):
-    """Return the pointer value stored in *srcptr* (common.c L690-697).
+#: ``sizeof(void *)`` on the host - the storage width of a USAGE POINTER /
+#: PROGRAM-POINTER item.  A pointer item stores its address value as exactly
+#: this many native-byte-order bytes in ``field.data``, byte-for-byte as the C
+#: runtime did with ``memcpy(&tmptr, f->data, sizeof(void *))`` (common.c
+#: L690-706) and as the emitted ``cob_pointer_manip`` helper does.
+_POINTER_SIZE = struct.calcsize("P")
 
-    Under the Python backend a "pointer" is modelled as the referenced object
-    itself, so this returns *srcptr* unchanged (identity), preserving call
-    sites that round-trip a pointer through storage.
+#: Bit mask reducing an integer to the host pointer width (C pointer wraparound).
+_POINTER_MASK = (1 << (_POINTER_SIZE * 8)) - 1
+
+
+def _ptr_buffer(obj):
+    """Return the raw byte buffer backing *obj* (a cob_field or a buffer view).
+
+    The pointer accessors are emitted with either a :class:`cob_field` object
+    (``output_param`` - the POINTER/PROGRAM-POINTER read and ``SET p`` paths) or
+    a raw ``memoryview`` data slice (``output_data`` - the ``SET ADDRESS OF``
+    path), so a single helper normalises both to the byte run that holds the
+    address.  ``None`` (an OMITTED / NULL operand) yields ``None``.
     """
-    return srcptr
+    if obj is None:
+        return None
+    return getattr(obj, "data", obj)   # cob_field -> .data ; buffer -> itself
+
+
+def _read_ptr(buf):
+    """Decode the ``sizeof(void *)`` address bytes at the start of *buf*."""
+    if buf is None:
+        return 0
+    return int.from_bytes(bytes(buf[:_POINTER_SIZE]), sys.byteorder, signed=False)
+
+
+def _write_ptr(buf, addr):
+    """Encode integer *addr* into the first ``sizeof(void *)`` bytes of *buf*."""
+    buf[:_POINTER_SIZE] = (int(addr) & _POINTER_MASK).to_bytes(
+        _POINTER_SIZE, sys.byteorder, signed=False)
+
+
+def _ptr_to_int(val):
+    """Normalise a pointer *value* (None / int / buffer) to an integer address.
+
+    ``None`` -> ``0`` (NULL).  An ``int`` is the address itself (a pointer copied
+    from another pointer, already decoded by :func:`cob_get_pointer`).  A buffer
+    (a ``memoryview``/``bytes``/``bytearray`` produced by ``ADDRESS OF x``) has
+    no real machine address under the Python backend, so a stable synthetic
+    address is derived from the object identity; it round-trips through pointer
+    storage and pointer comparison consistently.
+    """
+    if val is None:
+        return 0
+    if isinstance(val, int):
+        return val & _POINTER_MASK
+    return id(val) & _POINTER_MASK
+
+
+def cob_get_pointer(srcptr):
+    """Return the integer address stored in pointer item *srcptr* (common.c L690-697).
+
+    Mirrors the C ``memcpy(&tmptr, srcptr, sizeof(void *)); return tmptr;`` - the
+    ``sizeof(void *)`` bytes of the item are decoded as a native-byte-order
+    integer.  This is exactly the value ``output_integer`` needs when a POINTER
+    item is read into an integer expression, and it round-trips with
+    :func:`cob_set_pointer` and :func:`cob_pointer_manip` (all three share the
+    one raw-address-bytes model).  Accepts either a :class:`cob_field` or a raw
+    buffer; ``None`` yields ``0``.
+    """
+    return _read_ptr(_ptr_buffer(srcptr))
 
 
 def cob_get_prog_pointer(srcptr):
-    """Return the program-pointer value stored in *srcptr* (common.c L699-706)."""
-    return srcptr
+    """Return the integer address stored in PROGRAM-POINTER item *srcptr*.
+
+    Program pointers are stored identically to data pointers (common.c
+    L699-706), so this defers to the same decode path.
+    """
+    return _read_ptr(_ptr_buffer(srcptr))
+
+
+def cob_set_pointer(fld, val):
+    """Store pointer *val* into POINTER item *fld* (the ``SET pointer`` store path).
+
+    The emitter (codegen.c CB_TAG_ASSIGN) lowers ``SET p TO ...`` to
+    ``common.cob_set_pointer(p, <value>)`` so the storage that
+    :func:`cob_get_pointer` reads is written with the same value, byte-for-byte.
+    *val* may be ``None``/``0`` (NULL), an integer address (``SET p1 TO p2``) or a
+    data buffer (``SET p TO ADDRESS OF x``); :func:`_ptr_to_int` normalises all
+    three.  Returns *fld* so the call may also be used as an expression.
+    """
+    _write_ptr(fld.data, _ptr_to_int(val))
+    return fld
+
+
+def cob_set_prog_pointer(fld, val):
+    """Store program-pointer *val* into PROGRAM-POINTER item *fld*.
+
+    Identical storage to :func:`cob_set_pointer` (common.c L699-706).
+    """
+    _write_ptr(fld.data, _ptr_to_int(val))
+    return fld
+
+
+def cob_set_addr(data, val):
+    """``SET ADDRESS OF x TO val`` - write address *val* into buffer *data*.
+
+    The emitter (codegen.c CB_TAG_ASSIGN, CAST_ADDRESS var) passes ``data`` =
+    ``output_data(x)`` (a writable ``memoryview`` over x's storage) and ``val`` =
+    the new address expression.  This mirrors the C non-aligned store
+    ``memcpy(<data>, &temp_ptr, sizeof(void *))``: the ``sizeof(void *)`` address
+    bytes are written into the start of *data*, byte-for-byte, so a subsequent
+    read decodes the same value.
+    """
+    _write_ptr(data, _ptr_to_int(val))
+
+
+def cob_addr_of(data):
+    """Model C ``&data`` (ADDRESS-OF-ADDRESS / pointer-to-pointer).
+
+    The emitter wraps a data view in ``common.cob_addr_of(...)`` when it needs a
+    *pointer to* that storage (codegen.c CB_CAST_ADDR_OF_ADDR, and the
+    COB_NON_ALIGNED RETURNING-pointer ``memcpy`` source).  Python has no machine
+    address, so a fresh writable ``sizeof(void *)``-byte buffer is returned
+    holding a stable synthetic address (the object identity of *data*); it is a
+    valid ``memcpy`` source and an updatable pointer-slot argument.  ``None``
+    yields a zero (NULL) slot.
+    """
+    return bytearray(
+        _ptr_to_int(data).to_bytes(_POINTER_SIZE, sys.byteorder, signed=False))
+
+
+def cob_field_set_data(field, data):
+    """Re-point *field*'s storage at *data* and return *field* (BASED/LINKAGE).
+
+    Mirrors the C comma-expression ``(f->data = data, &f)`` (codegen.c L1625):
+    a LOCAL / BASED / LINKAGE / ANY-LENGTH item is a cached field whose backing
+    ``.data`` must be re-pointed at run time.  The view is **aliased** (never
+    copied) so the item shares storage with the pointed-to data exactly as the C
+    pointer assignment did; the field object is returned so it can be passed
+    straight on as a call argument.
+    """
+    field.data = data
+    return field
+
+
+def cob_trunc_div(a, b):
+    """C-style integer division: truncate the quotient toward zero.
+
+    The emitter routes the integer ``'/'`` operator to this helper (codegen.c
+    output_integer CB_TAG_BINARY_OP) because C integer division truncates toward
+    zero whereas Python ``//`` floors toward negative infinity, so the two
+    DISAGREE whenever the operands have opposite signs (C: ``-7 / 2 == -3`` but
+    Python: ``-7 // 2 == -4``).  Computing the magnitude quotient and reapplying
+    the sign reproduces C ``a / b`` exactly for all signs and magnitudes at
+    arbitrary precision (no float), preserving byte-for-byte parity.  Division by
+    zero propagates a :class:`ZeroDivisionError` (the C undefined-behaviour fault
+    is surfaced rather than masked).
+    """
+    a = int(a)
+    b = int(b)
+    q = abs(a) // abs(b)
+    if (a < 0) != (b < 0):
+        q = -q
+    return q
+
+
+def cob_pointer_manip(f1, f2, addsub):
+    """Add or subtract an integer offset to/from a USAGE POINTER item.
+
+    Runtime home of the helper that the C backend used to *emit* as a static
+    function inside every generated translation unit::
+
+        static void
+        cob_pointer_manip (cob_field *f1, cob_field *f2, size_t addsub)
+        {
+            unsigned char *tmptr;
+            memcpy (&tmptr, f1->data, sizeof(void *));
+            if (addsub) {
+                tmptr -= cob_get_int (f2);
+            } else {
+                tmptr += cob_get_int (f2);
+            }
+            memcpy (f1->data, &tmptr, sizeof(void *));
+        }
+
+    (the original ``cobc/codegen.c`` ``gen_ptrmanip`` emission).  The front-end
+    (``cobc/typeck.c`` L2660/L2702) emits ``common.cob_pointer_manip(f1, f2,
+    flag)`` for ``SET pointer UP/DOWN BY n``; *addsub* is ``0`` (the ``cb_int0``
+    UP / increment case) or ``1`` (the ``cb_int1`` DOWN / decrement case).
+
+    The pointer value is read from *f1*'s data as a ``sizeof(void *)`` native
+    -byte-order integer, adjusted by ``cob_get_int`` of *f2*, and written back -
+    byte-for-byte equivalent to the two ``memcpy`` calls above (the write masks
+    to the pointer width, mirroring C ``unsigned char *`` wraparound).
+    """
+    cur = _read_ptr(f1.data)
+    amount = _lazy_get_int(f2)
+    if addsub:
+        cur -= amount
+    else:
+        cur += amount
+    _write_ptr(f1.data, cur)
+
+
+# ===========================================================================
+# C standard-library buffer primitives (memcpy / memmove / memcmp / memset).
+#
+# The COBOL front-end (cobc/typeck.c) lowers small fixed-size MOVE / comparison
+# operations directly to the C library functions ``memcpy`` / ``memcmp`` /
+# ``memset`` (e.g. typeck.c L2471, L2505, L4510, L4524, ...), emitting them via
+# ``cb_build_funcall_3`` with ``cob_build_cast_address`` / ``cob_build_cast_
+# length`` operands.  The Python emitter routes those bare names to this module
+# (``codegen_pymod`` rule for ``mem*`` -> ``common``), so generated code calls
+# ``common.memcpy(...)`` etc.  Under the Python backend a "cast address" is a
+# ``memoryview`` slice over the program's backing ``bytearray`` (or a ``bytes``
+# literal for constant source data), and a "cast length" is a plain ``int``.
+# These are therefore faithful, byte-exact re-implementations of the three C
+# primitives operating on those buffers - NOT the field-aware ``cob_memcpy``
+# (which builds a temp field and delegates to ``cob_move``); the two coexist
+# because the emitter chooses the raw primitive only when both operands are
+# fixed-size raw byte runs.
+# ===========================================================================
+
+def _readable_bytes(buf, n):
+    """Return the first *n* bytes of *buf* as an immutable ``bytes`` snapshot.
+
+    Accepts ``memoryview`` slices, ``bytes``/``bytearray`` and any other
+    buffer-protocol object that the emitter may hand in for a cast-address
+    operand.  Taking a snapshot also makes :func:`memcpy`/:func:`memmove`
+    overlap-safe (the source is fully read before the destination is written).
+    """
+    mv = buf if isinstance(buf, memoryview) else memoryview(buf)
+    return bytes(mv[:n])
+
+
+def memcpy(dst, src, length):
+    """C ``memcpy``: copy *length* bytes from *src* into *dst*; return *dst*.
+
+    *dst* is a writable ``memoryview`` (over the program's ``bytearray``) or a
+    ``bytearray``; *src* may be a ``memoryview``, ``bytes`` or ``bytearray``;
+    *length* is an ``int``.  Semantics match the C library function for the
+    non-overlapping case the compiler guarantees here.
+    """
+    n = int(length)
+    if n > 0:
+        dst[:n] = _readable_bytes(src, n)
+    return dst
+
+
+def memmove(dst, src, length):
+    """C ``memmove``: like :func:`memcpy` but explicitly overlap-safe.
+
+    The COBOL backend never actually emits ``memmove`` (only ``memcpy`` /
+    ``memcmp`` / ``memset`` appear in ``typeck.c``), but ``codegen_pymod``
+    routes the name to this module, so it is provided for completeness.  Because
+    :func:`_readable_bytes` snapshots the source before writing, overlapping
+    regions are handled correctly.
+    """
+    n = int(length)
+    if n > 0:
+        dst[:n] = _readable_bytes(src, n)
+    return dst
+
+
+def memset(dst, c, length):
+    """C ``memset``: set *length* bytes of *dst* to byte value *c*; return *dst*.
+
+    *dst* is a writable ``memoryview``/``bytearray``; *c* is an ``int`` byte
+    value (used modulo 256, as in C); *length* is an ``int``.
+    """
+    n = int(length)
+    if n > 0:
+        dst[:n] = bytes((int(c) & 0xFF,)) * n
+    return dst
+
+
+def memcmp(a, b, size):
+    """C ``memcmp``: compare the first *size* bytes of *a* and *b*.
+
+    Returns a negative value, ``0``, or a positive value when *a* is
+    respectively less than, equal to, or greater than *b* over the compared
+    region - matching the C library contract used by the emitted comparison
+    code.  Operands may be ``memoryview``/``bytes``/``bytearray``.
+    """
+    n = int(size)
+    if n <= 0:
+        return 0
+    ba = _readable_bytes(a, n)
+    bb = _readable_bytes(b, n)
+    for i in range(n):
+        diff = ba[i] - bb[i]
+        if diff:
+            return -1 if diff < 0 else 1
+    return 0
 
 
 def cob_set_location(progid, sfile, sline, csect, cpara, cstatement):

@@ -460,10 +460,17 @@ case $host_os in
 		if test $? -ne 0 -o -s hptest.out
 		then
 			CFLAGS="$CFLAGS +ESlit"
-			COB_CFLAGS="$COB_CFLAGS +ESlit -w"
+			# MIGRATION (C->Python): removed the dead
+			# "COB_CFLAGS=...+ESlit -w" assignment.  COB_CFLAGS is the former
+			# generated-backend C-compiler flag variable; it no longer exists
+			# and is no longer AC_SUBST'd under the Python backend (AAP 0.5.2 /
+			# R10).  The CFLAGS line above still builds the cobc C binary on
+			# HP-UX and is preserved.
 		else
 			CFLAGS="$CFLAGS +Olit=all"
-			COB_CFLAGS="$COB_CFLAGS +Olit=all -w"
+			# MIGRATION (C->Python): removed the dead
+			# "COB_CFLAGS=...+Olit=all -w" assignment for the same reason; the
+			# CFLAGS line above (which builds the cobc C binary) is preserved.
 		fi
 		rm -f hptest*
 	fi
@@ -476,7 +483,9 @@ case $host_os in
 		COB_SHARED_OPT="-G"
 		COB_FIX_LIB=""
 		# COB_FIX_LIB="-Wc,-G $COB_EXPORT_DYN"
-		# COB_CFLAGS="$COB_CFLAGS -qchars=signed"
+		# MIGRATION (C->Python): removed the obsolete commented-out
+		# "COB_CFLAGS=...-qchars=signed" reference - COB_CFLAGS is removed
+		# entirely under the Python backend (AAP 0.5.2 / R10).
 	else
 		COB_FIX_LIB="$COB_EXPORT_DYN"
 	fi

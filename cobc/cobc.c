@@ -41,6 +41,24 @@
 #include <signal.h>
 #endif
 
+/* MIGRATION (C->Python) / SECURITY (CWE-78): headers for the argv-vector
+   process runner (cobc_spawn_argv) that replaces the former system()/shell
+   string executor.  On POSIX the Python backend interpreter is launched with
+   fork()+execvp()+waitpid() (declared in <unistd.h>/<sys/wait.h>), and the
+   child's stdout/stderr are silenced by redirecting file descriptors with
+   open()+dup2() (<fcntl.h>) -- never by a shell ">" redirection.  On Windows
+   the equivalent argv-vector launcher is _spawnvp (<process.h>), which also
+   bypasses the command interpreter.  None of these paths invoke /bin/sh or
+   cmd.exe, so shell metacharacters in COB_PYTHON or any file path are inert. */
+#ifdef _WIN32
+#include <process.h>		/* _spawnvp / _P_WAIT (argv-vector, no shell) */
+#else
+#include <sys/wait.h>		/* waitpid / WIFEXITED / WEXITSTATUS */
+#endif
+#ifdef	HAVE_FCNTL_H
+#include <fcntl.h>		/* open() for child stdout/stderr redirection */
+#endif
+
 #ifdef _WIN32
 #include <windows.h>		/* for GetTempPath, GetTempFileName */
 #endif
@@ -1406,46 +1424,91 @@ process_filename (const char *filename)
 	return fn;
 }
 
-static int
-process (const char *cmd)
-{
-	char	*p;
-	char	*buffptr;
-	size_t	clen;
-	int	ret;
-	char	buff[COB_MEDIUM_BUFF];
+/* MIGRATION (C->Python) / SECURITY (CWE-78): argv-vector process runner that
+   replaces the former process()/system() shell-string executor.  The original
+   process() concatenated the C-compiler command line into a single string,
+   back-slash-quoted only '$', and handed the result to system(), i.e. to
+   "/bin/sh -c <string>".  That made every other shell metacharacter (; | & `
+   > < * ? () newline ...) live, so a COB_PYTHON value or a source/output/module
+   path containing such a character could inject arbitrary shell commands.
 
-	if (strchr (cmd, '$') == NULL) {
-		if (verbose_output) {
-			fprintf (stderr, "%s\n", (char *)cmd);
+   The Python backend instead passes a NULL-terminated argv vector straight to
+   execvp() (POSIX) / _spawnvp() (Windows): the kernel launches the interpreter
+   directly with those exact argument strings and NO command interpreter is
+   involved, so shell metacharacters are inert.  Output is suppressed - when the
+   caller sets "silence" (the version probe) - by redirecting the child's
+   stdout/stderr onto an open() file descriptor for the null device via dup2(),
+   not by a shell ">" redirection.  The return value is the child's exit code
+   (0 == success), preserving the "!= 0" failure checks at every call site; a
+   fork/exec/wait failure maps to a non-zero status. */
+static int
+cobc_spawn_argv (char *const argv[], const int silence)
+{
+#ifdef _WIN32
+	/* Windows: _spawnvp passes argv directly to the program image (it does not
+	   route through cmd.exe), so the command-injection surface is removed here
+	   too.  Silencing the version probe is best-effort on this platform, which
+	   is acceptable: per AAP 0.2.2 Windows-specific behaviour beyond removing
+	   the C-compiler requirement is out of scope. */
+	intptr_t	rc;
+
+	if (verbose_output) {
+		char *const	*a;
+		for (a = argv; *a != NULL; a++) {
+			fprintf (stderr, "%s%s", (a == argv) ? "" : " ", *a);
 		}
-		return system (cmd);
+		fputc ('\n', stderr);
 	}
-    	clen = strlen (cmd) + 32;
-    	if (clen > COB_MEDIUM_BUFF) {
-    		buffptr = cobc_malloc (clen);
-    	} else {
-    		buffptr = buff;
-    	}
-    	p = buffptr;
-    	/* quote '$' */
-	for (; *cmd; cmd++) {
-    		if (*cmd == '$') {
-    			p += sprintf (p, "\\$");
-    		} else {
-    			*p++ = *cmd;
-    		}
-    	}
-    	*p = 0;
-    
-    	if (verbose_output) {
-    		fprintf (stderr, "%s\n", buffptr);
-    	}
-	   ret = system (buffptr);
-   	if (buffptr != buff) {
-   		free (buffptr);
-   	}
-	return ret;
+	(void)silence;
+	rc = _spawnvp (_P_WAIT, argv[0], (const char * const *)argv);
+	return (rc == 0) ? 0 : 1;
+#else
+	pid_t	pid;
+	int	status;
+	int	devnull;
+
+	if (verbose_output) {
+		/* Informational echo only - this string is NEVER re-parsed for
+		   execution, so it cannot reintroduce the injection vector. */
+		char *const	*a;
+		for (a = argv; *a != NULL; a++) {
+			fprintf (stderr, "%s%s", (a == argv) ? "" : " ", *a);
+		}
+		fputc ('\n', stderr);
+	}
+
+	pid = fork ();
+	if (pid < 0) {
+		return 1;
+	}
+	if (pid == 0) {
+		/* Child: optionally silence stdout/stderr via fd redirection, then
+		   exec the interpreter directly (no shell). */
+		if (silence) {
+			devnull = open (COB_NULL_DEVICE, O_WRONLY);
+			if (devnull >= 0) {
+				dup2 (devnull, STDOUT_FILENO);
+				dup2 (devnull, STDERR_FILENO);
+				if (devnull > STDERR_FILENO) {
+					close (devnull);
+				}
+			}
+		}
+		execvp (argv[0], argv);
+		/* Reached only if exec failed (e.g. interpreter not found). */
+		_exit (127);
+	}
+	/* Parent: reap the child, retrying across signal interruptions. */
+	while (waitpid (pid, &status, 0) < 0) {
+		if (errno != EINTR) {
+			return 1;
+		}
+	}
+	if (WIFEXITED (status)) {
+		return WEXITSTATUS (status);
+	}
+	return 1;
+#endif
 }
 
 /* Preprocess source */
@@ -1709,19 +1772,25 @@ process_translate (struct filename *fn)
    implicitly relied on a working C compiler; here we probe cob_python and
    require sys.version_info >= (3, 11).  Any failure - missing interpreter,
    exec error, or a version below 3.11 - is fatal: emit the mandated
-   diagnostic and exit(1) performing no compilation (AAP 0.7.2).  The probe's
-   output is discarded via COB_NULL_DEVICE so normal runs stay quiet. */
+   diagnostic and exit(1) performing no compilation (AAP 0.7.2).
+   SECURITY (CWE-78): the probe is dispatched through cobc_spawn_argv with a
+   fixed argv vector { cob_python, "-c", <probe>, NULL } - cob_python is one
+   argument and is never concatenated into a shell command, so a metacharacter
+   in its path cannot inject a command.  The probe's stdout/stderr are silenced
+   by file-descriptor redirection (silence=1), replacing the former
+   "> COB_NULL_DEVICE 2>&1" shell redirection. */
 static void
 cobc_check_python (void)
 {
-	char	buff[COB_MEDIUM_BUFF];
+	static char	probe[] =
+		"import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)";
+	char		*argv[4];
 
-	snprintf (buff, sizeof (buff),
-		  "\"%s\" -c \"import sys; "
-		  "sys.exit(0 if sys.version_info >= (3, 11) else 1)\" "
-		  "> %s 2>&1",
-		  cob_python, COB_NULL_DEVICE);
-	if (system (buff) != 0) {
+	argv[0] = (char *)cob_python;
+	argv[1] = (char *)"-c";
+	argv[2] = probe;
+	argv[3] = NULL;
+	if (cobc_spawn_argv (argv, 1) != 0) {
 		fprintf (stderr,
 			 "cobc: Python 3.11+ interpreter not found at %s. Set COB_PYTHON.\n",
 			 cob_python);
@@ -1741,23 +1810,26 @@ cobc_check_python (void)
    "python <module>" (AAP 0.4.1).  When "as_exec" is set a shebang for cob_python
    is embedded and the executable bit set, yielding a directly runnable artifact
    for the "-x" mode.  The staging is performed by one argv-driven "python -c"
-   command (no nested double quotes) executed through the existing process()
-   runner, whose exit status is returned. */
+   command (no nested double quotes); SECURITY (CWE-78): it is dispatched
+   through the cobc_spawn_argv argv-vector runner - the output archive name and
+   every module path are individual argv elements passed verbatim to execvp(),
+   so no shell parses them and metacharacters in any path are inert.  The
+   child's exit status is returned. */
 static int
 cobc_build_pyz (struct filename *primary, struct filename *modlist,
 		const char *outname, const int as_exec)
 {
 	struct filename	*f;
-	char		*buffptr;
-	char		*p;
-	size_t		bufflen;
+	char		**argv;
+	int		argc;
+	int		nargs;
 	int		ret;
-	char		buff[COB_MEDIUM_BUFF];
 
-	/* Fixed staging script.  argv = [ outname, "0"/"1", mod1, mod2, ... ]:
-	   copy each module by basename, the first additionally as __main__.py,
-	   then write the archive (optionally with an interpreter shebang). */
-	static const char	pyz_stage[] =
+	/* Fixed staging script.  Python's sys.argv becomes
+	   [ "-c"-script, outname, "0"/"1", mod1, mod2, ... ]: copy each module by
+	   basename, the first additionally as __main__.py, then write the archive
+	   (optionally with an interpreter shebang). */
+	static char	pyz_stage[] =
 		"import os,sys,shutil,tempfile,zipapp;"
 		"o=sys.argv[1];x=sys.argv[2]=='1';m=sys.argv[3:];"
 		"d=tempfile.mkdtemp();"
@@ -1766,39 +1838,43 @@ cobc_build_pyz (struct filename *primary, struct filename *modlist,
 		"zipapp.create_archive(d,o,interpreter=(sys.executable if x else None));"
 		"shutil.rmtree(d)";
 
-	/* Size the command buffer: interpreter + script + outname + flag + each
-	   quoted module path. */
-	bufflen = strlen (cob_python) + sizeof (pyz_stage) + strlen (outname) + 32;
-	bufflen += strlen (primary->translate) + 4;
+	/* MIGRATION (C->Python) / SECURITY (CWE-78): build a NULL-terminated argv
+	   vector rather than a shell command string.  Count the slots first:
+	   cob_python, "-c", script, outname, flag, primary, [extra modules], NULL. */
+	nargs = 6;
 	if (modlist) {
 		for (f = modlist; f; f = f->next) {
-			bufflen += strlen (f->translate) + 4;
+			if (f != primary) {
+				nargs++;
+			}
 		}
 	}
-	if (bufflen >= COB_MEDIUM_BUFF) {
-		buffptr = cobc_malloc (bufflen);
-	} else {
-		buffptr = buff;
-	}
+	nargs++;			/* NULL terminator */
+	argv = cobc_malloc ((size_t)nargs * sizeof (*argv));
 
-	/* The primary (entry) module is argv[3] - it becomes m[0]/__main__.py. */
-	p = buffptr;
-	p += sprintf (p, "\"%s\" -c \"%s\" \"%s\" %d \"%s\"",
-		      cob_python, pyz_stage, outname, as_exec ? 1 : 0,
-		      primary->translate);
+	/* The primary (entry) module is sys.argv[3] - it becomes m[0]/__main__.py.
+	   The (char *) casts drop const for the execvp prototype only; execvp does
+	   not modify the strings. */
+	argc = 0;
+	argv[argc++] = (char *)cob_python;
+	argv[argc++] = (char *)"-c";
+	argv[argc++] = pyz_stage;
+	argv[argc++] = (char *)outname;
+	argv[argc++] = (char *)(as_exec ? "1" : "0");
+	argv[argc++] = (char *)primary->translate;
 	/* Append any additional modules (multi-program -x / -b builds). */
 	if (modlist) {
 		for (f = modlist; f; f = f->next) {
 			if (f == primary) {
 				continue;
 			}
-			p += sprintf (p, " \"%s\"", f->translate);
+			argv[argc++] = (char *)f->translate;
 		}
 	}
-	ret = process (buffptr);
-	if (buffptr != buff) {
-		free (buffptr);
-	}
+	argv[argc] = NULL;
+
+	ret = cobc_spawn_argv (argv, 0);
+	free (argv);
 	return ret;
 }
 
@@ -1807,36 +1883,26 @@ cobc_build_pyz (struct filename *primary, struct filename *modlist,
    cfile honours the -o / object naming and doraise=True maps a Python syntax
    error to a non-zero exit status, preserving the original C error mapping.
    Both process_compile (-S) and process_assemble (-c) share this single
-   implementation.  The command is built into a buffer sized to the interpreter
-   path, the fixed inline script and both file paths, then written through a
-   "char *" of indeterminate extent (the cobc_build_pyz pattern) so that even
-   arbitrarily long file paths cannot overflow it. */
+   implementation.  SECURITY (CWE-78): the interpreter, the inline script and
+   the source and output paths are passed as separate argv elements to the
+   cobc_spawn_argv argv-vector runner, so no shell interprets them - a path
+   containing shell metacharacters cannot inject a command and there is no
+   buffer to overflow. */
 static int
 cobc_build_pycompile (const char *src, const char *out)
 {
-	static const char	py_compile_script[] =
+	static char	py_compile_script[] =
 		"import py_compile,sys; "
 		"py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)";
-	char	*buffptr;
-	char	buff[COB_MEDIUM_BUFF];
-	size_t	bufflen;
-	int	ret;
+	char	*argv[6];
 
-	bufflen = strlen (cob_python) + sizeof (py_compile_script)
-		  + strlen (src) + strlen (out) + 16;
-	if (bufflen >= COB_MEDIUM_BUFF) {
-		buffptr = cobc_malloc (bufflen);
-	} else {
-		buffptr = buff;
-	}
-	sprintf (buffptr,
-		 "\"%s\" -c \"%s\" \"%s\" \"%s\"",
-		 cob_python, py_compile_script, src, out);
-	ret = process (buffptr);
-	if (buffptr != buff) {
-		free (buffptr);
-	}
-	return ret;
+	argv[0] = (char *)cob_python;
+	argv[1] = (char *)"-c";
+	argv[2] = py_compile_script;
+	argv[3] = (char *)src;
+	argv[4] = (char *)out;
+	argv[5] = NULL;
+	return cobc_spawn_argv (argv, 0);
 }
 
 static int
@@ -2122,16 +2188,15 @@ main (int argc, char *argv[])
 		alt_ebcdic = 1;
 	}
 
-	/* Compiler special options */
-
-#if	defined(__INTEL_COMPILER)
-	strcat (cob_cflags, " -vec-report0 -opt-report 0");
-#elif	defined(__GNUC__)
-	strcat (cob_cflags, " -Wno-unused -fsigned-char");
-#ifdef	HAVE_PSIGN_OPT
-	strcat (cob_cflags, " -Wno-pointer-sign");
-#endif
-#endif
+	/* MIGRATION (C->Python): the former "Compiler special options" block
+	   appended host-C-compiler switches (Intel "-vec-report0 -opt-report 0";
+	   GCC "-Wno-unused -fsigned-char" and optionally "-Wno-pointer-sign") to
+	   cob_cflags.  Those flags configured the native C backend, which no longer
+	   exists, and cob_cflags is inert under the Python backend (it is reset to
+	   "" above and never read by any process_* dispatcher).  The appends were
+	   therefore dead writes and are removed so no stale C-compiler state lingers
+	   (review MINOR / R10).  The immutable CLI option handlers that still target
+	   cob_cflags are deliberately left untouched per the minimal-change clause. */
 
 	/* Process command line arguments */
 	iargs = process_command_line (argc, argv);
@@ -2153,9 +2218,11 @@ main (int argc, char *argv[])
 
 	/* Windows stuff reliant upon verbose option */
 #ifdef	_MSC_VER
-	if (!verbose_output) {
-		strcat (cob_cflags, " /nologo");
-	}
+	/* MIGRATION (C->Python): the MSVC "/nologo" switch was appended to
+	   cob_cflags to quiet the native C compiler.  cob_cflags is inert under the
+	   Python backend, so this append is a dead write and is removed (review
+	   MINOR / R10).  The manicmd selection below is unrelated to cob_cflags and
+	   is preserved unchanged. */
 #if	_MSC_VER >= 1400
 	if (!verbose_output) {
 		manicmd = "mt /nologo";

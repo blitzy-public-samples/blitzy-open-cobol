@@ -24,6 +24,18 @@
 
 SUBDIRS = cobol85
 
+# MIGRATION (C->Python): the C->Python backend refactor requires regenerating
+# the build (autoreconf) so configure emits the new COB_PYTHON macro into
+# defaults.h.  The original tree was built from a pre-generated configure made
+# by automake 1.9.x, whose implicit "serial-tests" harness permits "$(srcdir)"
+# inside the TESTS list below.  Modern automake (>= 1.13) defaults to the
+# "parallel-tests" harness, which rejects "$(srcdir)" in TESTS and aborts
+# autoreconf.  Restoring "serial-tests" here re-establishes the EXACT original
+# Autotest behaviour (the suites already ran serially) with zero change to how
+# the syntax/run/data-rep oracles execute, and is the minimal fix that unblocks
+# autoreconf.  The NIST CCVS85 oracle under cobol85/ is untouched.
+AUTOMAKE_OPTIONS = serial-tests
+
 TESTS = $(srcdir)/syntax \
 	$(srcdir)/run \
 	$(srcdir)/run-O \
@@ -122,8 +134,18 @@ $(srcdir)/data-rep: $(data_rep_DEPENDENCIES)
 # lives in $(srcdir)/libcob_py and is run here so `make check` enforces the
 # runtime-regression gate (AAP 0.7.1) and the >=80% per-module coverage gate.
 # Additive: does NOT touch the Autotest TESTS above. Interpreter = $(COB_PYTHON)
-# (AC_SUBST'd by configure.ac). pytest/coverage are dev-only tools (AAP 0.5.1):
-# if absent we warn and skip rather than break `make check`.
+# (AC_SUBST'd by configure.ac). pytest/coverage are dev-only tools (AAP 0.5.1).
+#
+# MIGRATION (C->Python) / strict-vs-dev coverage gate (review MINOR / R5):
+# By default (local developer workstations) a missing pytest or coverage.py is
+# reported and the suite (or the >=80% gate) is SKIPPED rather than breaking
+# `make check`, because these are dev-only tools.  In CI / release-gating
+# environments set COB_PY_STRICT_COVERAGE=1 (e.g. `make check
+# COB_PY_STRICT_COVERAGE=1`): the absence of pytest OR coverage.py then becomes
+# a HARD FAILURE so the runtime-regression (AAP 0.7.1) and >=80% per-module
+# coverage gates cannot be silently bypassed.  This documents and enforces the
+# distinction the review required between a permissible local skip and the
+# strict gate.
 check-local:
 	@echo "=== libcob_py runtime suite (C->Python migration) ==="; \
 	if $(COB_PYTHON) -m pytest --version >/dev/null 2>&1; then \
@@ -133,9 +155,21 @@ check-local:
 	        -m pytest -q "$(abs_srcdir)/libcob_py" && \
 	    $(COB_PYTHON) -m coverage report --fail-under=80; \
 	  else \
-	    echo "NOTE: coverage.py not installed; running pytest without the >=80% coverage gate"; \
+	    if test -n "$(COB_PY_STRICT_COVERAGE)"; then \
+	      echo "ERROR: COB_PY_STRICT_COVERAGE is set but coverage.py is not installed;" >&2; \
+	      echo "       the >=80% per-module coverage gate cannot be enforced (AAP 0.7.1 / R5)." >&2; \
+	      exit 1; \
+	    fi; \
+	    echo "NOTE: coverage.py not installed; running pytest WITHOUT the >=80% coverage gate"; \
+	    echo "      (set COB_PY_STRICT_COVERAGE=1 to make this fatal in CI)"; \
 	    $(COB_PYTHON) -m pytest -q "$(abs_srcdir)/libcob_py"; \
 	  fi; \
 	else \
-	  echo "WARNING: '$(COB_PYTHON) -m pytest' unavailable; skipping libcob_py suite (dev-only pytest not installed)"; \
+	  if test -n "$(COB_PY_STRICT_COVERAGE)"; then \
+	    echo "ERROR: COB_PY_STRICT_COVERAGE is set but '$(COB_PYTHON) -m pytest' is unavailable;" >&2; \
+	    echo "       the runtime-regression and coverage gates cannot be enforced (AAP 0.7.1 / R5)." >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "WARNING: '$(COB_PYTHON) -m pytest' unavailable; skipping libcob_py suite"; \
+	  echo "         (dev-only pytest not installed; set COB_PY_STRICT_COVERAGE=1 to make this fatal in CI)"; \
 	fi

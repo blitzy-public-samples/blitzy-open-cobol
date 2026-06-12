@@ -117,6 +117,58 @@ class TestCobDecimal:
 
 
 # ===========================================================================
+# cob_decimal_set_int / cob_decimal_set_uint
+#
+# These are the runtime homes of the helpers the C backend used to EMIT as
+# static functions in every translation unit (codegen.c gen_decset/gen_udecset).
+# The front-end (typeck.c L2046/L2057/L2076/L2079) now emits calls to
+# numeric.cob_decimal_set_int / _uint instead.  mpz_set_si / mpz_set_ui set the
+# (signed / unsigned) integer with scale 0.
+# ===========================================================================
+class TestCobDecimalSetInt:
+    def test_set_int_positive(self):
+        d = numeric.cob_decimal(99, 5)
+        numeric.cob_decimal_set_int(d, 12345)
+        assert (d.value, d.scale) == (12345, 0)
+
+    def test_set_int_negative(self):
+        d = numeric.cob_decimal()
+        numeric.cob_decimal_set_int(d, -12345)
+        assert (d.value, d.scale) == (-12345, 0)
+
+    def test_set_int_zero(self):
+        d = numeric.cob_decimal(7, 2)
+        numeric.cob_decimal_set_int(d, 0)
+        assert (d.value, d.scale) == (0, 0)
+
+    def test_set_int_resets_scale(self):
+        # A non-zero pre-existing scale must be cleared (mpz_set_si; d->scale = 0).
+        d = numeric.cob_decimal(1, 9)
+        numeric.cob_decimal_set_int(d, 5)
+        assert d.scale == 0
+
+    def test_set_uint_small(self):
+        d = numeric.cob_decimal()
+        numeric.cob_decimal_set_uint(d, 7)
+        assert (d.value, d.scale) == (7, 0)
+
+    def test_set_uint_above_int_max(self):
+        # Unsigned PICTUREs can carry values above 2**31 (cob_get_int magnitude).
+        d = numeric.cob_decimal()
+        numeric.cob_decimal_set_uint(d, 4000000000)
+        assert (d.value, d.scale) == (4000000000, 0)
+
+    def test_set_uint_wrap_faithful_to_c_unsigned_int(self):
+        # The C parameter is ``unsigned int``; a negative argument wraps modulo
+        # 2**32.  The front-end never produces this, but the mask preserves
+        # byte-for-byte parity with mpz_set_ui for the theoretical edge.
+        d = numeric.cob_decimal()
+        numeric.cob_decimal_set_uint(d, -1)
+        assert d.value == 0xFFFFFFFF
+        assert d.scale == 0
+
+
+# ===========================================================================
 # decimal.Decimal float bridge
 # ===========================================================================
 class TestDoubleBridge:

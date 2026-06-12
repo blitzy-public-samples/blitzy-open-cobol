@@ -43,6 +43,7 @@ runtime base module :mod:`libcob_py.common`.  ZERO third-party dependencies
 (AAP sections 0.5 / 0.7.1).
 """
 
+import contextlib
 import decimal
 import struct
 import sys
@@ -96,6 +97,95 @@ COB_ROUND_DEFAULT = decimal.ROUND_HALF_UP
 #: Rounding applied when there is no ``ROUNDED`` clause at all: truncation,
 #: i.e. truncate toward zero (matches the C store path's ``shift_decimal``).
 COB_ROUND_TRUNCATION = decimal.ROUND_DOWN
+
+# ---------------------------------------------------------------------------
+# decimal Overflow / Inexact traps -> EC-SIZE family + ON SIZE ERROR
+# (AAP section 0.6.2).
+#
+# AAP 0.6.2 directs that overflow handling "enables the decimal Overflow and
+# Inexact traps within the per-statement context and maps them to the EC-SIZE
+# family and the COBOL ON SIZE ERROR path."  Two facts from COBOL semantics
+# determine how this is realised faithfully under the byte-for-byte mandate
+# (AAP 0.7.1):
+#
+#   * COBOL SIZE ERROR is raised when the *result does not fit the receiving
+#     item's PICTURE* - i.e. its integer-digit capacity is exceeded - and NOT
+#     when a fractional digit is rounded away.  ``decimal.Inexact`` (and
+#     ``decimal.Rounded``) fire on EVERY rounding store, e.g. any ``ROUNDED``
+#     clause, so literally promoting Inexact to an exception would raise SIZE
+#     ERROR on perfectly legal COBOL statements and destroy parity.  Inexact /
+#     Rounded are therefore left OBSERVABLE-ONLY (trap disabled); the
+#     receiving-field digit-capacity check in
+#     :func:`cob_decimal_get_display` / :func:`cob_decimal_get_binary` /
+#     :func:`cob_decimal_get_packed` is the authoritative, byte-equivalent
+#     EC-SIZE-OVERFLOW detector that drives ON SIZE ERROR.
+#   * ``decimal.Overflow`` (adjusted exponent > Emax) and
+#     ``decimal.DivisionByZero`` are genuine error conditions with no legal
+#     COBOL counterpart at COBOL magnitudes (18-31 digits); they are ENABLED as
+#     traps so any such signal is surfaced and mapped to the EC-SIZE family
+#     rather than silently producing a wrong value.
+#
+# :data:`COB_SIZE_ERROR_TRAPS` is the explicit, visible trap set and
+# :func:`cob_size_error_context` is the per-statement context that installs
+# precision + ROUNDED MODE + traps and maps a raised signal to the COBOL
+# EC-SIZE exception (and hence ON SIZE ERROR).
+# ---------------------------------------------------------------------------
+
+#: decimal signals promoted to a COBOL EC-SIZE exception inside a statement
+#: context: Overflow -> EC-SIZE-OVERFLOW, DivisionByZero -> EC-SIZE-ZERO-DIVIDE.
+COB_SIZE_ERROR_TRAPS = (decimal.Overflow, decimal.DivisionByZero)
+
+#: Working precision for the per-statement context: well above COBOL's maximum
+#: 31 (some dialects 38) significant digits but far below decimal's default
+#: Emax, so legal COBOL magnitudes never spuriously raise ``decimal.Overflow``.
+COB_STATEMENT_PRECISION = 80
+
+
+def _map_decimal_signal_to_ec_size(signal_exc):
+    """Map a trapped :mod:`decimal` signal to the COBOL EC-SIZE exception.
+
+    ``DivisionByZero`` -> ``EC-SIZE-ZERO-DIVIDE``; every other trapped signal
+    (currently ``Overflow``) -> ``EC-SIZE-OVERFLOW``.  Returns the resulting
+    ``cob_exception_code`` so callers can short-circuit the store.
+    """
+    if isinstance(signal_exc, decimal.DivisionByZero):
+        common.cob_set_exception(common.COB_EC_SIZE_ZERO_DIVIDE)
+    else:
+        common.cob_set_exception(common.COB_EC_SIZE_OVERFLOW)
+    return common.cob_exception_code
+
+
+@contextlib.contextmanager
+def cob_size_error_context(opt, rounding=None):
+    """Per-statement :mod:`decimal` context implementing AAP 0.6.2 traps.
+
+    Installs a :func:`decimal.localcontext` carrying COBOL precision and the
+    statement's ROUNDED MODE (HALF_UP when ``COB_STORE_ROUND`` is set and no
+    explicit mode is supplied, truncation otherwise), ENABLES the
+    Overflow/DivisionByZero traps listed in :data:`COB_SIZE_ERROR_TRAPS`, and
+    keeps Inexact/Rounded observable-only (see the module note above).  A
+    trapped signal is caught and mapped to the COBOL EC-SIZE exception, so the
+    receiving store is skipped exactly as the COBOL ``ON SIZE ERROR`` path
+    requires.
+    """
+    with decimal.localcontext() as ctx:
+        ctx.prec = COB_STATEMENT_PRECISION
+        if opt & common.COB_STORE_ROUND:
+            ctx.rounding = rounding if rounding is not None else COB_ROUND_DEFAULT
+        else:
+            ctx.rounding = COB_ROUND_TRUNCATION
+        # Enable the EC-SIZE-mapped traps; Inexact/Rounded stay observable-only
+        # because COBOL SIZE ERROR is integer-digit overflow, not fractional
+        # rounding (see the module note above).
+        for sig in COB_SIZE_ERROR_TRAPS:
+            ctx.traps[sig] = True
+        ctx.traps[decimal.Inexact] = False
+        ctx.traps[decimal.Rounded] = False
+        try:
+            yield ctx
+        except COB_SIZE_ERROR_TRAPS as exc:
+            _map_decimal_signal_to_ec_size(exc)
+
 
 # ---------------------------------------------------------------------------
 # Power-of-ten cache.  The C runtime precomputes ``cob_mpze10[0..35]``; Python
@@ -290,6 +380,54 @@ def cob_decimal_set_double(d, v):
     """
     d.value = int(v * 1.0e9)
     d.scale = 9
+
+
+def cob_decimal_set_int(d, n):
+    """Set decimal *d* from a signed integer *n* with scale 0.
+
+    This is the runtime home of the helper that the C backend used to *emit* as
+    a static function inside every generated translation unit::
+
+        static void
+        cob_decimal_set_int (cob_decimal *d, const int n)
+        {
+            mpz_set_si (d->value, n);
+            d->scale = 0;
+        }
+
+    (see ``cobc/codegen.c`` ``gen_decset`` emission in the original C emitter).
+    The Python emitter no longer emits this body; instead the front-end
+    (``cobc/typeck.c`` L2046/L2057/L2076) emits a call
+    ``numeric.cob_decimal_set_int(d, n)`` and the implementation lives here.
+    ``mpz_set_si`` stores the signed value verbatim, so the Python bignum
+    assignment is byte-for-byte equivalent.
+    """
+    d.value = int(n)
+    d.scale = 0
+
+
+def cob_decimal_set_uint(d, n):
+    """Set decimal *d* from an unsigned integer *n* with scale 0.
+
+    Runtime home of the C backend's emitted static helper::
+
+        static void
+        cob_decimal_set_uint (cob_decimal *d, const unsigned int n)
+        {
+            mpz_set_ui (d->value, n);
+            d->scale = 0;
+        }
+
+    The front-end (``cobc/typeck.c`` L2079) emits this only for *unsigned*
+    PICTURE operands, where ``cob_get_int`` yields a non-negative magnitude, so
+    the value is already in ``[0, 2**31)``.  The C parameter is ``unsigned
+    int``; to mirror that 32-bit unsigned conversion exactly (including the
+    theoretical negative-wrap edge), the value is masked to 32 bits before being
+    stored.  For every value the front-end actually produces this mask is a
+    no-op, preserving byte-for-byte parity with ``mpz_set_ui``.
+    """
+    d.value = int(n) & 0xFFFFFFFF
+    d.scale = 0
 
 
 def cob_decimal_get_double(d):
@@ -931,37 +1069,52 @@ def cob_decimal_get_field(d, f, opt, rounding=None):
     else:
         mode = COB_ROUND_TRUNCATION
 
-    # Round/extend the mantissa to the field scale (replaces the C add-5
-    # round followed by the truncating shift_decimal).
-    d.value = _round_value_to_scale(d.value, d.scale, target, mode)
-    d.scale = target
+    # Per-statement decimal context (AAP 0.6.2): enables the Overflow /
+    # DivisionByZero traps mapped to the EC-SIZE family.  A trapped signal sets
+    # the COBOL exception and leaves ``result`` unset, so the store is skipped
+    # exactly as the COBOL ON SIZE ERROR path requires.  The digit-capacity
+    # checks inside the get_* stores remain the byte-equivalent SIZE-ERROR
+    # detector for the normal COBOL case (integer digits exceed the PICTURE).
+    result = None
+    with cob_size_error_context(opt, rounding):
+        # Round/extend the mantissa to the field scale (replaces the C add-5
+        # round followed by the truncating shift_decimal).
+        d.value = _round_value_to_scale(d.value, d.scale, target, mode)
+        d.scale = target
 
-    ftype = common.COB_FIELD_TYPE(f)
-    if ftype == common.COB_TYPE_NUMERIC_BINARY:
-        return cob_decimal_get_binary(d, f, opt)
-    if ftype == common.COB_TYPE_NUMERIC_PACKED:
-        return cob_decimal_get_packed(d, f, opt)
-    if ftype == common.COB_TYPE_NUMERIC_DISPLAY:
-        return cob_decimal_get_display(d, f, opt)
-    if ftype == common.COB_TYPE_NUMERIC_FLOAT:
-        f.data[:4] = bytearray(struct.pack("=f", cob_decimal_get_double(d)))
-        return 0
-    if ftype == common.COB_TYPE_NUMERIC_DOUBLE:
-        f.data[:8] = bytearray(struct.pack("=d", cob_decimal_get_double(d)))
-        return 0
+        ftype = common.COB_FIELD_TYPE(f)
+        if ftype == common.COB_TYPE_NUMERIC_BINARY:
+            result = cob_decimal_get_binary(d, f, opt)
+        elif ftype == common.COB_TYPE_NUMERIC_PACKED:
+            result = cob_decimal_get_packed(d, f, opt)
+        elif ftype == common.COB_TYPE_NUMERIC_DISPLAY:
+            result = cob_decimal_get_display(d, f, opt)
+        elif ftype == common.COB_TYPE_NUMERIC_FLOAT:
+            f.data[:4] = bytearray(struct.pack("=f", cob_decimal_get_double(d)))
+            result = 0
+        elif ftype == common.COB_TYPE_NUMERIC_DOUBLE:
+            f.data[:8] = bytearray(struct.pack("=d", cob_decimal_get_double(d)))
+            result = 0
+        else:
+            # Default (NUMERIC-EDITED and friends): render to a DISPLAY
+            # temporary of the field's digit count, then MOVE it (the
+            # editing/insertion lives in libcob_py.move).  ``common._lazy_move``
+            # performs the deferred import so numeric.py keeps ``common`` as its
+            # only sibling dependency.
+            digits = common.COB_FIELD_DIGITS(f)
+            temp_attr = common.cob_field_attr(
+                type=common.COB_TYPE_NUMERIC_DISPLAY, digits=digits,
+                scale=target, flags=common.COB_FLAG_HAVE_SIGN, pic=None)
+            temp = common.cob_field(size=digits, data=bytearray(digits),
+                                    attr=temp_attr)
+            if cob_decimal_get_display(d, temp, opt) == 0:
+                common._lazy_move(temp, f)
+            result = common.cob_exception_code
 
-    # Default (NUMERIC-EDITED and friends): render to a DISPLAY temporary of
-    # the field's digit count, then MOVE it (the editing/insertion lives in
-    # libcob_py.move).  ``common._lazy_move`` performs the deferred import so
-    # numeric.py keeps ``common`` as its only sibling dependency.
-    digits = common.COB_FIELD_DIGITS(f)
-    temp_attr = common.cob_field_attr(
-        type=common.COB_TYPE_NUMERIC_DISPLAY, digits=digits, scale=target,
-        flags=common.COB_FLAG_HAVE_SIGN, pic=None)
-    temp = common.cob_field(size=digits, data=bytearray(digits), attr=temp_attr)
-    if cob_decimal_get_display(d, temp, opt) == 0:
-        common._lazy_move(temp, f)
-    return common.cob_exception_code
+    if result is None:
+        # A decimal trap fired and was mapped to EC-SIZE; the store was skipped.
+        return common.cob_exception_code
+    return result
 
 
 # ===========================================================================

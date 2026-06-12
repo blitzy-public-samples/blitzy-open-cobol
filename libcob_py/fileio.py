@@ -46,7 +46,7 @@ looks like a legacy Berkeley DB database is opened, this module does *not*
 silently truncate or corrupt it: it yields COBOL file status ``30`` (permanent
 error) and logs the exact message ::
 
-    indexed file format incompatible - manual migration required
+    indexed file format incompatible — manual migration required
 
 One-time migration note
 ------------------------
@@ -70,6 +70,8 @@ while not emulating cross-process BDB lock arbitration.
 from __future__ import annotations
 
 import dbm
+import functools
+import heapq
 import io
 import os
 import shutil
@@ -189,8 +191,9 @@ COBSORTNOTOPEN = 4
 _SIZE_T_BYTES = 8
 
 #: Exact log message demanded by the indexed-file migration error contract
-#: (AAP section 0.6.3).  Emitted verbatim on the status-30 path.
-_MIGRATION_MESSAGE = "indexed file format incompatible - manual migration required"
+#: (AAP section 0.6.3).  Emitted verbatim on the status-30 path.  The dash is a
+#: U+2014 EM DASH, matching the AAP/checkpoint contract text byte-for-byte.
+_MIGRATION_MESSAGE = "indexed file format incompatible — manual migration required"
 
 
 # ===========================================================================
@@ -242,6 +245,93 @@ _eop_status = 0
 #: Environment-variable name prefixes tried when resolving a simple file name
 #: (fileio.c L255): ``DD_<name>``, ``dd_<name>``, then ``<name>`` itself.
 _PREFIX = ("DD_", "dd_", "")
+
+#: ASCII control characters (NUL .. US, plus DEL) that must never appear in a
+#: COBOL-supplied path.  The embedded NUL is the classic C-string truncation /
+#: command-injection vector; the other control bytes have no legitimate use in
+#: a file name.  Used by :func:`_safe_path` (CWE-22 hardening).
+_FORBIDDEN_PATH_CHARS = frozenset(chr(_c) for _c in range(0x20)) | {"\x7f"}
+
+#: Sentinel for :func:`_safe_path` *base*: "use the module ``COB_FILE_PATH``
+#: setting as the containment base if one is configured".  Passing ``base=None``
+#: explicitly means "no containment base" (distinct from this default).
+_USE_COB_FILE_PATH = object()
+
+
+def _safe_path(raw, *, base=_USE_COB_FILE_PATH, trusted=False):
+    """Canonicalise and validate a COBOL-supplied filesystem path (CWE-22).
+
+    This is the *centralised* guard required by the code review: every path that
+    originates in a COBOL data item - the ASSIGN/SELECT name resolved by
+    :func:`_resolve_filename` and the ``C$`` filesystem routines
+    (:func:`cob_acuw_mkdir`, :func:`cob_acuw_chdir`, :func:`cob_acuw_copyfile`,
+    :func:`cob_acuw_file_info`, :func:`cob_acuw_file_delete`) - is funnelled
+    through this one function before it reaches ``open`` / ``os.*`` /
+    ``shutil.*``.  The original C runtime performed *no* such validation
+    (fileio.c passed the resolved name straight to ``fopen``); this is an
+    additive security hardening that still preserves every *legitimate* COBOL
+    path use (absolute ASSIGN names and the ``COB_FILE_PATH`` mechanism).
+
+    :param raw: the candidate path (``str`` or ``bytes``) from a COBOL field or
+        an environment override.
+    :param base: an explicit containment directory.  When left at the default
+        sentinel the module ``COB_FILE_PATH`` setting (:data:`cob_file_path`)
+        supplies the base, if configured; passing ``base=None`` explicitly means
+        "no containment base".
+    :param trusted: when ``True`` the value is operator-controlled (an
+        environment-variable override or an explicit no-mapping name) and is
+        exempt from *containment* (it is still canonicalised and still rejected
+        for NUL/control bytes).  COBOL-data-derived paths use ``trusted=False``.
+    :returns: the canonical path string, or ``None`` when the path must be
+        rejected.  Callers map ``None`` to COBOL file status ``30`` (permanent
+        error) / ``C$`` failure code ``128``.
+
+    Validation rules:
+
+    * **NUL / control bytes** are rejected unconditionally - the single most
+      important hardening step.
+    * The path is canonicalised with :func:`os.path.normpath` (collapsing
+      ``.``/``..`` and redundant separators).
+    * **Containment** (a base is active, i.e. ``COB_FILE_PATH`` configured or an
+      explicit *base* supplied, and ``trusted`` is false): the resolved path
+      must stay inside the base directory; any ``..`` escape or absolute path
+      that lands outside the base is rejected.
+    * With **no containment base** active, a relative path that climbs above the
+      current working directory with a leading ``..`` is still rejected
+      ("explicitly gate ``..`` traversal"), while absolute names are allowed -
+      preserving the legacy COBOL freedom to address files by absolute path.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("latin-1")
+    if raw == "":
+        return None
+    # 1. Reject embedded NUL / ASCII control characters always.
+    for ch in raw:
+        if ch in _FORBIDDEN_PATH_CHARS:
+            return None
+
+    norm = os.path.normpath(raw)
+
+    # 2. Determine the containment base (skip containment for trusted values).
+    cbase = cob_file_path if base is _USE_COB_FILE_PATH else base
+    if cbase and not trusted:
+        root = os.path.realpath(cbase)
+        if os.path.isabs(norm):
+            candidate = os.path.realpath(norm)
+        else:
+            candidate = os.path.realpath(os.path.join(root, norm))
+        # The canonical path must be the base itself or a strict descendant.
+        if candidate != root and not candidate.startswith(root + os.sep):
+            return None
+        return candidate
+
+    # 3. No containment base (or trusted): still gate a relative ".." escape.
+    if not trusted and not os.path.isabs(norm) and (
+            norm == ".." or norm.startswith(".." + os.sep)):
+        return None
+    return norm
 
 
 # ===========================================================================
@@ -665,6 +755,18 @@ def _cob_file_open(f, filename, mode, sharing):
 
     if f.flag_select_features & common.COB_SELECT_LINAGE:
         if file_linage_check(f):
+            # Invalid LINAGE geometry (maps to file status 57).  The C runtime
+            # (fileio.c L855-L858) left ``fp`` dangling here: because cob_open
+            # never promotes ``open_mode`` on this error path, a later CLOSE
+            # reports "not open" (42) and would never release the descriptor.
+            # Close and detach the handle so no file descriptor leaks while
+            # preserving the open-error-before-LINAGE status precedence (the
+            # file is opened first so a missing file still yields 35, not 57).
+            try:
+                fp.close()
+            except OSError:  # pragma: no cover - close after open rarely fails
+                pass
+            f.file = None
             return common.COB_LINAGE_INVALID
         f.flag_needs_top = 1
         _cob_set_int(f.linorkeyptr.linage_ctr, 1)
@@ -1722,6 +1824,14 @@ def _resolve_filename(f):
     "simple" name (alphanumerics / ``_`` / ``-`` only), try the ``DD_<name>``,
     ``dd_<name>`` and ``<name>`` environment variables, then fall back to
     ``COB_FILE_PATH``/<name>.
+
+    Every value returned is funnelled through :func:`_safe_path` (CWE-22
+    hardening): NUL/control bytes are rejected, the path is canonicalised, and
+    a COBOL-data-derived simple name is contained within ``COB_FILE_PATH`` when
+    that base is configured.  Returns ``None`` when the path is rejected; the
+    caller (:func:`cob_open`) maps ``None`` to file status ``30``.  Environment
+    overrides and explicit no-mapping names are treated as operator-trusted
+    (exempt from containment, still NUL/control-checked).
     """
     if f.assign is None:
         name = (f.select_name or "")
@@ -1732,7 +1842,9 @@ def _resolve_filename(f):
 
     module = common.cob_current_module
     if module is not None and not getattr(module, "flag_filename_mapping", 1):
-        return name
+        # Name mapping disabled: the program asked for the literal name.  Treat
+        # it as operator-trusted (no containment) but still reject NUL/control.
+        return _safe_path(name, base=None, trusted=True)
 
     # Expand $VAR references and detect a "simple" name.
     simple = True
@@ -1760,10 +1872,15 @@ def _resolve_filename(f):
         for prefix in _PREFIX:
             val = os.environ.get(prefix + name)
             if val:
-                return val
+                # Operator-set DD_/dd_ override - trusted absolute redirect.
+                return _safe_path(val, base=None, trusted=True)
         if cob_file_path:
-            return os.path.join(cob_file_path, name)
-    return name
+            # Simple name under COB_FILE_PATH: enforce containment so a COBOL
+            # data field cannot use ``..`` to escape the configured directory.
+            return _safe_path(name)
+    # Non-simple or no COB_FILE_PATH: canonicalise without a containment base,
+    # but still reject NUL/control and gate a relative ``..`` escape.
+    return _safe_path(name, base=None)
 
 
 # ===========================================================================
@@ -1806,6 +1923,13 @@ def cob_open(f, mode, sharing, fnstatus):
         return
 
     filename = _resolve_filename(f)
+
+    # A ``None`` result means the resolved path failed the CWE-22 safety check
+    # (NUL/control byte or a containment/traversal violation).  Map it to the
+    # permanent-error status rather than passing it to the filesystem.
+    if filename is None:
+        save_status(f, COB_STATUS_30_PERMANENT_ERROR, fnstatus)
+        return
 
     was_not_exist = False
     if not os.path.exists(filename):
@@ -2148,23 +2272,34 @@ def cob_default_error_handle():
 # ===========================================================================
 
 class _cobsort(object):
-    """SORT work area - mirror of ``struct cobsort`` (fileio.c L183-L201)."""
+    """SORT work area - mirror of ``struct cobsort`` (fileio.c L183-L201).
+
+    Uses a bounded **external merge sort** (review fix for the previously
+    unbounded "load every spilled record into memory" retrieval): once the
+    in-core budget (:attr:`memory` records) is exceeded the current buffer is
+    *sorted* and written as a sorted *run* to a temp file (:attr:`runs`).
+    Retrieval performs a streaming k-way merge across the runs, so peak memory
+    is bounded by the number of runs (one staged record per run) rather than by
+    the total record count.
+    """
 
     __slots__ = ("pointer", "fnstatus", "sort_return", "size", "memory",
-                 "items", "retrieving", "retrieval_index", "_unique", "spill")
+                 "items", "retrieving", "retrieval_index", "_unique",
+                 "runs", "_merge_iter")
 
     def __init__(self, f, fnstatus, sort_return):
         self.pointer = f            # the SORT cob_file
         self.fnstatus = fnstatus
         self.sort_return = sort_return
         self.size = f.record_max
-        # Number of records that fit in the in-core budget before spilling.
+        # Number of records that fit in the in-core budget before a run spills.
         self.memory = max(1, cob_sort_memory // (f.record_max + 64))
-        self.items = []             # collected (unique, bytes) tuples
+        self.items = []             # current in-core run: (unique, bytes) tuples
         self.retrieving = 0
         self.retrieval_index = 0
         self._unique = 0
-        self.spill = None           # tempfile path when the budget is exceeded
+        self.runs = []              # tempfile paths, each a *sorted* run
+        self._merge_iter = None     # streaming k-way merge generator (retrieval)
 
 
 def _sort_compare(f, rec1, rec2):
@@ -2226,76 +2361,138 @@ def cob_file_sort_init_key(f, flag, field, offset):
     f.nkeys += 1
 
 
+def _sort_item_cmp(f):
+    """Build the stable record comparator for SORT work file *f*.
+
+    Compares two ``(unique, bytes)`` items first by the registered SORT keys
+    (:func:`_sort_compare`, honouring ASCENDING/DESCENDING and the collating
+    sequence) and breaks ties on the ascending submission sequence number, so
+    equal-key records preserve their input order (the COBOL "stable SORT"
+    contract, matching the C unique-sequence tiebreak).
+    """
+    def cmp(a, b):
+        c = _sort_compare(f, a[1], b[1])
+        if c != 0:
+            return c
+        return -1 if a[0] < b[0] else 1
+    return cmp
+
+
+def _sort_flush_run(p):
+    """Sort the current in-core buffer and write it out as one sorted run.
+
+    Returns 0 on success or :data:`COBSORTFILEERR` on a temp-file error.  A no-op
+    (returns 0) when the buffer is empty.  This is the bounded-memory spill step
+    of the external merge sort: each flushed run is independently ordered, so
+    retrieval only has to *merge* the runs rather than re-sort the whole input.
+    """
+    if not p.items:
+        return 0
+    p.items.sort(key=functools.cmp_to_key(_sort_item_cmp(p.pointer)))
+    try:
+        fd, path = tempfile.mkstemp(prefix="cobsort_")
+        with os.fdopen(fd, "wb") as handle:
+            for uniq, item in p.items:
+                handle.write(struct.pack("<Q", uniq))
+                handle.write(item)
+    except OSError:  # pragma: no cover - rare temp-file failure
+        return COBSORTFILEERR
+    p.runs.append(path)
+    p.items = []
+    return 0
+
+
 def cob_file_sort_submit(f, data):
-    """Submit one record into the SORT work area (port of cob_file_sort_submit)."""
+    """Submit one record into the SORT work area (port of cob_file_sort_submit).
+
+    Records accumulate in the in-core buffer; once the buffer exceeds the
+    :attr:`~_cobsort.memory` budget it is flushed as a sorted run to disk, so
+    the resident set stays bounded regardless of total input size.
+    """
     p = f.file
     if p is None:
         return COBSORTNOTOPEN
     rec = bytes(data[:f.record_max])
     if len(rec) < f.record_max:
         rec = rec + b" " * (f.record_max - len(rec))
-    if p.spill is not None:
-        # Already spilling to disk - append to the temp file.
-        try:
-            with open(p.spill, "ab") as handle:
-                handle.write(struct.pack("<Q", p._unique))
-                handle.write(rec)
-        except OSError:  # pragma: no cover
-            return COBSORTFILEERR
-    else:
-        p.items.append((p._unique, rec))
-        if len(p.items) > p.memory:
-            # Budget exceeded: spill the collected items to a temp file.
-            try:
-                fd, path = tempfile.mkstemp(prefix="cobsort_")
-                with os.fdopen(fd, "wb") as handle:
-                    for uniq, item in p.items:
-                        handle.write(struct.pack("<Q", uniq))
-                        handle.write(item)
-                p.spill = path
-                p.items = []
-            except OSError:  # pragma: no cover
-                return COBSORTFILEERR
+    p.items.append((p._unique, rec))
     p._unique += 1
+    if len(p.items) > p.memory:
+        # Budget exceeded: flush the buffer as a sorted run (bounded memory).
+        if _sort_flush_run(p) != 0:
+            return COBSORTFILEERR
     return 0
 
 
-def _sort_load_spill(p):
-    """Read every spilled record back into memory for the final ordering."""
+def _read_run_item(handle, reclen):
+    """Read one ``(unique, bytes)`` item from an open sorted-run file.
+
+    Returns ``None`` at end-of-run or on a short/truncated read.
+    """
+    head = handle.read(8)
+    if len(head) < 8:
+        return None
+    (uniq,) = struct.unpack("<Q", head)
+    rec = handle.read(reclen)
+    if len(rec) < reclen:
+        return None
+    return (uniq, rec)
+
+
+def _merge_runs(p):
+    """Stream records in final SORT order via a k-way merge of the runs.
+
+    A generator that opens every sorted run, seeds a heap with one item per run,
+    and repeatedly emits the smallest item (per :func:`_sort_item_cmp`) - reading
+    the next item from the run it came from.  Peak memory is bounded by the
+    number of runs, never by the total record count.  Run files stay open only
+    for the lifetime of the generator and are closed in the ``finally`` block.
+    """
     f = p.pointer
     reclen = f.record_max
-    out = list(p.items)
-    if p.spill is not None:
-        try:
-            with open(p.spill, "rb") as handle:
-                while True:
-                    head = handle.read(8)
-                    if len(head) < 8:
-                        break
-                    (uniq,) = struct.unpack("<Q", head)
-                    rec = handle.read(reclen)
-                    if len(rec) < reclen:
-                        break
-                    out.append((uniq, rec))
-        except OSError:  # pragma: no cover
-            pass
-    return out
+    keyfn = functools.cmp_to_key(_sort_item_cmp(f))
+    handles = []
+    heap = []
+    try:
+        for idx, path in enumerate(p.runs):
+            handle = open(path, "rb")
+            handles.append(handle)
+            item = _read_run_item(handle, reclen)
+            if item is not None:
+                # (sort-key, run index, item): the run index keeps heap entries
+                # strictly orderable; the unique tiebreak in keyfn already makes
+                # every key distinct, so the item itself is never compared.
+                heapq.heappush(heap, (keyfn(item), idx, item))
+        while heap:
+            _key, idx, item = heapq.heappop(heap)
+            yield item
+            nxt = _read_run_item(handles[idx], reclen)
+            if nxt is not None:
+                heapq.heappush(heap, (keyfn(nxt), idx, nxt))
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:  # pragma: no cover
+                pass
 
 
 def _sort_finish(p):
-    """Order all submitted records once retrieval begins (stable sort)."""
-    import functools
-    f = p.pointer
-    items = _sort_load_spill(p)
+    """Begin retrieval: order the submitted records (external merge sort).
 
-    def cmp(a, b):
-        c = _sort_compare(f, a[1], b[1])
-        if c != 0:
-            return c
-        return -1 if a[0] < b[0] else 1
-
-    items.sort(key=functools.cmp_to_key(cmp))
-    p.items = items
+    With no spilled runs the whole input fit in core, so a single stable
+    in-memory sort is used (fast path).  Otherwise the trailing buffer is
+    flushed as a final sorted run and a streaming k-way merge generator is
+    installed, so retrieval never materialises every record at once.
+    """
+    if not p.runs:
+        # Everything fit in core: stable in-memory sort (fast path).
+        p.items.sort(key=functools.cmp_to_key(_sort_item_cmp(p.pointer)))
+        p._merge_iter = None
+    else:
+        # External merge: flush the trailing buffer, then merge all runs.
+        _sort_flush_run(p)
+        p._merge_iter = _merge_runs(p)
     p.retrieving = 1
     p.retrieval_index = 0
 
@@ -2307,10 +2504,18 @@ def cob_file_sort_retrieve(f, data):
         return COBSORTNOTOPEN
     if not p.retrieving:
         _sort_finish(p)
-    if p.retrieval_index >= len(p.items):
-        return COBSORTEND
-    _uniq, rec = p.items[p.retrieval_index]
-    p.retrieval_index += 1
+    if p._merge_iter is not None:
+        # External merge path: pull the next record from the streaming merge.
+        try:
+            _uniq, rec = next(p._merge_iter)
+        except StopIteration:
+            return COBSORTEND
+    else:
+        # In-core fast path: walk the sorted buffer by index.
+        if p.retrieval_index >= len(p.items):
+            return COBSORTEND
+        _uniq, rec = p.items[p.retrieval_index]
+        p.retrieval_index += 1
     data[0:len(rec)] = rec
     f.record.size = len(rec)
     return 0
@@ -2368,11 +2573,22 @@ def cob_file_sort_close(f):
     fnstatus = None
     if p is not None:
         fnstatus = p.fnstatus
-        if p.spill is not None:
+        # Close any in-flight streaming merge first so its file handles are
+        # released before the backing run files are unlinked.
+        if p._merge_iter is not None:
             try:
-                os.remove(p.spill)
+                p._merge_iter.close()
+            except Exception:  # pragma: no cover - generator close is defensive
+                pass
+            p._merge_iter = None
+        # Remove every external-merge run temp file (replaces the single-spill
+        # cleanup; bounded external merge sort uses one temp file per run).
+        for path in p.runs:
+            try:
+                os.remove(path)
             except OSError:  # pragma: no cover
                 pass
+        p.runs = []
     f.file = None
     save_status(f, COB_STATUS_00_SUCCESS, fnstatus)
 
@@ -2450,10 +2666,28 @@ def _field_path(field):
     return name.rstrip()
 
 
+def _safe_field_path(field):
+    """Trim a COBOL field to a path and validate it via :func:`_safe_path`.
+
+    Centralised CWE-22 guard for the ``C$`` filesystem routines: returns the
+    canonical, validated path string, or ``None`` when the field is empty or
+    the path is rejected (NUL/control byte or a containment/traversal
+    violation).  Each ``C$`` caller maps ``None`` to its failure code (128).
+    """
+    raw = _field_path(field)
+    if not raw:
+        return None
+    return _safe_path(raw)
+
+
 def cob_acuw_mkdir(dir):
     """C$MAKEDIR - create a directory (port of fileio.c L4951-L4963)."""
+    # CWE-22: validate the COBOL-supplied path before touching the filesystem.
+    path = _safe_field_path(dir)
+    if path is None:
+        return 128
     try:
-        os.mkdir(_field_path(dir))
+        os.mkdir(path)
         return 0
     except OSError:
         return 128
@@ -2461,11 +2695,16 @@ def cob_acuw_mkdir(dir):
 
 def cob_acuw_chdir(dir, status):
     """C$CHDIR - change the working directory (port of fileio.c L4965-L4978)."""
-    try:
-        os.chdir(_field_path(dir))
-        ret = 0
-    except OSError:
+    # CWE-22: validate the COBOL-supplied path before touching the filesystem.
+    path = _safe_field_path(dir)
+    if path is None:
         ret = 128
+    else:
+        try:
+            os.chdir(path)
+            ret = 0
+        except OSError:
+            ret = 128
     if status is not None:
         _cob_set_int(status, ret)
     return ret
@@ -2479,8 +2718,13 @@ def cob_acuw_copyfile(fname1, fname2, file_type):
     """
     if not _chk_parms(3):
         return 128
+    # CWE-22: validate both COBOL-supplied paths before touching the filesystem.
+    src = _safe_field_path(fname1)
+    dst = _safe_field_path(fname2)
+    if src is None or dst is None:
+        return 128
     try:
-        shutil.copyfile(_field_path(fname1), _field_path(fname2))
+        shutil.copyfile(src, dst)
         return 0
     except OSError:
         return 128
@@ -2495,9 +2739,13 @@ def cob_acuw_file_info(file_name, file_info):
     """
     if not _chk_parms(2) or file_name is None:
         return 128
+    # CWE-22: validate the COBOL-supplied path before touching the filesystem.
+    path = _safe_field_path(file_name)
+    if path is None:
+        return 128
     import time as _time
     try:
-        st = os.stat(_field_path(file_name))
+        st = os.stat(path)
     except OSError:
         return 35
     tm = _time.localtime(st.st_mtime)
@@ -2518,8 +2766,12 @@ def cob_acuw_file_delete(file_name, file_type):
     """
     if not _chk_parms(2) or file_name is None:
         return 128
+    # CWE-22: validate the COBOL-supplied path before touching the filesystem.
+    path = _safe_field_path(file_name)
+    if path is None:
+        return 128
     try:
-        os.remove(_field_path(file_name))
+        os.remove(path)
         return 0
     except OSError:
         return 128
