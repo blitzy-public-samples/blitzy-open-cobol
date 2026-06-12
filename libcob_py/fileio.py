@@ -2076,7 +2076,14 @@ def cob_read(f, key, fnstatus, read_opts):
         save_status(f, COB_STATUS_10_END_OF_FILE, fnstatus)
         return
 
-    if key is None:
+    # MIGRATION (C->Python) / QA FIX C1: mirror C's ``if (key == NULL)`` exactly
+    # (libcob/fileio.c L4135).  The IMMUTABLE front-end (cobc/typeck.c L5276)
+    # emits the NULL sequential-read key as the literal integer ``0`` (cb_int0),
+    # so a *falsy* key (``0`` OR ``None``) means "no key -> READ NEXT".  Testing
+    # ``is None`` treated the emitted ``0`` as a real key and skipped this
+    # sequential-only EOF/BOF guard; ``not key`` matches C truthiness (a real
+    # cob_field is always truthy, ``0``/``None`` are falsy).
+    if not key:
         if f.flag_end_of_file and not (read_opts & common.COB_READ_PREVIOUS):
             save_status(f, COB_STATUS_46_READ_ERROR, fnstatus)
             return
@@ -2090,7 +2097,15 @@ def cob_read(f, key, fnstatus, read_opts):
         save_status(f, COB_STATUS_47_INPUT_DENIED, fnstatus)
         return
 
-    if key is not None:
+    # MIGRATION (C->Python) / QA FIX C1: mirror C's ``if (key)`` dispatch exactly
+    # (libcob/fileio.c L4163).  A *truthy* key (a real cob_field) selects the
+    # keyed backend; a *falsy* key -- the emitter's literal ``0`` for a NULL
+    # ``cob_field *`` key (cb_int0 from the immutable typeck.c), or ``None`` --
+    # selects the sequential READ NEXT backend.  ``is not None`` mis-routed the
+    # emitted ``0`` to the keyed path, returning status 23 for every SEQUENTIAL /
+    # LINE SEQUENTIAL READ (and leaving the record buffer stale -- silent data
+    # loss).  A real cob_field defines no __bool__/__len__ so it is always truthy.
+    if key:
         ret = _be_read(f, key, read_opts)
     else:
         ret = _be_read_next(f, read_opts)

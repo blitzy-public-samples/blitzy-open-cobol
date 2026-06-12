@@ -160,6 +160,18 @@ $(srcdir)/data-rep: $(data_rep_DEPENDENCIES)
 #     package $(abs_srcdir)/libcob_py no longer needs a tests/__init__.py marker
 #     (that out-of-scope file is removed) and `import libcob_py` resolves to the
 #     runtime package at the repo root, never the identically-named test package.
+#   * Run-from-root (QA FIX MAJOR M1): the coverage/pytest step is launched from
+#     the repository ROOT (`cd "$(abs_top_srcdir)"`), NOT from $(srcdir)=tests.
+#     `python -m pytest` puts its working directory on sys.path[0]; when that was
+#     tests/, the test package tests/libcob_py SHADOWED the runtime package, so
+#     every `import libcob_py.<module>` resolved to the test package, raised
+#     ModuleNotFoundError, and pytest.importorskip skipped ALL 11 modules ("No
+#     data was collected" -> the gate enforced nothing).  Running from the repo
+#     root makes sys.path[0] the root so `import libcob_py` resolves to the
+#     runtime.  COVERAGE_FILE is pinned to $(srcdir)/.coverage so the data file
+#     still lands under tests/ for the clean-local/distclean cleanup above, and
+#     the per-module `coverage report --include=<abs>` calls already use absolute
+#     paths so they are cwd-independent.
 check-local:
 	@echo "=== libcob_py runtime suite (C->Python migration) ==="; \
 	if test -n "$(COB_PY_SKIP_RUNTIME_TESTS)"; then \
@@ -180,6 +192,8 @@ check-local:
 	    exit 1; \
 	  fi; \
 	  PYTHONPATH="$(abs_top_srcdir):$$PYTHONPATH"; export PYTHONPATH; \
+	  COVERAGE_FILE="$(abs_srcdir)/.coverage"; export COVERAGE_FILE; \
+	  cd "$(abs_top_srcdir)" && \
 	  $(COB_PYTHON) -m coverage run --source="$(abs_top_srcdir)/libcob_py" \
 	      -m pytest -q --import-mode=importlib -o consider_namespace_packages=true \
 	      "$(abs_srcdir)/libcob_py" || exit 1; \

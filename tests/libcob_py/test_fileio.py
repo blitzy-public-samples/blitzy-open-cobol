@@ -41,6 +41,8 @@ HARD CONSTRAINTS honoured by this module (AAP 0.5 / 0.7.1):
 """
 import os
 import struct
+import subprocess
+import sys
 
 import pytest
 
@@ -1368,3 +1370,213 @@ def test_default_error_handle_formats_status(work_dir, capsys):
     err = capsys.readouterr().err
     assert "STATUS = 35" in err
     assert "NOPEFILE" in err
+
+
+# ===========================================================================
+# QA FIX Q1 - emitter<->runtime sequential-READ contract coverage.
+#
+# Background (QA findings C1 + Q1).  The unit tests above drive ``cob_read``
+# with ``key=None`` (sequential) or a real key *field* (keyed) - but the EMITTER
+# never produces ``None`` for a NULL sequential-read key.  The IMMUTABLE
+# front-end (cobc/typeck.c L5276) builds the call with ``cb_int0`` and
+# cobc/codegen.c therefore emits the LITERAL integer ``0``:
+#
+#     fileio.cob_read (h_F, 0, f_7, 1)
+#
+# Because no test exercised ``cob_read(f, 0, ...)``, the runtime regression where
+# every SEQUENTIAL / LINE SEQUENTIAL READ returned status 23 (and left the record
+# buffer stale - silent data loss) shipped green.  The tests below close that
+# gap at two levels:
+#   * a UNIT test that calls ``cob_read`` with the exact emitted ``key=0`` and
+#     asserts sequential READ NEXT semantics (status 00 + populated record); and
+#   * an end-to-end INTEGRATION test that compiles+runs a real LINE SEQUENTIAL
+#     write/read program through the refactored Python backend, plus an optional
+#     dual-cobc byte-for-byte parity check against the original C backend.
+#
+# Standard-library only: the helpers use ``subprocess`` / ``sys`` / ``os`` and
+# the dev-only ``pytest`` framework; cobc-binary discovery comes from the
+# stdlib-only conftest helpers.  No new runtime dependency is introduced.
+# ===========================================================================
+from tests.libcob_py.conftest import (  # noqa: E402  (after the importorskip guard)
+    REPO_ROOT,
+    cobc_orig_path,
+    cobc_path,
+    cobc_py_path,
+    requires_cobc,
+    requires_dual_cobc,
+    run_cobc,
+)
+
+# A self-contained LINE SEQUENTIAL program: OPEN OUTPUT, WRITE two records,
+# CLOSE; then OPEN INPUT, READ the first record, DISPLAY its FILE STATUS and the
+# record bytes.  Fixed-format (area A col 8 / area B col 12) to match the proven
+# parity-harness programs.  Under the C1 defect the READ reported ``R1-ST=23``
+# and left the buffer holding the last-written ``TWO``; the correct (C-runtime)
+# behaviour is ``R1-ST=00`` with ``REC=[ONE  ]``.
+_Q1_SEQ_READ_PROG = (
+    "       IDENTIFICATION DIVISION.\n"
+    "       PROGRAM-ID. SEQRDQ1.\n"
+    "       ENVIRONMENT DIVISION.\n"
+    "       INPUT-OUTPUT SECTION.\n"
+    "       FILE-CONTROL.\n"
+    "           SELECT F ASSIGN TO \"q1seq.dat\"\n"
+    "               ORGANIZATION IS LINE SEQUENTIAL\n"
+    "               FILE STATUS IS WS-ST.\n"
+    "       DATA DIVISION.\n"
+    "       FILE SECTION.\n"
+    "       FD F.\n"
+    "       01 F-REC PIC X(5).\n"
+    "       WORKING-STORAGE SECTION.\n"
+    "       01 WS-ST PIC XX.\n"
+    "       PROCEDURE DIVISION.\n"
+    "           OPEN OUTPUT F.\n"
+    "           MOVE \"ONE  \" TO F-REC.\n"
+    "           WRITE F-REC.\n"
+    "           MOVE \"TWO  \" TO F-REC.\n"
+    "           WRITE F-REC.\n"
+    "           CLOSE F.\n"
+    "           OPEN INPUT F.\n"
+    "           DISPLAY \"OPEN-ST=\" WS-ST.\n"
+    "           READ F.\n"
+    "           DISPLAY \"R1-ST=\" WS-ST \" REC=[\" F-REC \"]\".\n"
+    "           CLOSE F.\n"
+    "           STOP RUN.\n"
+)
+
+
+@pytest.mark.parametrize(
+    "org", [common.COB_ORG_SEQUENTIAL, common.COB_ORG_LINE_SEQUENTIAL])
+def test_cob_read_zero_key_is_sequential_next(work_dir, org):
+    """QA C1/Q1 (unit): ``cob_read`` with the EMITTER's literal ``0`` key.
+
+    The emitter passes integer ``0`` for a NULL ``cob_field *`` sequential-read
+    key (never ``None``).  That falsy key must dispatch to sequential READ NEXT -
+    status ``00`` with the record populated in order - and must NOT be routed to
+    the keyed backend (which returns ``23`` for a non-keyed organization).  This
+    locks the emitter<->runtime contract that finding C1 violated, for both
+    SEQUENTIAL and LINE SEQUENTIAL files.
+    """
+    ext = ".txt" if org == common.COB_ORG_LINE_SEQUENTIAL else ".dat"
+    path = work_dir / ("q1zerokey" + ext)
+    write_opt = _LS_WRITE_OPT if org == common.COB_ORG_LINE_SEQUENTIAL else 0
+
+    writer = make_file(path, 5, org=org)
+    fileio.cob_open(writer, common.COB_OPEN_OUTPUT, 0, None)
+    assert st(writer) == "00"
+    for payload in (b"ONE  ", b"TWO  "):
+        set_rec(writer, payload)
+        fileio.cob_write(writer, writer.record, write_opt, None)
+        assert st(writer) == "00"
+    fileio.cob_close(writer, common.COB_CLOSE_NORMAL, None)
+
+    reader = make_file(path, 5, org=org)
+    fileio.cob_open(reader, common.COB_OPEN_INPUT, 0, None)
+    assert st(reader) == "00"
+
+    # The EXACT argument cobc emits for a sequential READ: the integer 0
+    # (NOT None).  Pre-fix this returned 23 (mis-routed to the keyed backend).
+    fileio.cob_read(reader, 0, None, common.COB_READ_NEXT)
+    assert st(reader) == "00", (
+        "sequential READ with emitted key=0 must be status 00 (was 23 under C1), "
+        "got %s" % st(reader))
+    assert bytes(reader.record.data[:reader.record.size]).rstrip() == b"ONE"
+
+    # A second 0-key read advances to the next record (still sequential).
+    fileio.cob_read(reader, 0, None, common.COB_READ_NEXT)
+    assert st(reader) == "00"
+    assert bytes(reader.record.data[:reader.record.size]).rstrip() == b"TWO"
+
+    # Reading past the final record reports end-of-file (10), proving the 0-key
+    # path follows the sequential state machine, not the keyed one.
+    fileio.cob_read(reader, 0, None, common.COB_READ_NEXT)
+    assert st(reader) == "10"
+    fileio.cob_close(reader, common.COB_CLOSE_NORMAL, None)
+
+
+def _q1_translate_and_run(prog_cob, work_dir, py_name, cobc_binary=None):
+    """Translate *prog_cob* to Python with a refactored ``cobc`` and run it.
+
+    Mirrors the emitter end-to-end path used by the numeric-parity harness:
+    ``cobc -C -x`` emits a runnable ``main`` as *Python source* (no .pyz
+    packaging), which is then executed under ``COB_PYTHON`` (else this
+    interpreter) with the ``libcob_py`` runtime importable via ``PYTHONPATH``
+    (the repository root).  ``COB_CONFIG_DIR`` is pinned to the in-tree dialects
+    so the test does not depend on an installed compiler's compiled-in default.
+    A non-zero compile/run status is an assertion failure (a genuine
+    regression), never a skip - the ``@requires_cobc`` marker already handles an
+    absent binary.  Returns the program's stdout decoded as Latin-1 text.
+    """
+    cobc = cobc_binary if cobc_binary is not None else cobc_path()
+    py_path = work_dir / py_name
+    prev_cfg = os.environ.get("COB_CONFIG_DIR")
+    os.environ["COB_CONFIG_DIR"] = str(REPO_ROOT / "config")
+    try:
+        comp = run_cobc(cobc, ["-C", "-x", "-o", str(py_path), str(prog_cob)],
+                        cwd=work_dir)
+    finally:
+        if prev_cfg is None:
+            os.environ.pop("COB_CONFIG_DIR", None)
+        else:
+            os.environ["COB_CONFIG_DIR"] = prev_cfg
+    assert comp.returncode == 0, (
+        "cobc translate failed:\n%s" % comp.stderr.decode("latin-1", "replace"))
+    assert py_path.is_file(), "cobc did not emit the expected .py module"
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    interp = os.environ.get("COB_PYTHON") or sys.executable
+    run = subprocess.run(
+        [interp, str(py_path)], cwd=str(work_dir), capture_output=True,
+        timeout=120, check=False, env=env)
+    assert run.returncode == 0, (
+        "generated program crashed (rc=%d):\n%s"
+        % (run.returncode, run.stderr.decode("latin-1", "replace")))
+    return run.stdout.decode("latin-1", "replace")
+
+
+@requires_cobc
+def test_emitted_sequential_read_end_to_end(tmp_path):
+    """QA C1/Q1 (integration, THE regression guard): compile+run a real LINE
+    SEQUENTIAL write/read program through the refactored Python backend.
+
+    This exercises the actual emitted ``fileio.cob_read(h, 0, f, 1)`` call - the
+    code path the unit suite never reached and the reason C1 shipped green.  The
+    READ must succeed (``R1-ST=00``) and return the FIRST record (``ONE``), not
+    the stale last-written buffer (``TWO``) that the status-23 defect produced.
+    """
+    prog = tmp_path / "seqrdq1.cob"
+    prog.write_text(_Q1_SEQ_READ_PROG, encoding="latin-1")
+    out = _q1_translate_and_run(prog, tmp_path, "seqrdq1.py")
+    assert "OPEN-ST=00" in out, out
+    assert "R1-ST=00" in out, out            # the READ must succeed (was 23)
+    assert "REC=[ONE  ]" in out, out         # first record, not a stale buffer
+    assert "R1-ST=23" not in out, out        # the C1 defect must not recur
+
+
+@requires_dual_cobc
+def test_sequential_read_dual_cobc_byte_parity(tmp_path):
+    """QA C1/Q1 (dual-cobc parity, bonus): the SAME sequential-file program must
+    produce byte-identical output from the original C backend and the refactored
+    Python backend.  Skips cleanly when ``COBC_ORIG``/``COBC_PY`` are unset.
+    """
+    prog = tmp_path / "seqrddual.cob"
+    prog.write_text(_Q1_SEQ_READ_PROG, encoding="latin-1")
+
+    # Original C backend: native executable, run directly.
+    exe_c = tmp_path / "seq_orig"
+    comp_c = run_cobc(cobc_orig_path(), ["-x", "-o", str(exe_c), str(prog)],
+                      cwd=tmp_path, timeout=180)
+    assert comp_c.returncode == 0, comp_c.stderr.decode("latin-1", "replace")
+    run_c = subprocess.run([str(exe_c)], cwd=str(tmp_path), capture_output=True,
+                           timeout=120, check=False)
+    assert run_c.returncode == 0, run_c.stderr.decode("latin-1", "replace")
+    out_c = run_c.stdout.decode("latin-1", "replace")
+
+    # Refactored Python backend: emit Python source and run it under the runtime
+    # (robust even when a packaged .pyz would not be self-contained).
+    out_py = _q1_translate_and_run(prog, tmp_path, "seq_py.py", cobc_py_path())
+
+    assert out_c == out_py, (
+        "sequential-file program output diverged between the C and Python "
+        "backends (C1 regression)\nC : %r\nPy: %r" % (out_c, out_py))
