@@ -25,7 +25,6 @@ binary byte-order / sign-extension logic lives in exactly one place).
 """
 
 import struct
-import sys
 
 from libcob_py import common
 from libcob_py import numeric
