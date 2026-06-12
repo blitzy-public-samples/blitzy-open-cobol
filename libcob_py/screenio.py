@@ -406,12 +406,40 @@ def cob_screen_init():
             cob_has_color = 1
         cob_max_y, cob_max_x = _stdscr.getmaxyx()
         cob_screen_initialized = 1
-    except Exception:  # pragma: no cover - exercised only without a TTY
+    except Exception:
         # initscr / capability setup failed.  The C path calls
         # cob_runtime_error + cob_stop_run, but the refactor's graceful
         # degradation contract requires falling back to termio instead.
-        _stdscr = None
-        _raise_screen_truncated()
+        #
+        # MIGRATION SAFETY (Checkpoint-2 review fix): initscr() may have ALREADY
+        # switched the terminal into curses mode (cbreak + noecho + keypad)
+        # before a later setup call (cbreak/keypad/nl/noecho/colour/getmaxyx)
+        # raised.  Discarding the screen without tearing curses down would leave
+        # the user's shell in a broken raw/no-echo state after we degrade to
+        # termio.  Restore the terminal on THIS (exception) path too - the same
+        # teardown the C runtime performs in cob_screen_terminate() via endwin()
+        # (screenio.c L441-L448) - using a guarded, best-effort sequence so a
+        # secondary failure cannot mask the graceful-degradation fallback.
+        try:
+            if _stdscr is not None:
+                # A screen object exists => initscr() succeeded => the terminal
+                # is in curses mode; undo the mode changes and leave curses.
+                try:
+                    _curses.nocbreak()   # undo cbreak()
+                except Exception:  # pragma: no cover - best-effort restore
+                    pass
+                try:
+                    _curses.echo()       # undo noecho()
+                except Exception:  # pragma: no cover - best-effort restore
+                    pass
+                try:
+                    _curses.endwin()     # leave curses (mirrors cob_screen_terminate)
+                except Exception:  # pragma: no cover - best-effort restore
+                    pass
+        finally:
+            cob_screen_initialized = 0
+            _stdscr = None
+            _raise_screen_truncated()
 
 
 def cob_screen_terminate():

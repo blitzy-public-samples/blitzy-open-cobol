@@ -431,6 +431,149 @@ def test_screen_init_no_curses_module_degrades(monkeypatch):
     assert common.cob_exception_code == 0x0F03
 
 
+# ---------------------------------------------------------------------------
+# Partial curses-init failure (Checkpoint-2 review MAJOR finding regression)
+#
+# initscr() SUCCEEDS (the terminal is now switched into curses mode) but a
+# subsequent setup call raises.  cob_screen_init must restore the terminal on
+# the exception path - call nocbreak()/echo()/endwin() (the same teardown
+# cob_screen_terminate() performs, screenio.c L441-L448) - BEFORE latching the
+# termio fallback, so the user's shell is not left in a broken raw/no-echo
+# state.  These run headless; the failure is simulated deterministically.
+# ---------------------------------------------------------------------------
+class _FakeStdscrPartial(object):
+    """Minimal stdscr returned by :class:`_FakeCursesPartialInit`.
+
+    ``initscr()`` returns this object so ``screenio._stdscr`` becomes non-None
+    (the terminal is in curses mode).  ``keypad`` / ``getmaxyx`` succeed unless
+    the owning fake is configured to fail at that step.
+    """
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def keypad(self, flag):
+        if self._owner.fail_on == "keypad":
+            raise RuntimeError("simulated keypad failure")
+
+    def getmaxyx(self):
+        if self._owner.fail_on == "getmaxyx":
+            raise RuntimeError("simulated getmaxyx failure")
+        return (24, 80)
+
+
+class _FakeCursesPartialInit(object):
+    """A ``curses`` stand-in whose ``initscr()`` succeeds but a later setup fails.
+
+    Reproduces the partial-initialisation hazard from the Checkpoint-2 review:
+    ``initscr()`` switches the terminal into curses mode and then a subsequent
+    mode/size call (``cbreak``/``keypad``/``nl``/``noecho``/``getmaxyx``) raises.
+    The teardown entry points (``nocbreak``/``echo``/``endwin``) are recorded so
+    a test can assert the terminal is restored on the exception path before
+    degrading to termio.
+    """
+
+    error = Exception
+
+    def __init__(self, fail_on="noecho"):
+        self.fail_on = fail_on
+        self.endwin_called = 0
+        self.nocbreak_called = 0
+        self.echo_called = 0
+        self._screen = _FakeStdscrPartial(self)
+
+    # --- init + setup (initscr succeeds; the configured step raises) --------
+    def initscr(self):
+        return self._screen
+
+    def cbreak(self):
+        if self.fail_on == "cbreak":
+            raise RuntimeError("simulated cbreak failure")
+
+    def nl(self):
+        if self.fail_on == "nl":
+            raise RuntimeError("simulated nl failure")
+
+    def noecho(self):
+        if self.fail_on == "noecho":
+            raise RuntimeError("simulated noecho failure")
+
+    def has_colors(self):
+        return False
+
+    # --- teardown entry points the exception path must invoke ---------------
+    def nocbreak(self):
+        self.nocbreak_called += 1
+
+    def echo(self):
+        self.echo_called += 1
+
+    def endwin(self):
+        self.endwin_called += 1
+
+
+@pytest.mark.parametrize("fail_on", ["cbreak", "keypad", "nl", "noecho", "getmaxyx"])
+def test_partial_init_failure_restores_terminal(monkeypatch, fail_on):
+    """Partial curses init -> terminal restored (endwin) THEN degrade to termio.
+
+    Regression test for the Checkpoint-2 MAJOR finding (``screenio.py`` L409-415).
+    ``initscr()`` succeeds - so the terminal is in curses mode - but a later
+    setup call raises.  ``cob_screen_init`` MUST restore the terminal on the
+    exception path (``nocbreak``/``echo``/``endwin``) before arming the termio
+    fallback.  Every failure position is exercised to prove the restore happens
+    regardless of where after ``initscr`` the failure occurs.
+    """
+    fake = _FakeCursesPartialInit(fail_on=fail_on)
+    # The partial-init path is only reachable when curses is "available": reset
+    # the fallback latch and the init flag so cob_screen_init enters the try.
+    monkeypatch.setattr(screenio, "_curses", fake)
+    monkeypatch.setattr(screenio, "_curses_failed", False)
+    monkeypatch.setattr(screenio, "cob_screen_initialized", 0)
+    monkeypatch.setattr(screenio, "_stdscr", None)
+    common.cob_exception_code = 0
+
+    screenio.cob_screen_init()
+
+    # (1) Terminal restored on the exception path: endwin() MUST be called (the
+    #     C teardown contract), with the cbreak/noecho mode-restores attempted.
+    assert fake.endwin_called == 1, "endwin() must be called to restore the terminal"
+    assert fake.nocbreak_called == 1, "nocbreak() must undo cbreak() on the failure path"
+    assert fake.echo_called == 1, "echo() must undo noecho() on the failure path"
+    # (2) Graceful degradation still latches: screen NOT initialised, fallback
+    #     armed, EC-SCREEN-ITEM-TRUNCATED (hex 0F03) dispatched, _stdscr cleared.
+    assert screenio.cob_screen_initialized == 0
+    assert screenio._stdscr is None
+    assert screenio._curses_failed is True
+    assert common.cob_exception_code == 0x0F03
+
+
+def test_partial_init_failure_then_display_degrades_to_termio(monkeypatch):
+    """After a partial-init failure (with restore), DISPLAY still reaches termio.
+
+    Confirms the new terminal-restore path does not break the second half of the
+    graceful-degradation contract (AAP 0.3.4): once the screen fails to come up,
+    a field DISPLAY is routed to :func:`libcob_py.termio.cob_display`.
+    """
+    fake = _FakeCursesPartialInit(fail_on="noecho")
+    monkeypatch.setattr(screenio, "_curses", fake)
+    monkeypatch.setattr(screenio, "_curses_failed", False)
+    monkeypatch.setattr(screenio, "cob_screen_initialized", 0)
+    monkeypatch.setattr(screenio, "_stdscr", None)
+    common.cob_exception_code = 0
+
+    screenio.cob_screen_init()
+    assert fake.endwin_called == 1, "endwin() restores the terminal on partial init"
+    assert screenio._curses_failed is True
+
+    calls = []
+    monkeypatch.setattr(screenio.termio, "cob_display",
+                        lambda *a, **k: calls.append(a))
+    screenio.cob_field_display(_alnum("HELLO"), None, None)
+    assert len(calls) == 1, "DISPLAY must fall through to termio after partial-init failure"
+    # termio.cob_display(to_stderr=False, newline=True, varcnt=1, field) -> field at index 3
+    assert bytes(calls[0][3].data[:5]) == b"HELLO"
+
+
 def test_screen_init_real_environment_degrades_or_skips():
     """Exercise the REAL initscr in the actual (headless) environment.
 
