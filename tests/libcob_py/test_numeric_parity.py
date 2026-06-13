@@ -905,13 +905,20 @@ def test_generated_pyz_is_self_contained(tmp_path):
         "cobc -x packaging failed:\n%s" % comp.stderr.decode("latin-1", "replace"))
     assert pyz.is_file(), "cobc -x did not emit the expected .pyz"
 
-    # The archive must carry the runtime package - the 11 runtime modules.
+    # The archive must carry the runtime package: the 11 AAP runtime modules
+    # PLUS the ``__main__.py`` entry shim (MIGRATION C->Python: __main__.py makes
+    # the package executable as ``python -m libcob_py`` / drives cobcrun's
+    # module-mode launch, so it is bundled with the package).  Assert the exact
+    # expected set rather than a bare count so a missing/extra module is named.
     names = zipfile.ZipFile(str(pyz)).namelist()
     runtime_mods = sorted(
         n for n in names if n.startswith("libcob_py/") and n.endswith(".py"))
-    assert len(runtime_mods) == 11, (
-        "expected 11 bundled runtime modules, got %d: %s"
-        % (len(runtime_mods), runtime_mods))
+    expected_mods = sorted("libcob_py/%s.py" % m for m in (
+        "__init__", "__main__", "common", "numeric", "move", "strings",
+        "intrinsic", "fileio", "call", "screenio", "termio", "system"))
+    assert runtime_mods == expected_mods, (
+        "bundled runtime modules mismatch:\n  expected %s\n  got      %s"
+        % (expected_mods, runtime_mods))
     # Build-only / non-runtime files must NOT be bundled.
     assert not any("pyproject.toml" in n for n in names), names
     assert not any("__pycache__" in n for n in names), names

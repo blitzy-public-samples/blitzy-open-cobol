@@ -1113,6 +1113,18 @@ def cob_runtime_error(fmt, *args):
     """
     global _error_handlers
 
+    # MIGRATION (C->Python): the rewritten codegen emits COBOL data-item names as
+    # Python bytes literals (e.g. cob_check_subscript(i, 1, 10, b"X")); the C
+    # runtime received them as char* and rendered them verbatim through %s.
+    # Decoding bytes/bytearray args here (latin-1 is a loss-free 1:1 mapping that
+    # never raises) makes "%s" reproduce the C diagnostic byte-for-byte ("'X'",
+    # not Python's "b'X'" repr) for EVERY cob_runtime_error caller -
+    # cob_check_subscript/odo/ref_mod/based/numeric and any future name arg.
+    if args:
+        args = tuple(
+            a.decode("latin-1") if isinstance(a, (bytes, bytearray)) else a
+            for a in args
+        )
     try:
         message = fmt % args if args else str(fmt)
     except (TypeError, ValueError):
@@ -2206,6 +2218,18 @@ _POINTER_SIZE = struct.calcsize("P")
 #: Bit mask reducing an integer to the host pointer width (C pointer wraparound).
 _POINTER_MASK = (1 << (_POINTER_SIZE * 8)) - 1
 
+# MIGRATION (C -> Python): under the C backend a pointer was a real machine
+# address and ``SET ADDRESS OF item TO p`` simply re-pointed the item's
+# ``cob_field.data`` at the memory ``p`` addressed.  Python has no machine
+# addresses, so ``ADDRESS OF x`` yields a synthetic integer (``id(buffer)``).
+# To let ``SET ADDRESS OF y TO <pointer-item>`` recover the *actual* storage a
+# stored synthetic address refers to (e.g. ``SET p TO ADDRESS OF X`` then later
+# ``SET ADDRESS OF Y TO p``), every buffer whose synthetic address is taken is
+# recorded here, keyed by that address.  The registry keeps the buffer alive so
+# the address remains resolvable for the lifetime of the run unit, mirroring the
+# C guarantee that the addressed storage stays valid while a pointer holds it.
+_addr_registry = {}
+
 
 def _ptr_buffer(obj):
     """Return the raw byte buffer backing *obj* (a cob_field or a buffer view).
@@ -2248,7 +2272,14 @@ def _ptr_to_int(val):
         return 0
     if isinstance(val, int):
         return val & _POINTER_MASK
-    return id(val) & _POINTER_MASK
+    addr = id(val) & _POINTER_MASK
+    # MIGRATION (C -> Python): record the buffer under its synthetic address so
+    # a copy of this pointer value (stored in a POINTER item, then later used in
+    # SET ADDRESS OF ...) can recover the very storage it refers to.  Purely
+    # additive: the returned address is unchanged, so existing pointer storage
+    # and comparison semantics are byte-for-byte identical.
+    _addr_registry[addr] = val
+    return addr
 
 
 def cob_get_pointer(srcptr):
@@ -2323,6 +2354,111 @@ def cob_addr_of(data):
     """
     return bytearray(
         _ptr_to_int(data).to_bytes(_POINTER_SIZE, sys.byteorder, signed=False))
+
+
+def cob_alloc_based(retptr, sizefld):
+    """``ALLOCATE based-item [RETURNING ptr]`` - return the new backing store.
+
+    MIGRATION (C -> Python): the C backend lowered ALLOCATE to
+    ``cob_allocate(&item->data, retptr, size)`` which set the BASED item's data
+    *pointer* in place.  Python cannot take the address of a name, so the
+    emitter instead lowers ALLOCATE to ``b_<id> = common.cob_alloc_based(ret,
+    size)`` - the freshly allocated ``bytearray`` is *returned* and rebound to
+    the module-level backing name.  This mirrors C ``cob_allocate`` (common.c
+    L1644-L1673): a zero-filled block of ``size`` bytes is recorded in the
+    allocation cache; ``EC-STORAGE-NOT-AVAIL`` is raised when the request cannot
+    be met (returning ``None`` = NULL).  When *retptr* (a RETURNING data pointer)
+    is supplied, the synthetic address of the new block is stored into it, byte
+    -for-byte like the C ``*(void **)(retptr->data) = mptr`` store.
+    """
+    global cob_exception_code
+
+    cob_exception_code = 0
+    mptr = None
+    fsize = _lazy_get_int(sizefld)
+    if fsize > 0:
+        try:
+            mptr = bytearray(fsize)
+        except MemoryError:
+            mptr = None
+        if mptr is None:
+            cob_set_exception(COB_EC_STORAGE_NOT_AVAIL)
+        else:
+            _cob_alloc_base.append(mptr)
+    if retptr is not None and getattr(retptr, "data", None) is not None:
+        # Store the new block's (synthetic) address into the RETURNING pointer;
+        # _ptr_to_int also registers mptr so the pointer stays resolvable.
+        _write_ptr(retptr.data, _ptr_to_int(mptr))
+    return mptr
+
+
+def cob_free_based(buf):
+    """``FREE based-item`` / ``FREE ADDRESS OF based-item`` - release *buf*.
+
+    MIGRATION (C -> Python): the C backend lowered FREE to
+    ``cob_free_alloc(&item->data, NULL)`` which freed the block and NULLed the
+    item's data pointer in place.  The emitter now lowers FREE to ``b_<id> =
+    common.cob_free_based(b_<id>)`` - the backing name is rebound to ``None``
+    (NULL).  Mirrors C ``cob_free_alloc`` (common.c L1675-L1705): freeing
+    storage that was never allocated raises ``EC-STORAGE-NOT-ALLOC`` (no silent
+    success).  Always returns ``None`` so the caller rebinds the name to NULL.
+    """
+    global cob_exception_code
+
+    cob_exception_code = 0
+    if buf is None:
+        cob_set_exception(COB_EC_STORAGE_NOT_ALLOC)
+        return None
+    for idx, cached in enumerate(_cob_alloc_base):
+        if cached is buf:
+            del _cob_alloc_base[idx]
+            return None
+    # FREE of an address we did not allocate (e.g. an aliased LINKAGE view).
+    cob_set_exception(COB_EC_STORAGE_NOT_ALLOC)
+    return None
+
+
+def cob_ptr_addr(val):
+    """Return the integer (synthetic) address of *val* - ``ADDRESS OF x`` value.
+
+    MIGRATION (C -> Python): ``ADDRESS OF x`` read in integer context (pointer
+    comparison ``IF p = ADDRESS OF x``, ``SET p TO ADDRESS OF x``) was a raw
+    machine address in C.  Python has none, so the emitter wraps the data view
+    in ``common.cob_ptr_addr(view)`` to obtain a stable synthetic integer that
+    compares and subtracts cleanly (``None`` -> 0 = NULL).  Delegates to
+    :func:`_ptr_to_int`, which also registers the buffer so a stored copy of the
+    address can later be resolved back to the storage by :func:`cob_resolve_addr`
+    (e.g. ``SET p TO ADDRESS OF x`` then ``SET ADDRESS OF y TO p``).
+    """
+    return _ptr_to_int(val)
+
+
+def cob_resolve_addr(val):
+    """``SET ADDRESS OF item TO val`` - return the storage *item* should alias.
+
+    MIGRATION (C -> Python): C lowered this to ``item->data = (unsigned char *)
+    val``.  Python rebinds the item's module-level backing name instead:
+    ``b_<id> = common.cob_resolve_addr(val)``.  *val* is whatever the integer
+    -context emitter produced for the source operand:
+
+      * ``None`` / ``0``                -> NULL: the item becomes unbound (None).
+      * a buffer (``ADDRESS OF x`` was passed directly, a memoryview/bytearray)
+        -> alias that storage; it is registered so a later copy-through-pointer
+        can recover it.
+      * an ``int`` (a value read from a POINTER item, ``SET ADDRESS OF y TO p``)
+        -> resolve through the address registry to the originally addressed
+        storage; an unrecognised / dangling address yields ``None`` (NULL).
+    """
+    if val is None:
+        return None
+    if isinstance(val, int):
+        if val == 0:
+            return None
+        return _addr_registry.get(val & _POINTER_MASK)
+    # A buffer/memoryview passed directly (ADDRESS OF x): alias it and register
+    # so an indirect SET ADDRESS through a stored pointer can recover it too.
+    _addr_registry[id(val) & _POINTER_MASK] = val
+    return val
 
 
 def cob_field_set_data(field, data):

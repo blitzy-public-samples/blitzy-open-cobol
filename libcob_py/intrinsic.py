@@ -320,7 +320,23 @@ def cob_intr_concatenate(offset, length, params, *args):
 # ===========================================================================
 def cob_intr_exception_file():
     """FUNCTION EXCEPTION-FILE (intrinsic.c L919-L943)."""
-    err = getattr(common, "cob_error_file", None)
+    # MIGRATION (C->Python): the "last I/O error file" pointer (the C global
+    # ``cob_error_file``) is OWNED BY the fileio subsystem - libcob_py.fileio
+    # latches it in ``save_status`` and the code generator's USE-error handler
+    # reads ``fileio.cob_error_file`` - exactly as the C runtime declares
+    # ``cob_error_file`` in fileio.c.  ``intrinsic`` is initialised BEFORE
+    # ``fileio`` in the cob_init_* order, so import fileio LAZILY here to read
+    # the current error file without forming an import cycle.
+    # QA FIX (test 146 "FUNCTION EXCEPTION-FILE"): the previous code read
+    # ``common.cob_error_file``, which does NOT exist on ``common`` (fileio,
+    # not common, owns it), so ``err`` was always None and EXCEPTION-FILE
+    # always returned "00" instead of "<file-status><select-name>" (e.g.
+    # "35TEST-FILE" after an OPEN INPUT on a missing file).
+    try:
+        from libcob_py import fileio  # deferred: intrinsic precedes fileio
+        err = getattr(fileio, "cob_error_file", None)
+    except Exception:
+        err = None
     if common.cob_exception_code == 0 or err is None or \
             (common.cob_exception_code & 0x0500) != 0x0500:
         return make_field_entry(2, common.COB_TYPE_ALPHANUMERIC, 0, 0, 0,

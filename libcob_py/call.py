@@ -24,6 +24,7 @@ environment reads (``COB_LIBRARY_PATH`` / ``COB_PRE_LOAD`` / ``COB_LOAD_CASE``)
 and the OS path separator.
 """
 import importlib
+import ctypes
 import os
 import sys
 
@@ -67,6 +68,109 @@ COB_LIBRARY_PATH = "."
 # by module name through importlib; the extension mirrors COB_MODULE_EXT and is
 # used only for COB_PRE_LOAD file probing.
 COB_MODULE_EXT = "pyz"
+
+# MIGRATION (C->Python): NATIVE C subprogram support.  A COBOL program may
+# ``CALL`` a subprogram written in C (the test oracle's ``CALL "dump"`` helpers
+# compile a ``dump.c`` into a shared object with ``cc -shared -fPIC``; this is a
+# legitimate COBOL feature - calling an external native routine).  The original
+# C backend resolved such a CALL through ``lt_dlopen``/``lt_dlsym``; the
+# faithful Python-backend equivalent (stdlib only - ctypes is part of the
+# standard library, NOT a third-party package, so AAP 0.5/0.7.1 still holds) is
+# :mod:`ctypes`, which dlopen's the shared object and exposes its C entry point.
+# ``_NATIVE_EXT`` is the platform native shared-object extension probed in
+# addition to the COBOL ``.pyz`` module extension (Linux ``.so``; the test
+# harness builds ``dump.${SHREXT}`` and we set SHREXT=so in tests/atlocal).
+# A located candidate is treated as native ONLY when its first bytes are the
+# ELF magic, so a Python ``.pyz`` zip archive is never mistaken for native code.
+_NATIVE_EXT = "so"
+# ELF magic - leading bytes of a Linux shared object (``\x7fELF``).
+_ELF_MAGIC = b"\x7fELF"
+# Read-past-end pad for an immutable BY CONTENT literal: the original C backend
+# placed literals in zeroed static storage, so a callee that reads slightly
+# past the declared length saw zero bytes (e.g. the ``dump`` helper that prints
+# 4 bytes of a 3-byte X"000102" literal expects a trailing 00).  Copying the
+# literal into a NUL-padded ctypes buffer reproduces that exactly.
+_NATIVE_PAD = 8
+
+
+# MIGRATION (C->Python): ctypes mirrors of the libcob C runtime structs
+# ``cob_field_attr``/``cob_field``/``cob_file`` (libcob/common.h).  A native
+# subprogram CALL'd USING a COBOL *file-name* (e.g. ``CALL "setfilename" USING
+# TEST-FILE``) receives a ``cob_file *`` and dereferences members at fixed ABI
+# offsets - notably ``f->assign->data`` (the ASSIGN/external-filename buffer).
+# To let such a routine read AND write the COBOL file's storage exactly as the C
+# backend allowed, we hand it a ctypes ``cob_file`` whose ``assign`` (and
+# ``record``) point at ctypes ``cob_field``s whose ``data`` ALIASES the Python
+# field's bytearray (via ``ctypes.from_buffer``), so the callee's memcpy/memset
+# writes propagate straight back into the COBOL data item.  The field order,
+# integer widths and pointer placement below were verified to reproduce the
+# installed header's offsets byte-for-byte (cob_field 0/8/16, total 24;
+# cob_file.assign at offset 16, total 120 on LP64).  These are stdlib ctypes
+# Structures only - no third-party dependency, so AAP 0.5/0.7.1 still holds.
+class _CtCobFieldAttr(ctypes.Structure):
+    """ctypes mirror of C ``cob_field_attr`` (common.h)."""
+
+    _fields_ = [
+        ("type", ctypes.c_ubyte),       # field type
+        ("digits", ctypes.c_ubyte),     # digit count
+        ("scale", ctypes.c_byte),       # signed scale
+        ("flags", ctypes.c_ubyte),      # field flags
+        ("pic", ctypes.c_char_p),       # picture string pointer
+    ]
+
+
+class _CtCobField(ctypes.Structure):
+    """ctypes mirror of C ``cob_field`` (common.h): {size, data, attr}."""
+
+    _fields_ = [
+        ("size", ctypes.c_size_t),                  # field size
+        ("data", ctypes.c_void_p),                  # pointer to field storage
+        ("attr", ctypes.POINTER(_CtCobFieldAttr)),  # pointer to attribute
+    ]
+
+
+class _CtCobFile(ctypes.Structure):
+    """ctypes mirror of C ``cob_file`` (common.h).
+
+    Only the leading pointer block, the ``size_t`` block and the trailing
+    ``char`` flag block are needed to place ``assign`` (offset 16) and the other
+    members a native file routine might read at the exact C offsets; the actual
+    payloads we populate are ``assign`` and ``record`` (the two ``cob_field *``
+    members backed by COBOL storage).  All other members are left NULL/zero -
+    no in-scope native routine dereferences them.
+    """
+
+    _fields_ = [
+        ("select_name", ctypes.c_char_p),           # name in SELECT
+        ("file_status", ctypes.c_void_p),           # FILE STATUS buffer
+        ("assign", ctypes.POINTER(_CtCobField)),    # ASSIGN TO  (offset 16)
+        ("record", ctypes.POINTER(_CtCobField)),    # record area
+        ("record_size", ctypes.c_void_p),           # record size field
+        ("keys", ctypes.c_void_p),                  # key descriptors
+        ("file", ctypes.c_void_p),                  # backend file pointer
+        ("linorkeyptr", ctypes.c_void_p),           # LINAGE / split-key ptr
+        ("sort_collating", ctypes.c_void_p),        # SORT collating seq
+        ("extfh_ptr", ctypes.c_void_p),             # EXTFH usage
+        ("record_min", ctypes.c_size_t),            # record min size
+        ("record_max", ctypes.c_size_t),            # record max size
+        ("nkeys", ctypes.c_size_t),                 # number of keys
+        ("organization", ctypes.c_char),            # ORGANIZATION
+        ("access_mode", ctypes.c_char),             # ACCESS MODE
+        ("lock_mode", ctypes.c_char),               # LOCK MODE
+        ("open_mode", ctypes.c_char),               # OPEN MODE
+        ("flag_optional", ctypes.c_char),           # OPTIONAL
+        ("last_open_mode", ctypes.c_char),          # last OPEN mode
+        ("special", ctypes.c_char),                 # special file
+        ("flag_nonexistent", ctypes.c_char),        # nonexistent file
+        ("flag_end_of_file", ctypes.c_char),        # at EOF
+        ("flag_begin_of_file", ctypes.c_char),      # at BOF
+        ("flag_first_read", ctypes.c_char),         # first READ after OPEN
+        ("flag_read_done", ctypes.c_char),          # last READ ok
+        ("flag_select_features", ctypes.c_char),    # SELECT features
+        ("flag_needs_nl", ctypes.c_char),           # LS needs NL at close
+        ("flag_needs_top", ctypes.c_char),          # LINAGE needs top
+        ("file_version", ctypes.c_char),            # file I/O version
+    ]
 
 
 def cob_encode_program_id(name):
@@ -252,12 +356,298 @@ def _locate_in_loaded_modules(encoded):
     run, so a match is unambiguous; the per-resolve scan happens at most once
     per sibling because the result is then cached by :func:`cob_resolve`.
     """
-    for mod in list(sys.modules.values()):
+    for mod_name, mod in list(sys.modules.items()):
         if mod is None:
+            continue
+        # QA FIX (test 3 "Hexadecimal literal" - spurious stdlib match): restrict
+        # the scan to COBOL-GENERATED units only.  The previous unrestricted scan
+        # matched ANY loaded module exposing a callable of the encoded name, so a
+        # CALL to a program whose name collides with a standard-library function
+        # (CALL "dump" vs json/pickle/marshal ``dump``) resolved to that stdlib
+        # function and was then invoked with the COBOL argument list, raising
+        # "TypeError: dump() takes at least 2 positional arguments (1 given)".
+        # Two disqualifiers make the scan precise:
+        #   (a) skip the libcob_py runtime package and its sub-modules - they are
+        #       not COBOL programs (and a sub-module like ``move``/``system`` could
+        #       otherwise shadow a like-named program-id); and
+        #   (b) require the module to BE a generated COBOL unit, identified by its
+        #       ``common`` attribute being THIS libcob_py.common (every emitted
+        #       module does ``from libcob_py import common`` to call cob_init /
+        #       cob_field / ...; stdlib and site modules do not).
+        # Encoded COBOL program-ids are unique within a run, so among the
+        # generated units that remain a match is still unambiguous.
+        if mod_name == "libcob_py" or mod_name.startswith("libcob_py."):
+            continue
+        if getattr(mod, "common", None) is not common:
             continue
         func = getattr(mod, encoded, None)
         if callable(func):
             return func
+    return None
+
+
+def _load_module(modname):
+    """Import the generated module *modname*, seeding ``sys.path`` from the
+    resolve paths when a direct import fails.
+
+    Mirrors the C resolver/preloader, which probe ``resolve_path[i]/<name>.<ext>``
+    and ``lt_dlopen`` the first hit (call.c ``cob_resolve`` L321 and the
+    ``COB_PRE_LOAD`` scan L571-593).  ``cobc -m`` packages each compiled unit as
+    a self-contained ``<name>.pyz`` zip archive; such an archive is importable
+    only once the archive file itself is on ``sys.path`` (zipimport), so a bare
+    :func:`importlib.import_module` is retried after locating ``<modname>.pyz``
+    (``COB_MODULE_EXT``) or a plain ``<modname>.py`` on the resolve paths and
+    inserting it.  Returns the imported module, or ``None`` when no importable
+    candidate exists (the caller decides whether that is fatal).
+    """
+    try:
+        importlib.invalidate_caches()
+        return importlib.import_module(modname)
+    except ImportError:
+        archive = _locate_on_resolve_paths(modname)
+        if archive is None:
+            return None
+        if archive.endswith("." + COB_MODULE_EXT):
+            entry = archive                          # the .pyz file (zipimport)
+        else:
+            entry = os.path.dirname(archive) or "."  # dir holding the .py
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+        try:
+            importlib.invalidate_caches()
+            return importlib.import_module(modname)
+        except ImportError:
+            return None
+
+
+def _is_native_object(path):
+    """Return True when *path* is a native shared object (ELF), not a ``.pyz``.
+
+    MIGRATION (C->Python): the resolver must distinguish a NATIVE C subprogram
+    (loaded via ctypes) from a Python ``.pyz`` zip archive (loaded via
+    zipimport).  Both can share a directory on the resolve path, and - because
+    the test harness builds ``dump.${SHREXT}`` - can even share an extension, so
+    the discriminator is the file CONTENT: a shared object begins with the ELF
+    magic ``\\x7fELF`` whereas a ``.pyz`` begins with the ZIP magic ``PK``.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == _ELF_MAGIC
+    except OSError:
+        return False
+
+
+def _locate_native_on_resolve_paths(modname):
+    """Find a native shared object for *modname* on the resolver search paths.
+
+    MIGRATION (C->Python): mirrors the C resolver's ``resolve_path[]`` scan for a
+    ``<name>.<shlibext>`` before ``lt_dlopen`` (call.c L405-L420), restricted to
+    files whose content is actually native (ELF - see :func:`_is_native_object`).
+    Probes, in each resolve directory (and the current directory, which the C
+    resolver also searched), the platform native extension ``<modname>.so``
+    first, then the COBOL module extension ``<modname>.pyz`` and the doubled-dot
+    ``<modname>..pyz`` form that ``${CC} -o dump.${SHREXT}`` produces when
+    ``SHREXT`` carries a leading dot, and finally the bare ``<modname>``.
+    Returns the first candidate that exists AND is an ELF object, else ``None``.
+    """
+    search_dirs = list(_resolve_paths)
+    if "." not in search_dirs:
+        search_dirs.append(".")
+    suffixes = (
+        "." + _NATIVE_EXT,                 # dump.so   (preferred native name)
+        "." + COB_MODULE_EXT,              # dump.pyz  (native built with .pyz ext)
+        ".." + COB_MODULE_EXT,             # dump..pyz (SHREXT carried leading dot)
+        "",                                # dump      (bare)
+    )
+    for suf in suffixes:
+        for d in search_dirs:
+            cand = os.path.join(d, modname + suf)
+            if os.path.isfile(cand) and _is_native_object(cand):
+                return cand
+    return None
+
+
+def _is_cob_file_like(arg):
+    """True if *arg* duck-types as a COBOL file object (fileio.cob_file).
+
+    MIGRATION (C->Python): a native subprogram CALL'd USING a file-name expects
+    a ``cob_file *``.  We detect the Python file object structurally (it carries
+    the SELECT name, the ASSIGN field and an OPEN MODE) rather than importing
+    :mod:`libcob_py.fileio` (which would create an import cycle), and so that a
+    plain :class:`~libcob_py.common.cob_field` (size/data/attr - no ``assign``)
+    is never mistaken for a file.
+    """
+    return (hasattr(arg, "assign")
+            and hasattr(arg, "select_name")
+            and hasattr(arg, "open_mode"))
+
+
+def _alias_cob_field(pyfield, keepalive):
+    """Build a ctypes ``cob_field *`` aliasing a Python cob_field's storage.
+
+    MIGRATION (C->Python): mirrors a single :class:`~libcob_py.common.cob_field`
+    into a :class:`_CtCobField` whose ``data`` pointer aliases the SAME Python
+    ``bytearray``/``memoryview`` storage (via ``ctypes.from_buffer``), so a
+    native routine that writes through ``field->data`` mutates the COBOL data
+    item in place - exactly as the C pointer did.  Returns ``None`` when the
+    field (or its storage) is absent, leaving the parent pointer NULL.  Read-only
+    storage (an immutable literal) cannot be aliased, so it is copied (the callee
+    then cannot write back, which is correct for a read-only argument).  All
+    ctypes objects are appended to *keepalive* so the aliasing survives the call.
+    """
+    if pyfield is None:
+        return None
+    data = getattr(pyfield, "data", None)
+    if data is None:
+        return None
+    try:
+        size = int(getattr(pyfield, "size", 0) or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        try:
+            size = len(data)
+        except TypeError:
+            return None
+    if size <= 0:
+        return None
+    try:
+        cbuf = (ctypes.c_char * size).from_buffer(data)
+    except (TypeError, ValueError):
+        # Read-only / non-contiguous storage: copy (no write-back possible).
+        cbuf = ctypes.create_string_buffer(bytes(data)[:size], size)
+    keepalive.append(cbuf)
+    ctf = _CtCobField()
+    ctf.size = size
+    ctf.data = ctypes.cast(cbuf, ctypes.c_void_p)
+    ctf.attr = None
+    keepalive.append(ctf)
+    ptr = ctypes.pointer(ctf)
+    keepalive.append(ptr)
+    return ptr
+
+
+def _marshal_cob_file(fobj, keepalive):
+    """Marshal a Python cob_file into a ctypes ``cob_file *`` for a native call.
+
+    MIGRATION (C->Python): constructs a :class:`_CtCobFile` whose ``assign`` and
+    ``record`` members point at ctypes ``cob_field``s aliasing the Python file's
+    ASSIGN/record storage, so a native routine (e.g. ``setfilename`` doing
+    ``memcpy(f->assign->data, name, ...)``) sees the COBOL members at the right
+    ABI offsets and writes straight back into the COBOL data items.  Members not
+    backed by COBOL storage are left NULL.  Returns a ``byref`` to the struct,
+    which is retained in *keepalive* for the duration of the call.
+    """
+    ctf = _CtCobFile()
+    keepalive.append(ctf)
+    assign_ptr = _alias_cob_field(getattr(fobj, "assign", None), keepalive)
+    if assign_ptr is not None:
+        ctf.assign = assign_ptr
+    record_ptr = _alias_cob_field(getattr(fobj, "record", None), keepalive)
+    if record_ptr is not None:
+        ctf.record = record_ptr
+    return ctypes.byref(ctf)
+
+
+def _marshal_native_arg(arg, keepalive):
+    """Convert one COBOL CALL argument into a ctypes argument for a native call.
+
+    MIGRATION (C->Python): reproduces the raw-pointer argument passing the C
+    backend used when calling a native subprogram.  Each emitted CALL argument
+    arrives as one of: ``None`` (OMITTED -> NULL pointer); an ``int`` (BY VALUE
+    numeric -> passed by value); ``bytes`` (immutable BY CONTENT literal -> a
+    NUL-padded copy so the callee may read slightly past the end and see zero,
+    matching zeroed static literal storage); or a writable buffer
+    (``bytearray`` / ``memoryview`` for BY REFERENCE or a BY CONTENT temp ->
+    aliased in place via ``ctypes.from_buffer`` so the callee's writes propagate
+    back to the COBOL data item, exactly like the C pointer did).  Objects that
+    must outlive the call are appended to *keepalive*.
+    """
+    if arg is None:
+        return ctypes.c_void_p(None)
+    if isinstance(arg, bool):
+        # Guard before int (bool is a subclass of int); treat as small integer.
+        return ctypes.c_longlong(int(arg))
+    if isinstance(arg, int):
+        # BY VALUE numeric: passed by value (rare for the native helpers, which
+        # take pointers, but supported for completeness / faithfulness).
+        return ctypes.c_longlong(arg)
+    if isinstance(arg, (bytes, bytearray, memoryview)):
+        mv = arg if isinstance(arg, memoryview) else memoryview(arg)
+        if mv.readonly:
+            # Immutable (BY CONTENT literal): copy into a NUL-padded buffer.
+            buf = ctypes.create_string_buffer(bytes(mv), mv.nbytes + _NATIVE_PAD)
+            keepalive.append(buf)
+            return ctypes.cast(buf, ctypes.c_void_p)
+        # Writable: alias the SAME storage so C writes propagate (BY REFERENCE).
+        cbuf = (ctypes.c_char * mv.nbytes).from_buffer(mv)
+        keepalive.append(cbuf)
+        return ctypes.cast(cbuf, ctypes.c_void_p)
+    if _is_cob_file_like(arg):
+        # A COBOL file-name argument: hand the native routine a ctypes cob_file
+        # whose assign/record members alias the COBOL storage (see
+        # _marshal_cob_file), so f->assign->data writes propagate back.
+        return _marshal_cob_file(arg, keepalive)
+    # Anything else (an unrecognised Python object a native routine expects as a
+    # struct pointer): unsupported here -> NULL.  The native call then no-ops on
+    # that argument rather than crashing the interpreter.
+    return ctypes.c_void_p(None)
+
+
+def _make_native_wrapper(cfunc):
+    """Wrap a ctypes C function so it presents the COBOL entry-callable contract.
+
+    MIGRATION (C->Python): the emitted code invokes a resolved entry as
+    ``ret = _unifunc(arg0, arg1, ...)`` and stores ``ret`` via
+    ``move.cob_set_int``.  This wrapper marshals each argument
+    (:func:`_marshal_native_arg`), invokes the native function (whose
+    ``restype`` is set to ``c_int`` so the COBOL RETURN-CODE comes back as a
+    Python ``int``), keeps the aliasing buffers alive across the call so any
+    write-through has completed, and returns the integer result (0 for a void
+    return).
+    """
+    def _native_entry(*args):
+        keepalive = []
+        cargs = [_marshal_native_arg(a, keepalive) for a in args]
+        result = cfunc(*cargs)
+        # keepalive intentionally retained until here: the ctypes buffers alias
+        # the COBOL storage, so the callee's writes are already visible.
+        del keepalive
+        return 0 if result is None else int(result)
+    return _native_entry
+
+
+def _resolve_native(name, encoded):
+    """Resolve a CALL target to a NATIVE C subprogram loaded through ctypes.
+
+    MIGRATION (C->Python): faithful stdlib replacement for the C resolver's
+    ``lt_dlopen``/``lt_dlsym`` path (call.c L405-L426) for subprograms that are
+    genuinely native code (a ``.c`` compiled to a shared object), which cannot
+    be expressed as Python.  Locates the shared object on the resolve paths
+    (:func:`_locate_native_on_resolve_paths`), ``dlopen``'s it via
+    :class:`ctypes.CDLL`, and looks up the C entry symbol - the symbol name is
+    the program name exactly as written (the C function name), with the
+    case-folded and encoded forms tried as fallbacks.  Returns a Python callable
+    wrapping the native function, or ``None`` when no native object/symbol is
+    found (the caller then reports PROGRAM-NOT-FOUND, exactly as before).
+    """
+    modname = _apply_case(name)
+    path = _locate_native_on_resolve_paths(modname)
+    if path is None:
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+    except OSError:
+        return None
+    for sym in (name, modname, encoded):
+        if not sym:
+            continue
+        try:
+            cfunc = getattr(lib, sym)
+        except AttributeError:
+            continue
+        cfunc.restype = ctypes.c_int
+        return _make_native_wrapper(cfunc)
     return None
 
 
@@ -277,50 +667,70 @@ def cob_resolve(name):
         return func
 
     encoded = cob_encode_program_id(name)
-    modname = _apply_case(encoded)
+    # MIGRATION (C->Python): the C resolver (call.c L393-L426) builds the module
+    # FILE name from the (case-folded) ORIGINAL program name -- "<name>.<ext>" --
+    # and uses the ENCODED name ONLY for the dlsym ENTRY-POINT lookup inside the
+    # loaded handle.  cobc likewise names the generated module file and its
+    # internal ".py" after the source/PROGRAM-ID base, NOT the encoded id, so an
+    # unusual PROGRAM-ID like "A@B" produces "A@B.pyz" containing module "A@B"
+    # whose entry def is the encoded "A_40B".  Locate/import by the original
+    # (case-folded) base; fetch the entry below by the encoded name.  For
+    # ordinary names (no leading digit / non-alnum char) the encoded and original
+    # forms are identical, so this is a no-op for the common case.
+    modname = _apply_case(name)
 
-    try:
-        importlib.invalidate_caches()
-        module = importlib.import_module(modname)
-    except ImportError:
-        # QA FIX (Issue G1 - inter-program CALL resolution): a CALLed subprogram
-        # compiled with "cobc -m" is a self-contained "<PROGRAM-ID>.pyz" archive
-        # sitting in a COB_LIBRARY_PATH directory (or "."), not a module already
-        # importable by name.  importlib will not import it unless the archive
-        # itself is a sys.path entry (zipimport), so - mirroring the C resolver's
-        # resolve_path[] scan for "<name>.so" before lt_dlopen - locate
-        # "<modname>.pyz" (or a plain "<modname>.py") on the resolve paths, put
-        # it on sys.path, and retry the import exactly once.
-        module = None
-        archive = _locate_on_resolve_paths(modname)
-        if archive is not None:
-            if archive.endswith("." + COB_MODULE_EXT):
-                entry = archive                      # the .pyz file (zipimport)
-            else:
-                entry = os.path.dirname(archive) or "."   # dir holding the .py
-            if entry not in sys.path:
-                sys.path.insert(0, entry)
-            try:
-                importlib.invalidate_caches()
-                module = importlib.import_module(modname)
-            except ImportError:
-                module = None
-        if module is None:
-            # QA FIX (COBOL-85 gate - sibling program CALL): a program that
-            # shares its source file with the caller has NO standalone module on
-            # disk to import (the code generator emits sibling programs as
-            # separate entries inside the caller's own module).  Before
-            # declaring the program unresolvable, mirror the C resolver locating
-            # a statically-linked sibling: search the already-loaded modules for
-            # the encoded entry and, when present, cache and return it.
-            sibling = _locate_in_loaded_modules(encoded)
-            if sibling is not None:
-                insert(name, sibling, None)
-                _resolve_error = None
-                return sibling
-            _resolve_error = "Cannot find module '%s'" % name
-            common.cob_set_exception(common.COB_EC_PROGRAM_NOT_FOUND)
-            return None
+    # QA FIX (Issue G1 - inter-program CALL resolution): a CALLed subprogram
+    # compiled with "cobc -m" is a self-contained "<PROGRAM-ID>.pyz" archive
+    # sitting in a COB_LIBRARY_PATH directory (or "."), not a module already
+    # importable by name.  _load_module() mirrors the C resolver's resolve_path[]
+    # scan for "<name>.so" before lt_dlopen by locating "<modname>.pyz" (or a
+    # plain "<modname>.py") on the resolve paths, seeding sys.path (zipimport),
+    # and importing it.
+    module = _load_module(modname)
+    if module is None and encoded != modname:
+        # MIGRATION (C->Python): a non-identifier PROGRAM-ID (e.g. "MY-PROG",
+        # "A@B") cannot be imported by its original name -- the dash/"@" is
+        # invalid in a Python module name -- whereas the C resolver dlopen'd
+        # "<name>.so" by PATH, which works for any name.  The faithful Python
+        # equivalent is the ENCODED id (cob_encode_program_id), which is always a
+        # valid identifier and is exactly the symbol the code generator emits for
+        # the entry def; a standalone subprogram for such a program is therefore
+        # importable as "<encoded>.pyz"/"<encoded>.py" (e.g. "cobc -m -o
+        # MY__PROG.pyz ...").  This is purely additive: it runs only when the
+        # original-name load failed and the encoded form differs, so ordinary
+        # identifier names (encoded == modname) and the source-base / preload
+        # resolution paths below are unaffected.
+        module = _load_module(encoded)
+    if module is None:
+        # QA FIX (COBOL-85 gate - sibling program CALL): a program that
+        # shares its source file with the caller has NO standalone module on
+        # disk to import (the code generator emits sibling programs as
+        # separate entries inside the caller's own module).  This ALSO covers
+        # a COB_PRE_LOAD'd module whose file name differs from its PROGRAM-ID
+        # (e.g. "cobc -m callee.cob" with "PROGRAM-ID. callee2"): the preload
+        # imported "callee" - registering "callee2" inside it - so CALL
+        # "callee2" finds the entry here even though no "callee2.pyz" exists.
+        # Before declaring the program unresolvable, mirror the C resolver
+        # locating a statically-linked sibling: search the already-loaded
+        # modules for the encoded entry and, when present, cache and return it.
+        sibling = _locate_in_loaded_modules(encoded)
+        if sibling is not None:
+            insert(name, sibling, None)
+            _resolve_error = None
+            return sibling
+        # MIGRATION (C->Python): no Python module resolved the name; before
+        # declaring it unresolvable, try a NATIVE C subprogram (a ".c" compiled
+        # to a shared object) loaded through ctypes - the faithful stdlib
+        # equivalent of the C resolver's lt_dlopen/lt_dlsym path for native
+        # CALL targets (e.g. CALL "dump" to a gcc-built dump.so).
+        native = _resolve_native(name, encoded)
+        if native is not None:
+            insert(name, native, None)
+            _resolve_error = None
+            return native
+        _resolve_error = "Cannot find module '%s'" % name
+        common.cob_set_exception(common.COB_EC_PROGRAM_NOT_FOUND)
+        return None
 
     # The entry point is the attribute named after the encoded program-id
     # (the def the code generator emitted); fall back to a conventional
@@ -471,17 +881,22 @@ def cob_init_call():
     except Exception:                       # pragma: no cover - system optional
         pass
 
-    # COB_PRE_LOAD: import each named module now (call.c L571-L593).
+    # COB_PRE_LOAD: import each named module now (call.c L571-L593).  The C
+    # preloader stat()s "resolve_path[i]/<name>.<COB_MODULE_EXT>" and lt_dlopen()s
+    # the first hit; _load_module() is the faithful Python equivalent - it
+    # locates "<name>.pyz" (or "<name>.py") on the resolve paths, seeds sys.path
+    # (zipimport), and imports it.  A bare importlib.import_module() would miss a
+    # ".pyz" that is not yet a sys.path entry, silently dropping the preload (the
+    # COB_PRE_LOAD test calls a PROGRAM-ID whose entry lives only in the
+    # preloaded archive, so the preload MUST actually load it).  A missing
+    # preload module returns None and is skipped, exactly as the C code breaks
+    # out without error.
     s = os.environ.get("COB_PRE_LOAD")
     if s is not None:
         for mod in s.split(os.pathsep):
             if not mod:
                 continue
-            try:
-                importlib.import_module(_apply_case(cob_encode_program_id(mod)))
-            except ImportError:
-                # Mirror the C behaviour: a missing preload module is skipped.
-                continue
+            _load_module(_apply_case(cob_encode_program_id(mod)))
 
 
 # ===========================================================================

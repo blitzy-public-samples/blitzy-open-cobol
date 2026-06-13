@@ -1902,10 +1902,39 @@ cobc_build_pyz (struct filename *primary, struct filename *modlist,
 		"# entry module is ALSO staged as __main__.py so 'cobc -x'/cobcrun still\n"
 		"# execute the archive directly.\n"
 		"modbase = os.path.splitext(os.path.basename(outname))[0]\n"
+		"# QA FIX (Dynamic call with static linking - 'cobc -c' then link):\n"
+		"# a module input is either an emitted SOURCE '.py' (the -x/-m direct\n"
+		"# path) or a BYTE-COMPILED object carried under cobc's '.o' name (the\n"
+		"# '-c' compile-then-link path, e.g. 'cobc -x -o prog caller.o callee.o').\n"
+		"# Stage each so it is importable inside the archive under its PROGRAM-ID\n"
+		"# base name: a source module as '<base>.py', a compiled object as the\n"
+		"# zipimport-loadable '<base>.pyc'.  Copying a '.pyc' under a '.py' name\n"
+		"# would make Python try to compile its NUL bytes as source and fail with\n"
+		"# 'source code string cannot contain null bytes', so the extension MUST\n"
+		"# track the actual file kind.\n"
+		"def _is_src(p):\n"
+		"    return os.path.splitext(p)[1] == '.py'\n"
 		"for s in modules:\n"
-		"    shutil.copy(s, os.path.join(stage, os.path.basename(s)))\n"
-		"shutil.copy(modules[0], os.path.join(stage, modbase + '.py'))\n"
-		"shutil.copy(modules[0], os.path.join(stage, '__main__.py'))\n"
+		"    base = os.path.splitext(os.path.basename(s))[0]\n"
+		"    shutil.copy(s, os.path.join(stage,\n"
+		"                base + ('.py' if _is_src(s) else '.pyc')))\n"
+		"prim = modules[0]\n"
+		"prim_base = os.path.splitext(os.path.basename(prim))[0]\n"
+		"if _is_src(prim):\n"
+		"    # SOURCE primary: also stage under the output base name and reuse it\n"
+		"    # verbatim as __main__.py - the emitted 'if __name__ == \"__main__\":\n"
+		"    # main()' trigger fires when the archive runs (unchanged -x/-m path).\n"
+		"    shutil.copy(prim, os.path.join(stage, modbase + '.py'))\n"
+		"    shutil.copy(prim, os.path.join(stage, '__main__.py'))\n"
+		"else:\n"
+		"    # COMPILED primary: stage under the output base name as '.pyc'.\n"
+		"    # zipapp requires a SOURCE __main__.py entry point (it rejects a\n"
+		"    # __main__.pyc), so emit a tiny launcher that imports the primary by\n"
+		"    # its PROGRAM-ID base name and invokes main() - the same entry the\n"
+		"    # source __main__ trigger would have run.\n"
+		"    shutil.copy(prim, os.path.join(stage, modbase + '.pyc'))\n"
+		"    with open(os.path.join(stage, '__main__.py'), 'w') as _fh:\n"
+		"        _fh.write('import %s\\n%s.main()\\n' % (prim_base, prim_base))\n"
 		"shutil.copytree(libpy_dir, os.path.join(stage, 'libcob_py'),\n"
 		"                ignore=shutil.ignore_patterns('__pycache__', '*.pyc',\n"
 		"                '*.pyo', 'pyproject.toml', 'Makefile', 'Makefile.am',\n"
@@ -1986,6 +2015,60 @@ cobc_build_pycompile (const char *src, const char *out)
 	return cobc_spawn_argv (argv, 0);
 }
 
+/* MIGRATION (C->Python): recognise a NATIVE (C / assembler / C++) subprogram
+   SOURCE supplied directly on the command line - e.g. "cobc -m dump.c".  A
+   COBOL program may CALL an external routine written in C (a legitimate,
+   long-standing COBOL feature exercised by the test oracle's "CALL \"dump\""
+   helpers); such a source cannot be lowered to Python, so it must be compiled
+   by the native C compiler into a shared object rather than wrapped into a
+   ".pyz".  This is distinguished from an emitted Python object carried under
+   cobc's ".o" name (the "cobc -c" compile-then-link path) by the SOURCE
+   extension, so the Python module/object paths are completely unaffected. */
+static int
+is_native_source (const char *source)
+{
+	const char	*ext = file_extension (source);
+
+	return (strcmp (ext, "c") == 0 ||
+		strcmp (ext, "s") == 0 ||
+		strcmp (ext, "cc") == 0 ||
+		strcmp (ext, "cpp") == 0 ||
+		strcmp (ext, "cxx") == 0);
+}
+
+/* MIGRATION (C->Python): compile a native subprogram source (fn->source) into
+   the shared object "outname" with the system C compiler.  This is the faithful
+   analogue of what the original backend did with COB_CC for a ".c" input: the
+   result is a real ELF shared object that libcob_py.call dlopen's through ctypes
+   at CALL time (ctypes being the stdlib replacement for the removed dlopen/dlsym
+   resolver).  The compiler is taken from $COB_CC, falling back to the POSIX
+   standard name "cc"; the portable "-shared -fPIC" flags build a loadable
+   object.  SECURITY (CWE-78): the command is dispatched through the
+   cobc_spawn_argv argv-vector runner - the compiler name, flags, output name and
+   source path are individual argv elements passed verbatim to execvp(), so no
+   shell parses them and a metacharacter in any path is inert. */
+static int
+cobc_build_native (struct filename *fn, const char *outname)
+{
+	const char	*cc;
+	char		*argv[8];
+	int		argc;
+
+	cc = getenv ("COB_CC");
+	if (cc == NULL || cc[0] == '\0') {
+		cc = "cc";
+	}
+	argc = 0;
+	argv[argc++] = (char *)cc;
+	argv[argc++] = (char *)"-shared";
+	argv[argc++] = (char *)"-fPIC";
+	argv[argc++] = (char *)"-o";
+	argv[argc++] = (char *)outname;
+	argv[argc++] = (char *)fn->source;
+	argv[argc] = NULL;
+	return cobc_spawn_argv (argv, 0);
+}
+
 static int
 process_compile (struct filename *fn)
 {
@@ -2031,6 +2114,26 @@ process_module_direct (struct filename *fn)
 {
 	char	name[COB_MEDIUM_BUFF];
 
+	/* MIGRATION (C->Python): a NATIVE C/asm subprogram source ("cobc -m
+	   dump.c") cannot become a ".py" - compile it to a real shared object that
+	   libcob_py.call dlopen's via ctypes.  The object keeps the native ".so"
+	   extension so it is unambiguously native (an emitted COBOL module keeps
+	   COB_MODULE_EXT = ".pyz").  This precedes the ".pyz" packaging below and
+	   never triggers for a COBOL input (those have a non-native source ext). */
+	if (is_native_source (fn->source)) {
+		char	nname[COB_MEDIUM_BUFF];
+		if (output_name) {
+			strcpy (nname, output_name);
+			if (strchr (output_name, '.') == NULL) {
+				strcat (nname, ".so");
+			}
+		} else {
+			file_basename (fn->source, nname);
+			strcat (nname, ".so");
+		}
+		return cobc_build_native (fn, nname);
+	}
+
 	/* MIGRATION (C->Python): "-m" (CB_LEVEL_MODULE) previously linked a native
 	   shared object via cob_cc + linker flags (cob_ldflags, cob_libs,
 	   COB_SHARED_OPT, ...).  Now the single emitted ".py" is packaged into a
@@ -2064,6 +2167,25 @@ static int
 process_module (struct filename *fn)
 {
 	char	name[COB_MEDIUM_BUFF];
+
+	/* MIGRATION (C->Python): native C/asm subprogram source -> shared object
+	   (see process_module_direct).  Defensive: a ".c" input normally reaches
+	   process_module_direct (need_assemble set), but handle it here too so any
+	   native source packaged in module mode is compiled, never wrapped in a
+	   ".pyz". */
+	if (is_native_source (fn->source)) {
+		char	nname[COB_MEDIUM_BUFF];
+		if (output_name) {
+			strcpy (nname, output_name);
+			if (strchr (output_name, '.') == NULL) {
+				strcat (nname, ".so");
+			}
+		} else {
+			file_basename (fn->source, nname);
+			strcat (nname, ".so");
+		}
+		return cobc_build_native (fn, nname);
+	}
 
 	/* MIGRATION (C->Python): "-m" packaging for an input that needs no further
 	   assembly (the C path linked fn->object into a shared object).  The Python

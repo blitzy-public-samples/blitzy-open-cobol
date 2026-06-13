@@ -45,9 +45,13 @@ HARD CONSTRAINTS (AAP sections 0.5 / 0.7.1)
   ``lib_dir`` / ``clean_cob_env`` / ``set_cob_env`` fixtures (``conftest.py``).
 """
 # --- Standard-library imports (stdlib only; no third-party packages) -------
+import ctypes
 import importlib
 import os
+import shutil
+import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -920,4 +924,283 @@ def test_cobfunc_not_initialized_stops(monkeypatch):
 def test_max_cobcall_parms_constant():
     """The fixed upper bound on CALL arguments mirrors COB_MAX_COBCALL_PARMS."""
     assert call.COB_MAX_COBCALL_PARMS == 16
+
+
+# ===========================================================================
+# Phase 12 - NATIVE-C subprogram interop bridge (ctypes)
+# ---------------------------------------------------------------------------
+# MIGRATION (C->Python): the C resolver dlopen'd a native ".so" and called its
+# entry through lt_dlsym; the faithful stdlib replacement loads the shared
+# object with ctypes and marshals each COBOL CALL argument to a raw pointer /
+# by-value scalar, including a ctypes mirror of the cob_file/cob_field structs
+# so a routine taking "cob_file *" sees the COBOL members at the right ABI
+# offsets and can write back through f->assign->data.  These tests cover that
+# bridge (call.py: _is_native_object, _locate_native_on_resolve_paths,
+# _is_cob_file_like, _alias_cob_field, _marshal_cob_file, _marshal_native_arg,
+# _make_native_wrapper, _resolve_native and the cob_resolve native fallback).
+# ===========================================================================
+_CC = shutil.which("cc") or shutil.which("gcc")
+requires_cc = pytest.mark.skipif(
+    _CC is None, reason="no C compiler (cc/gcc) available to build a native .so")
+
+# A COBOL file object is detected structurally (duck-typed), so a minimal stand-in
+# carrying the discriminating attributes models one without importing fileio.
+class _StubField:
+    """Minimal cob_field-like object: size + data (+ optional attr)."""
+
+    def __init__(self, size, data, attr=None):
+        self.size = size
+        self.data = data
+        self.attr = attr
+
+
+class _StubFile:
+    """Minimal cob_file-like object (assign/select_name/open_mode + record)."""
+
+    def __init__(self, assign=None, record=None):
+        self.select_name = "TEST-FILE"
+        self.open_mode = 0
+        self.assign = assign
+        self.record = record
+
+
+def _write_elf_magic(path):
+    """Create a file whose first bytes are the ELF magic (a fake shared object)."""
+    path.write_bytes(b"\x7fELF" + b"\x00" * 60)
+    return path
+
+
+# --- _is_native_object -----------------------------------------------------
+def test_is_native_object_detects_elf(tmp_path):
+    elf = _write_elf_magic(tmp_path / "x.so")
+    assert call._is_native_object(str(elf)) is True
+
+
+def test_is_native_object_rejects_zip(tmp_path):
+    # A .pyz zip archive begins with "PK", NOT the ELF magic.
+    pyz = tmp_path / "x.pyz"
+    pyz.write_bytes(b"PK\x03\x04" + b"\x00" * 40)
+    assert call._is_native_object(str(pyz)) is False
+
+
+def test_is_native_object_missing_file(tmp_path):
+    assert call._is_native_object(str(tmp_path / "nope.so")) is False
+
+
+# --- _locate_native_on_resolve_paths ---------------------------------------
+def test_locate_native_finds_so_on_resolve_paths(tmp_path):
+    _write_elf_magic(tmp_path / "dump.so")
+    call._resolve_paths = [str(tmp_path)]
+    found = call._locate_native_on_resolve_paths("dump")
+    assert found is not None and found.endswith("dump.so")
+
+
+def test_locate_native_finds_double_dot_form(tmp_path):
+    # ${CC} -o dump.${SHREXT} with SHREXT carrying a leading dot would yield the
+    # doubled-dot "dump..pyz"; the locator must still find an ELF there.
+    _write_elf_magic(tmp_path / "dump..pyz")
+    call._resolve_paths = [str(tmp_path)]
+    found = call._locate_native_on_resolve_paths("dump")
+    assert found is not None and found.endswith("dump..pyz")
+
+
+def test_locate_native_ignores_non_elf(tmp_path):
+    (tmp_path / "dump.so").write_bytes(b"PK\x03\x04not-elf")
+    call._resolve_paths = [str(tmp_path)]
+    assert call._locate_native_on_resolve_paths("dump") is None
+
+
+def test_locate_native_absent(tmp_path):
+    call._resolve_paths = [str(tmp_path)]
+    assert call._locate_native_on_resolve_paths("missing") is None
+
+
+# --- _is_cob_file_like -----------------------------------------------------
+def test_is_cob_file_like_true_for_file():
+    assert call._is_cob_file_like(_StubFile()) is True
+
+
+def test_is_cob_file_like_false_for_field():
+    # A plain cob_field (size/data/attr - no assign/open_mode) is NOT a file.
+    assert call._is_cob_file_like(common.cob_field(3, bytearray(b"abc"))) is False
+
+
+@pytest.mark.parametrize("value", [b"bytes", bytearray(b"x"), 7, None, "str"])
+def test_is_cob_file_like_false_for_scalars(value):
+    assert call._is_cob_file_like(value) is False
+
+
+# --- _alias_cob_field ------------------------------------------------------
+def test_alias_cob_field_none_field():
+    assert call._alias_cob_field(None, []) is None
+
+
+def test_alias_cob_field_no_data():
+    assert call._alias_cob_field(_StubField(4, None), []) is None
+
+
+def test_alias_cob_field_aliases_bytearray_writeback():
+    buf = bytearray(b"        ")            # 8 bytes
+    keep = []
+    ptr = call._alias_cob_field(_StubField(8, buf), keep)
+    assert ptr is not None
+    # The ctypes cob_field's data must alias the SAME storage: write through it.
+    ctypes.memmove(ptr.contents.data, b"TESTFILE", 8)
+    assert bytes(buf) == b"TESTFILE"        # write propagated back to the bytearray
+    assert ptr.contents.size == 8
+
+
+def test_alias_cob_field_memoryview_offset_writeback():
+    buf = bytearray(b"\x00" * 10)
+    mv = memoryview(buf)[2:]                 # offset slice (size 8)
+    keep = []
+    ptr = call._alias_cob_field(_StubField(8, mv), keep)
+    ctypes.memmove(ptr.contents.data, b"ABCDEFGH", 8)
+    assert bytes(buf) == b"\x00\x00ABCDEFGH"  # honored the offset
+
+
+def test_alias_cob_field_readonly_is_copied():
+    # Immutable bytes can't be aliased; the helper copies them (no write-back).
+    keep = []
+    ptr = call._alias_cob_field(_StubField(3, b"abc"), keep)
+    assert ptr is not None and ptr.contents.size == 3
+
+
+def test_alias_cob_field_size_defaults_to_len():
+    buf = bytearray(b"xyz")
+    ptr = call._alias_cob_field(_StubField(0, buf), [])
+    assert ptr is not None and ptr.contents.size == 3
+
+
+# --- _marshal_cob_file -----------------------------------------------------
+def test_marshal_cob_file_assign_writeback():
+    fname = bytearray(b"        ")           # FILENAME PIC X(8)
+    fobj = _StubFile(assign=_StubField(8, fname))
+    keep = []
+    call._marshal_cob_file(fobj, keep)
+    # _marshal_cob_file appends the _CtCobFile as the first keepalive item; read
+    # it back and write through assign->data to prove the storage is aliased.
+    cfile = keep[0]
+    assert isinstance(cfile, call._CtCobFile)
+    ctypes.memmove(cfile.assign.contents.data, b"DATAFILE", 8)
+    assert bytes(fname) == b"DATAFILE"
+
+
+def test_marshal_cob_file_record_populated():
+    rec = bytearray(b"\x00" * 4)
+    fobj = _StubFile(record=_StubField(4, rec))
+    keep = []
+    call._marshal_cob_file(fobj, keep)       # must not raise; record aliased
+    assert keep                              # ctypes objects retained alive
+
+
+# --- _marshal_native_arg ---------------------------------------------------
+def test_marshal_native_arg_none_is_null():
+    out = call._marshal_native_arg(None, [])
+    assert isinstance(out, ctypes.c_void_p) and out.value in (None, 0)
+
+
+def test_marshal_native_arg_bool_and_int():
+    assert isinstance(call._marshal_native_arg(True, []), ctypes.c_longlong)
+    out = call._marshal_native_arg(42, [])
+    assert isinstance(out, ctypes.c_longlong) and out.value == 42
+
+
+def test_marshal_native_arg_readonly_bytes_is_padded():
+    keep = []
+    out = call._marshal_native_arg(b"\x00\x01\x02", keep)
+    # The literal is copied into a NUL-padded buffer so a read-past-end sees 0.
+    assert isinstance(out, ctypes.c_void_p) and keep
+    raw = ctypes.string_at(out, 4)
+    assert raw == b"\x00\x01\x02\x00"
+
+
+def test_marshal_native_arg_writable_aliases():
+    buf = bytearray(b"abcd")
+    keep = []
+    out = call._marshal_native_arg(memoryview(buf), keep)
+    ctypes.memmove(out, b"WXYZ", 4)
+    assert bytes(buf) == b"WXYZ"             # write-through to the bytearray
+
+
+def test_marshal_native_arg_cob_file_routes_to_struct():
+    fname = bytearray(b"        ")
+    fobj = _StubFile(assign=_StubField(8, fname))
+    out = call._marshal_native_arg(fobj, [])
+    # A cob_file routes to the struct marshaller (byref), NOT a NULL pointer.
+    assert not (isinstance(out, ctypes.c_void_p) and out.value in (None, 0))
+
+
+# --- _make_native_wrapper --------------------------------------------------
+def test_make_native_wrapper_returns_int():
+    wrapper = call._make_native_wrapper(lambda *a: 7)
+    assert wrapper(b"x", 1, None) == 7
+
+
+def test_make_native_wrapper_void_returns_zero():
+    wrapper = call._make_native_wrapper(lambda *a: None)
+    assert wrapper() == 0
+
+
+def test_make_native_wrapper_marshals_each_arg():
+    seen = {}
+
+    def fake_cfunc(*cargs):
+        seen["n"] = len(cargs)
+        return 0
+
+    wrapper = call._make_native_wrapper(fake_cfunc)
+    wrapper(None, 5, b"lit", bytearray(b"rw"))
+    assert seen["n"] == 4                     # every COBOL arg was marshalled
+
+
+# --- _resolve_native + cob_resolve native fallback (need a real .so) -------
+def _build_native_dump(directory):
+    """Compile a tiny ``int dump(unsigned char*)`` shared object with cc."""
+    src = directory / "dump.c"
+    src.write_text(textwrap.dedent("""\
+        #include <stdio.h>
+        int dump(unsigned char *data) {
+            /* echo the first byte so the return value is observable */
+            return data ? (int)data[0] : -1;
+        }
+    """))
+    so = directory / "dump.so"
+    subprocess.run([_CC, "-shared", "-fPIC", "-o", str(so), str(src)],
+                   check=True, capture_output=True)
+    return so
+
+
+@requires_cc
+def test_resolve_native_loads_and_calls(tmp_path):
+    _build_native_dump(tmp_path)
+    call._resolve_paths = [str(tmp_path)]
+    wrapper = call._resolve_native("dump", "dump")
+    assert wrapper is not None and callable(wrapper)
+    # dump() returns its first byte; pass a BY CONTENT literal X"41..".
+    assert wrapper(b"\x41\x00\x00") == 0x41
+
+
+@requires_cc
+def test_resolve_native_symbol_absent(tmp_path):
+    _build_native_dump(tmp_path)              # exports "dump", not "nosuch"
+    call._resolve_paths = [str(tmp_path)]
+    assert call._resolve_native("nosuch", "nosuch") is None
+
+
+def test_resolve_native_no_object(tmp_path):
+    call._resolve_paths = [str(tmp_path)]     # empty dir -> nothing to load
+    assert call._resolve_native("dump", "dump") is None
+
+
+@requires_cc
+def test_cob_resolve_falls_back_to_native(tmp_path, monkeypatch):
+    _build_native_dump(tmp_path)
+    monkeypatch.setenv("COB_LIBRARY_PATH", str(tmp_path))
+    call.cob_init_call()                      # seed resolve paths from env
+    func = call.cob_resolve("dump")           # no Python "dump" -> native fallback
+    assert func is not None and callable(func)
+    assert func(b"\x7a\x00\x00") == 0x7a
+    # Resolved native entry is cached like any other resolved program.
+    assert call.cob_resolve("dump") is func
 

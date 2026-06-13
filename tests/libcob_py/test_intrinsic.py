@@ -830,20 +830,27 @@ def test_exception_location_idle_when_no_exception():
 
 def test_exception_file_with_io_exception():
     """EXCEPTION-FILE returns status + select-name when an I-O exception is set."""
+    # MIGRATION (C->Python): the "last I/O error file" pointer is the C global
+    # ``cob_error_file`` declared in fileio.c (libcob/fileio.c:203), so the
+    # fileio subsystem - NOT common - owns it; FUNCTION EXCEPTION-FILE
+    # (intrinsic.c L928) reads that global.  This test therefore sets the latch
+    # on ``libcob_py.fileio`` (the faithful owner), matching the runtime where
+    # fileio.save_status() latches cob_error_file on an I/O error.
+    from libcob_py import fileio
     saved_code = common.cob_exception_code
-    saved_err = getattr(common, "cob_error_file", None)
+    saved_err = getattr(fileio, "cob_error_file", None)
     try:
         class _FakeFile:
             select_name = "INFILE"
             file_status = b"35"
-        common.cob_error_file = _FakeFile()
+        fileio.cob_error_file = _FakeFile()
         # The I-O category bits (0x0500) must be present for the populated path.
         common.cob_exception_code = 0x0500 | 0x05
         out = rtext(intrinsic.cob_intr_exception_file())
         assert out.startswith(b"35") and b"INFILE" in out
     finally:
         common.cob_exception_code = saved_code
-        common.cob_error_file = saved_err
+        fileio.cob_error_file = saved_err
 
 
 def test_init_intrinsic_callable():

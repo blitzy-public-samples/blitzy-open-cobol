@@ -160,6 +160,65 @@ static int			block_depth = 0;
    are emitted by the function wrapper (output_internal_function). */
 static int			output_segment_open = 0;
 
+/* MIGRATION (C -> Python): stack of cycle-label ids for the inline PERFORM
+   loops (TIMES / UNTIL / FOREVER) currently being emitted.  EXIT PERFORM CYCLE
+   is lowered by the front-end (parser.y) to a GO TO targeting the innermost
+   inline PERFORM's cycle_label, which sits at the END of the loop body.  In C
+   that GO TO simply jumped forward to a label still inside the for/while loop,
+   so control naturally fell through to the next iteration.  In Python a GO TO
+   normally becomes "raise _CobGoto(<id>)" which is caught by the _dispatch
+   handler OUTSIDE every loop -- that would unwind the whole loop and run only a
+   single iteration (the cycle_label dispatch segment is emitted after the
+   loop).  The faithful translation of "skip the rest of this iteration and run
+   the next one" is the Python "continue" statement.  output_goto_1 therefore
+   emits "continue" when the GO TO target is the active (innermost) loop's
+   cycle_label.  Only genuine loop performs push here; an inline ONCE perform is
+   not a loop, so its cycle GO TO keeps the _CobGoto path (jump to the after-body
+   segment), and a bare "continue" -- which would be a Python SyntaxError outside
+   a loop -- is never emitted for it. */
+#define COB_PERFORM_CYCLE_MAX	64
+static int			perform_cycle_stack[COB_PERFORM_CYCLE_MAX];
+static int			perform_cycle_depth = 0;
+
+/* Push the cycle_label id of an inline loop PERFORM (0 when the body contains
+   no EXIT PERFORM CYCLE).  Depth is always incremented so pop stays balanced
+   even past the (generously sized) stack bound. */
+static void
+perform_cycle_push (struct cb_perform *p)
+{
+	int	id = 0;
+
+	if (p->cycle_label) {
+		id = CB_LABEL (cb_ref (p->cycle_label))->id;
+	}
+	if (perform_cycle_depth < COB_PERFORM_CYCLE_MAX) {
+		perform_cycle_stack[perform_cycle_depth] = id;
+	}
+	perform_cycle_depth++;
+}
+
+static void
+perform_cycle_pop (void)
+{
+	if (perform_cycle_depth > 0) {
+		perform_cycle_depth--;
+	}
+}
+
+/* Non-zero when label id is the cycle_label of the innermost inline loop
+   PERFORM currently open, i.e. an EXIT PERFORM CYCLE that must become a Python
+   "continue" of that loop rather than a loop-unwinding _CobGoto. */
+static int
+is_active_cycle_target (int id)
+{
+	if (id != 0
+	    && perform_cycle_depth > 0
+	    && perform_cycle_depth <= COB_PERFORM_CYCLE_MAX) {
+		return perform_cycle_stack[perform_cycle_depth - 1] == id;
+	}
+	return 0;
+}
+
 /* MIGRATION (C -> Python): single-module assembly buffers.
    The former C backend wrote THREE streams per compilation unit: the ".c"
    body (yyout), a storage header ".h" (cb_storage_file) and a per-program
@@ -271,6 +330,20 @@ static void output_param (cb_tree x, int id);
    inline (as Python tuple elements), so it forward-references output_funcall,
    which is defined later in the file. */
 static void output_funcall (cb_tree x);
+
+/* MIGRATION (C -> Python): BASED / non-parameter LINKAGE items have no own
+   storage until ALLOCATE / SET ADDRESS binds them.  The C backend modelled the
+   binding by re-pointing the item's "cob_field.data" through "&item->data";
+   Python cannot take the address of a name, so the backing bytearray name
+   "b_<id>" is instead REBOUND by assignment.  These helpers identify such items
+   and the founder field that ALLOCATE / FREE / SET ADDRESS funcall arguments
+   refer to, so the emitter can (a) emit a module-level "b_<id> = None"
+   initialiser, (b) declare "global b_<id>" in the dispatch scope that rebinds
+   it, and (c) lower ALLOCATE / FREE / SET ADDRESS to name-rebinding
+   assignments. */
+static int linkage_is_parameter (struct cb_program *prog, struct cb_field *f01);
+static int is_rebindable_base (struct cb_program *prog, struct cb_field *f01);
+static struct cb_field *funcall_based_field (cb_tree arg);
 
 static void
 lookup_call (const char *p)
@@ -840,6 +913,77 @@ output_base (struct cb_field *f)
 	output ("%s%s", CB_PREFIX_BASE, name);
 }
 
+/* MIGRATION (C -> Python): return non-zero when LINKAGE founder *f01* is a
+   PROCEDURE DIVISION USING parameter of *prog*.  A parameter item's backing
+   name "b_<id>" is the entry-function argument (a function-local) and must NOT
+   be given a module-level initialiser or a "global" declaration; only
+   non-parameter LINKAGE items (SET ADDRESS targets) get module-level storage. */
+static int
+linkage_is_parameter (struct cb_program *prog, struct cb_field *f01)
+{
+	cb_tree	l;
+
+	for (l = prog->parameter_list; l; l = CB_CHAIN (l)) {
+		if (cb_field_founder (cb_field (CB_VALUE (l))) == f01) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* MIGRATION (C -> Python): return non-zero when founder *f01* needs a
+   MODULE-LEVEL, pointer-rebindable backing name "b_<id> = None": a BASED
+   founder in WORKING-STORAGE or LINKAGE, or a non-parameter LINKAGE founder.
+   EXTERNAL items use a named shared buffer handled elsewhere; LOCAL-STORAGE
+   BASED items are per-invocation function-locals (emitted in the prologue) and
+   are deliberately excluded so they are never declared "global". */
+static int
+is_rebindable_base (struct cb_program *prog, struct cb_field *f01)
+{
+	if (f01->flag_external) {
+		return 0;
+	}
+	if (f01->storage == CB_STORAGE_LOCAL) {
+		return 0;
+	}
+	if (f01->flag_item_based) {
+		return 1;
+	}
+	if (f01->storage == CB_STORAGE_LINKAGE
+	    && !linkage_is_parameter (prog, f01)) {
+		return 1;
+	}
+	return 0;
+}
+
+/* MIGRATION (C -> Python): extract the BASED/LINKAGE founder field that an
+   ALLOCATE / FREE funcall argument addresses.  The front-end (immutable
+   typeck.c) wraps the target in cb_build_cast_addr_of_addr (FREE data-name /
+   ALLOCATE) or cb_build_cast_address (FREE ADDRESS OF), so peel one or two CAST
+   layers down to the underlying reference and return its founder.  Returns NULL
+   for the "ALLOCATE n CHARACTERS RETURNING ptr" form (a NULL/charcount arg with
+   no based target). */
+static struct cb_field *
+funcall_based_field (cb_tree arg)
+{
+	struct cb_cast	*cp;
+
+	if (arg == NULL) {
+		return NULL;
+	}
+	while (CB_CAST_P (arg)) {
+		cp = CB_CAST (arg);
+		if (cp->val == NULL) {
+			return NULL;
+		}
+		arg = cp->val;
+	}
+	if (CB_REF_OR_FIELD_P (arg)) {
+		return cb_field_founder (cb_field (arg));
+	}
+	return NULL;
+}
+
 /* MIGRATION (C -> Python): emit the byte offset of a field within its base
    buffer as a Python int expression, each term prefixed with " + " so it can
    follow a leading "0" inside a memoryview slice (memoryview(b)[0 + ...:]).
@@ -1214,16 +1358,22 @@ output_integer (cb_tree x)
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_CONST:
 		/* MIGRATION (C -> Python): integer-context figurative constants.  ZERO
-		   folds to the integer 0 and NULL to None.  The remaining constants in
-		   this context carry a literal integer string ("1"/"0" for TRUE/FALSE),
-		   which is valid Python verbatim.  As a defensive measure -- so a bare C
-		   "&cob_<x>" address-of can never leak into the emitted Python -- a val
-		   beginning with '&' is rewritten to the module-qualified runtime object
-		   (common.cob_<x>), matching output_param's CONST handling. */
+		   folds to the integer 0.  NULL folds to the integer 0 as well: in
+		   INTEGER context NULL is a pointer VALUE, and the C backend compared
+		   pointers as integer addresses where NULL == (void *)0.  The pointer
+		   condition "IF p = NULL" is lowered to "(<p-as-int> - <null-as-int>)
+		   == 0", so NULL must read as the integer 0 (not None) or the
+		   subtraction raises TypeError.  The pointer STORE paths
+		   (cob_set_pointer / cob_resolve_addr) treat 0 and None identically
+		   (both are NULL), so SET p TO NULL / SET ADDRESS OF x TO NULL are
+		   unaffected.  The remaining constants carry a literal integer string
+		   ("1"/"0" for TRUE/FALSE), valid Python verbatim.  As a defensive
+		   measure a val beginning with '&' is rewritten to the module-qualified
+		   runtime object (common.cob_<x>), matching output_param's CONST. */
 		if (x == cb_zero) {
 			output ("0");
 		} else if (x == cb_null) {
-			output ("None");
+			output ("0");
 		} else {
 			const char	*cval = CB_CONST (x)->val;
 
@@ -1287,8 +1437,30 @@ output_integer (cb_tree x)
 		cp = CB_CAST (x);
 		switch (cp->type) {
 		case CB_CAST_ADDRESS:
-			output ("(");
-			output_data (cp->val);
+			/* MIGRATION (C -> Python): ADDRESS OF x read as a pointer VALUE in
+			   integer context (pointer comparison, SET p TO ADDRESS OF x).  The
+			   C backend yielded the raw machine address; Python yields the
+			   synthetic integer address via common.cob_ptr_addr(view) so the
+			   result is an int that subtracts/compares cleanly and round-trips
+			   through pointer storage (cob_ptr_addr registers the buffer so a
+			   stored copy can later be resolved by SET ADDRESS OF).  For a
+			   BASED / LINKAGE item the backing name "b_<id>" may be None
+			   (unallocated / unbound / SET ADDRESS ... TO NULL) and
+			   memoryview(None) raises TypeError, so the data view is guarded:
+			   an unbound item passes None to cob_ptr_addr, which maps it to 0
+			   (NULL) - exactly the C "&item is NULL" semantics. */
+			output ("common.cob_ptr_addr (");
+			if (CB_REF_OR_FIELD_P (cp->val)
+			    && (cb_field (cp->val)->flag_item_based
+				|| cb_field (cp->val)->storage == CB_STORAGE_LINKAGE)) {
+				output ("(");
+				output_data (cp->val);
+				output (" if ");
+				output_base (cb_field (cp->val));
+				output (" is not None else None)");
+			} else {
+				output_data (cp->val);
+			}
 			output (")");
 			break;
 		case CB_CAST_PROGRAM_POINTER:
@@ -1657,9 +1829,23 @@ output_param (cb_tree x, int id)
 				if (f->flag_any_length && f->flag_anylen_done) {
 					output ("%s%d", CB_PREFIX_FIELD, f->id);
 				} else {
-					output ("common.cob_field_set_data (%s%d, ", CB_PREFIX_FIELD, f->id);
+					/* MIGRATION (C -> Python): a LINKAGE / BASED item's backing
+					   base may legitimately be None at run time - an OMITTED
+					   CALL argument ("CALL ... USING OMITTED"), a BASED item not
+					   yet ALLOCATEd, or a linkage pointer SET to NULL.  The C
+					   runtime stored a NULL data pointer in cob_field and the
+					   only legal operation on it was the OMITTED class test
+					   (cob_is_omitted -> data == NULL).  memoryview(None) raises
+					   a TypeError, so guard the view: when the base is None pass
+					   None straight through to cob_field_set_data (which records
+					   field.data = None, exactly mirroring the NULL pointer), so
+					   cob_is_omitted reports True and the byte-exact behaviour is
+					   preserved for every bound (non-None) reference. */
+					output ("common.cob_field_set_data (%s%d, (", CB_PREFIX_FIELD, f->id);
 					output_data (x);
-					output (")");
+					output (" if ");
+					output_base (f);
+					output (" is not None else None))");
 					if (f->flag_any_length) {
 						f->flag_anylen_done = 1;
 					}
@@ -1853,6 +2039,44 @@ output_funcall (cb_tree x)
 		}
 		return;
 	}
+
+	/* MIGRATION (C -> Python): ALLOCATE / FREE of a BASED (or non-parameter
+	   LINKAGE) item cannot be a plain call - the C backend passed "&item->data"
+	   so cob_allocate/cob_free_alloc could re-point the item's storage pointer
+	   in place.  Python has no address-of-name, so these are lowered to a
+	   name-REBINDING assignment of the module-level backing name "b_<id>":
+	     ALLOCATE item [RETURNING ret]  ->  b_<id> = common.cob_alloc_based(ret, size)
+	     FREE item / FREE ADDRESS OF item ->  b_<id> = common.cob_free_based(b_<id>)
+	   The founder is recovered from the cast-wrapped first/relevant argument.
+	   The "ALLOCATE n CHARACTERS RETURNING ptr" form (no based target) has no
+	   founder and falls through to the ordinary call below.  The name is
+	   declared "global" in the dispatch scope (see output_internal_function). */
+	if (!strcmp (p->name, "cob_allocate")) {
+		struct cb_field	*bf = funcall_based_field (p->argv[0]);
+		if (bf && is_rebindable_base (current_prog, bf)) {
+			output_base (bf);
+			output (" = common.cob_alloc_based (");
+			/* arg[1] = RETURNING data pointer (or NULL); arg[2] = size */
+			output_param (p->argv[1], 1);
+			output (", ");
+			output_param (p->argv[2], 2);
+			output (")");
+			return;
+		}
+	} else if (!strcmp (p->name, "cob_free_alloc")) {
+		struct cb_field	*bf = funcall_based_field (p->argv[0]);
+		if (bf == NULL) {
+			bf = funcall_based_field (p->argv[1]);
+		}
+		if (bf && is_rebindable_base (current_prog, bf)) {
+			output_base (bf);
+			output (" = common.cob_free_based (");
+			output_base (bf);
+			output (")");
+			return;
+		}
+	}
+
 	/* MIGRATION (C -> Python): a normal runtime call.  The C runtime function
 	   name (chosen by the immutable typeck.c front-end) is emitted module-
 	   qualified as libcob_py.<module>.<name>(...) via output_pyfunc /
@@ -3221,13 +3445,30 @@ output_call (struct cb_call *p)
 static void
 output_goto_1 (cb_tree x)
 {
+	int	id = CB_LABEL (cb_ref (x))->id;
+
+	/* MIGRATION (C -> Python): EXIT PERFORM CYCLE special case.  The front-end
+	   lowers EXIT PERFORM CYCLE to a GO TO whose target is the innermost inline
+	   PERFORM's cycle_label, which is emitted at the END of that loop's body.
+	   The COBOL meaning is "skip the rest of this iteration and start the next
+	   one", which is exactly Python's "continue" for the enclosing for/while
+	   loop.  Emitting the usual "raise _CobGoto(<id>)" here would instead unwind
+	   the entire loop (its handler lives outside every loop, and the cycle_label
+	   dispatch segment is emitted after the loop), running only one iteration.
+	   is_active_cycle_target() is true only while that loop is the innermost one
+	   being emitted, so "continue" always targets the correct Python loop. */
+	if (is_active_cycle_target (id)) {
+		output_line ("continue");
+		return;
+	}
+
 	/* MIGRATION (C -> Python): "goto l_N;" becomes "raise _CobGoto(<id>)".
 	   A Python exception is used instead of "_pc = <id>; continue" because a
 	   GO TO may appear nested inside an inline PERFORM for/while loop, where a
 	   bare "continue" would target that inner loop rather than the outer
 	   _dispatch loop.  The exception escapes any nesting and is caught by the
 	   _dispatch "except _CobGoto" handler, which resumes at the target. */
-	output_line ("raise _CobGoto (%d)", CB_LABEL (cb_ref (x))->id);
+	output_line ("raise _CobGoto (%d)", id);
 }
 
 static void
@@ -3369,8 +3610,15 @@ output_perform_until (struct cb_perform *p, cb_tree l)
 	cb_tree				next;
 
 	if (l == NULL) {
-		/* Perform body at the end */
+		/* Perform body at the end.
+		   MIGRATION (C -> Python): the body sits inside the innermost
+		   "while True:" suite emitted below, so mark this loop as the active
+		   inline PERFORM -- EXIT PERFORM CYCLE in the body then emits
+		   "continue", restarting the loop (re-testing the UNTIL condition)
+		   instead of unwinding it via _CobGoto. */
+		perform_cycle_push (p);
 		output_perform_once (p);
+		perform_cycle_pop ();
 		return;
 	}
 
@@ -3436,7 +3684,11 @@ output_perform (struct cb_perform *p)
 		output ("):\n");
 		loop_counter++;
 		output_block_open ();
+		/* MIGRATION (C -> Python): mark this for-loop as the active inline
+		   PERFORM so EXIT PERFORM CYCLE inside the body emits "continue". */
+		perform_cycle_push (p);
 		output_perform_once (p);
+		perform_cycle_pop ();
 		output_block_close ();
 		break;
 	case CB_PERFORM_UNTIL:
@@ -3450,7 +3702,11 @@ output_perform (struct cb_perform *p)
 		/* MIGRATION (C -> Python): "for (;;) { ... }" -> "while True:". */
 		output_line ("while True:");
 		output_block_open ();
+		/* MIGRATION (C -> Python): mark this while-loop as the active inline
+		   PERFORM so EXIT PERFORM CYCLE inside the body emits "continue". */
+		perform_cycle_push (p);
 		output_perform_once (p);
+		perform_cycle_pop ();
 		output_block_close ();
 		break;
 	}
@@ -3788,11 +4044,28 @@ output_stmt (cb_tree x)
 				fprintf (stderr, "Unexpected tree type %d\n", cp->type);
 				ABORT ();
 			}
-			output ("common.cob_set_addr (");
-			output_data (cp->val);
-			output (", ");
-			output_integer (ap->val);
-			output (")");
+			/* MIGRATION (C -> Python): C re-pointed the LINKAGE/BASED item's
+			   data pointer in place ("item->data = val").  Python has no
+			   address-of-name, so REBIND the module-level backing name:
+			   "b_<id> = common.cob_resolve_addr(val)".  cob_resolve_addr maps a
+			   NULL/0 to None (unbound), aliases a directly-passed buffer
+			   (ADDRESS OF x), and resolves an integer read from a POINTER item
+			   back to the storage it addresses.  The name is declared "global"
+			   in the dispatch scope (see output_internal_function) so the
+			   assignment updates the shared module object.  Falls back to the
+			   in-place pointer-byte store for any non-reference target. */
+			if (CB_REF_OR_FIELD_P (cp->val)) {
+				output_base (cb_field (cp->val));
+				output (" = common.cob_resolve_addr (");
+				output_integer (ap->val);
+				output (")");
+			} else {
+				output ("common.cob_set_addr (");
+				output_data (cp->val);
+				output (", ");
+				output_integer (ap->val);
+				output (")");
+			}
 		} else {
 			f = cb_field (ap->var);
 			if (f->usage == CB_USAGE_POINTER) {
@@ -4711,6 +4984,18 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 	if (cb_sticky_linkage && parmnum) {
 		for (i = 0; i < parmnum; i++) {
 			output_line ("global cob_parm_%d", i);
+			/* MIGRATION (C -> Python): the sticky-linkage parameter shadow
+			   "cob_parm_<i>" persists each supplied CALL argument across
+			   invocations so that a later CALL passing FEWER arguments restores
+			   the previous binding (reproducing the C file-scope static
+			   cob_parm[] array used when "sticky-linkage: yes").  The function
+			   declares it "global" and both reads (restore guard) and writes
+			   (remember supplied) it, so the name MUST already exist at module
+			   scope before the first call - otherwise the very first read
+			   ("if _ccp <= i and cob_parm_<i> is not None") raises NameError.
+			   Emit a module-level initialiser into the data stream; None means
+			   "never supplied", exactly the state the restore guard tests. */
+			output_storage ("cob_parm_%d = None\n", i);
 		}
 	}
 	for (f = prog->working_storage; f; f = f->sister) {
@@ -5035,6 +5320,28 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 	/* ---- Dispatch loop: the PROCEDURE DIVISION as re-enterable segments ---- */
 	output_line ("def _dispatch (_pc, _through):");
 	output_block_open ();
+	/* MIGRATION (C -> Python): ALLOCATE / FREE / SET ADDRESS statements are
+	   emitted inside this nested _dispatch function and REBIND the module-level
+	   backing names "b_<id>" of BASED / non-parameter LINKAGE items.  A plain
+	   assignment inside _dispatch would create a function-local shadow, so each
+	   such name is declared "global" here.  Declaring "global" for a name that
+	   is only read is harmless, so the full rebindable set is declared. */
+	{
+		struct cb_field	*bf;
+		struct cb_field	*lists[2];
+		int		li;
+
+		lists[0] = prog->working_storage;
+		lists[1] = prog->linkage_storage;
+		for (li = 0; li < 2; li++) {
+			for (bf = lists[li]; bf; bf = bf->sister) {
+				if (cb_field_founder (bf) == bf
+				    && is_rebindable_base (prog, bf)) {
+					output_line ("global %s%d", CB_PREFIX_BASE, bf->id);
+				}
+			}
+		}
+	}
 	output_line ("while True:");
 	output_block_open ();
 	output_line ("try:");
@@ -5242,15 +5549,25 @@ output_entry_function (struct cb_program *prog, cb_tree entry,
 		f = cb_field (CB_VALUE (l));
 		if (CB_PURPOSE_INT (l) == CB_CALL_BY_VALUE
 		    && CB_TREE_CLASS (CB_VALUE (l)) == CB_CLASS_NUMERIC) {
-			output ("i_%d=None", f->id);
+			output ("i_%d=None, ", f->id);
 		} else {
-			output ("%s%d=None", CB_PREFIX_BASE, f->id);
-		}
-		if (CB_CHAIN (l)) {
-			output (", ");
+			output ("%s%d=None, ", CB_PREFIX_BASE, f->id);
 		}
 	}
-	output ("):\n");
+	/* MIGRATION (C -> Python): a trailing "*_extra" catch-all is appended to
+	   EVERY public entry signature so the callee tolerates being invoked with
+	   MORE positional arguments than it declares in USING.  The C runtime was
+	   inherently variadic at the call site (cob_unifunc punned the function
+	   pointer and C ignores surplus arguments), and the emitter pads each CALL
+	   with up to 4 trailing None placeholders when sticky-linkage / null-param
+	   is in effect (see output_call).  Without "*_extra" a fixed-arity Python
+	   def raises "takes N positional arguments but M were given".  Surplus
+	   arguments are COBOL-correct to ignore (a called program only ever reads
+	   the linkage items it declares); they are discarded into _extra.  Every
+	   parameter above already carries an "=None" default, so a CALL passing
+	   FEWER arguments than declared is equally tolerated (the missing trailing
+	   linkage items stay None / OMITTED), exactly matching the C behaviour. */
+	output ("*_extra):\n");
 	output_block_open ();
 
 	output_prefix ();
@@ -5679,6 +5996,40 @@ codegen (struct cb_program *prog, const int nested)
 	   flushed into the single module by output_flush_module_buffers(). */
 	output_storage_open ();
 	output_target = storage_mem;
+
+	/* MIGRATION (C -> Python): emit a module-level "b_<id> = None" backing name
+	   for every BASED founder and every non-parameter LINKAGE founder.  field.c
+	   marks these flag_base=1 at parse time, so output_base() never enters them
+	   into base_cache (no bytearray is emitted for them) and the emitted
+	   references "b_<id>" would otherwise be undefined module names (NameError).
+	   None models the C NULL data pointer = unallocated (BASED) / unbound
+	   (LINKAGE); ALLOCATE rebinds it to a fresh bytearray and SET ADDRESS rebinds
+	   it to the aliased storage (see output_funcall / CB_TAG_ASSIGN).  LINKAGE
+	   PARAMETER items are excluded (their "b_<id>" is the entry-function
+	   argument) and LOCAL-STORAGE BASED items are excluded (emitted per
+	   invocation in the prologue). */
+	{
+		struct cb_field	*bf;
+		int		first_based = 0;
+		struct cb_field	*lists[2];
+		int		li;
+
+		lists[0] = prog->working_storage;
+		lists[1] = prog->linkage_storage;
+		for (li = 0; li < 2; li++) {
+			for (bf = lists[li]; bf; bf = bf->sister) {
+				if (cb_field_founder (bf) == bf
+				    && is_rebindable_base (prog, bf)) {
+					if (!first_based) {
+						first_based = 1;
+						output ("\n# BASED / LINKAGE backing pointers\n");
+					}
+					output ("%s%d = None", CB_PREFIX_BASE, bf->id);
+					output ("\t# %s\n", bf->name);
+				}
+			}
+		}
+	}
 
 	/* MIGRATION (C->Python): Program-local declaration block neutralized.
 	   The C backend emitted per-program local C declarations into local_mem:
