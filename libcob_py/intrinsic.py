@@ -1076,6 +1076,15 @@ def cob_intr_mean(params, *args):
                              common.COB_FLAG_HAVE_SIGN)
     _get(d1, probe, 0)
     n = struct.unpack("=q", bytes(probe.data[:8]))[0]
+    # QA-FIX (G1/IF120A hang, emitter<->runtime numeric-semantics parity):
+    # The C reference counts digits with ``for (i = 0; n; n /= 10, ++i)``
+    # (intrinsic.c L2271). C integer division truncates toward zero, so for a
+    # negative mean (e.g. FUNCTION MEAN(5,-2,-14,0) = -2.75 -> n = -2) the loop
+    # terminates after one step (-2 / 10 == 0). Python's ``//`` floors toward
+    # negative infinity, so ``-2 // 10 == -1`` and ``-1 // 10 == -1`` spins
+    # forever. Counting digits on ``abs(n)`` reproduces C's truncation-toward-
+    # zero digit count exactly (the digit count of n and -n is identical).
+    n = abs(n)
     i = 0
     while n:
         n //= 10
@@ -1204,6 +1213,11 @@ def cob_intr_variance(params, *args):
                              common.COB_FLAG_HAVE_SIGN)
     _get(d4, probe, 0)
     n = struct.unpack("=q", bytes(probe.data[:8]))[0]
+    # QA-FIX (emitter<->runtime numeric-semantics parity): same C truncation-
+    # toward-zero digit count as cob_intr_mean (intrinsic.c L2271). VARIANCE is
+    # mathematically non-negative, but ``abs(n)`` is applied for defensive
+    # parity so any representational negative cannot spin Python's floor ``//``.
+    n = abs(n)
     i = 0
     while n:
         n //= 10

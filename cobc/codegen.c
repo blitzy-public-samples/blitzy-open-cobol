@@ -101,6 +101,16 @@ static int			inside_stack[64];
 #endif
 static int			param_id = 0;
 static int			stack_id = 0;
+/* QA-FIX (G1/IC222A..IC237A file-status-48): per-source-file program counter
+   used to namespace NON-global, NON-external file-handle module globals so two
+   sequential/nested programs declaring a file with the same COBOL name (e.g.
+   PRINT-FILE) do not collide on one shared "h_<name>" global.  In C each
+   program owns a function-local "static cob_file *" (emitted into its own
+   .lN.h), so they never collide; the Python lowering must reproduce that
+   per-program ownership.  Reset to 0 for each outermost program (nested == 0);
+   the first program (id 0) keeps the unsuffixed name so single-program output
+   is byte-for-byte unchanged. */
+static int			file_namespace_id = 0;
 static int			num_cob_fields = 0;
 static int			loop_counter = 0;
 static int			progid = 0;
@@ -739,6 +749,24 @@ codegen_pymod (const char *name)
 static void
 output_pyfunc (const char *name)
 {
+	/* MIGRATION (C -> Python) [QA finding: Rule #7 emitter<->runtime contract;
+	   NC174A class-condition over-qualification]: user-defined CLASS conditions
+	   (the COBOL "CLASS name IS ..." clause) are lowered by the immutable
+	   front-end into funcalls whose name is the class cname "is_<name>"
+	   (cobc/tree.c cb_build_class_name: snprintf(..., "is_%s",
+	   to_cname(p->name))).  Unlike the cob_* runtime symbols, these helpers are
+	   NOT part of libcob_py: the emitter writes each one as a module-local
+	   "def is_<name> (f):" function (see output_class_name_definition).  They
+	   must therefore be CALLED unqualified -- emitting
+	   "libcob_py.is_<name>(...)" raises AttributeError at runtime
+	   ("module 'libcob_py' has no attribute 'is_<name>'").  No cob_* runtime
+	   routine and no libcob_py facade symbol begins with "is_", so the "is_"
+	   prefix is an unambiguous, safe discriminator for these locally-defined
+	   class-condition functions, and single-class programs are unaffected. */
+	if (!strncmp (name, "is_", 3)) {
+		output ("%s", name);
+		return;
+	}
 	output ("%s.%s", codegen_pymod (name), name);
 }
 
@@ -4373,6 +4401,77 @@ output_initial_values (struct cb_field *p)
 	}
 }
 
+/* QA-FIX (G1/IC226A EXTERNAL sibling rebind): an EXTERNAL data item is entered
+   into field_cache (and therefore re-pointed by output_external_data_init)
+   only when its FIRST PROCEDURE-DIVISION reference is emitted by output_param.
+   For a nested / sibling program that reference is emitted AFTER the program's
+   one-time-init block, so at init time field_cache held no entry for the item
+   and its cob_field.data was never re-pointed -- it stayed None, producing a
+   run-time "'NoneType' object is not subscriptable" the first time the sibling
+   touched the field (e.g. IC226A's IC226A__1 sub-program crashed on EXT-DATA-4
+   / f_139).  field_cache is reset only for the top-level program (if (!nested)
+   above), so it accumulates across the compilation unit -- which is why the
+   sibling already rebinds the MAIN program's EXTERNAL fields but not its own.
+   This helper walks the CURRENT program's WORKING-STORAGE and pre-registers any
+   referenced EXTERNAL item using exactly the bookkeeping output_param performs,
+   so the immediately-following rebind loop binds them.  Items already
+   registered (count of the main program, or earlier in this walk) are skipped
+   via flag_field and harmlessly rebound to the same shared base slice. */
+static void
+register_program_external_fields (struct cb_field *f)
+{
+	struct cb_field		*pechk;
+	struct field_list	*fl;
+	cb_tree			x;
+	void			*savetarget;
+	int			is_ext;
+
+	for (; f; f = f->sister) {
+		if (f->children) {
+			register_program_external_fields (f->children);
+		}
+		/* Determine EXTERNAL membership exactly as output_param does
+		   (see the parent-chain walk at the external registration path). */
+		is_ext = 0;
+		if (f->redefines && f->redefines->flag_external) {
+			f->flag_item_external = 1;
+			f->flag_external = 1;
+		}
+		if (f->flag_external || f->flag_item_external) {
+			is_ext = 1;
+		}
+		for (pechk = f->parent; pechk && !is_ext; pechk = pechk->parent) {
+			if (pechk->flag_external
+			    || (pechk->redefines && pechk->redefines->flag_external)) {
+				is_ext = 1;
+			}
+		}
+		if (!is_ext) {
+			continue;
+		}
+		f->flag_item_external = 1;
+		/* Same guard as output_param: a plain (no subscript / no offset),
+		   fixed-size, referenced item that is not yet cached. */
+		if (f->count > 0 && !f->flag_field
+		    && !cb_field_variable_size (f)
+		    && !cb_field_variable_address (f)) {
+			x = cb_build_field_reference (f, NULL);
+			savetarget = output_target;
+			output_target = NULL;
+			output_field (x);
+			fl = cobc_malloc (sizeof (struct field_list));
+			fl->x = x;
+			fl->f = f;
+			fl->curr_prog = excp_current_program_id;
+			fl->nulldata = 0;
+			fl->next = field_cache;
+			field_cache = fl;
+			f->flag_field = 1;
+			output_target = savetarget;
+		}
+	}
+}
+
 /* MIGRATION (C->Python): helper that inlines the EXTERNAL data-item field
    re-pointing that the C emitter performed via "goto L_initextern".  After an
    EXTERNAL base (b_<name>) has been bound to its shared buffer by
@@ -4383,6 +4482,14 @@ static void
 output_external_data_init (void)
 {
 	struct field_list	*k;
+
+	/* QA-FIX (G1/IC226A): ensure the CURRENT program's referenced EXTERNAL
+	   items are present in field_cache before the rebind loop runs, so a
+	   nested / sibling program re-points its own EXTERNAL fields and not only
+	   those inherited from earlier programs in the compilation unit. */
+	if (current_prog) {
+		register_program_external_fields (current_prog->working_storage);
+	}
 
 	for (k = field_cache; k; k = k->next) {
 		if (k->f->flag_item_external) {
@@ -5376,6 +5483,34 @@ codegen (struct cb_program *prog, const int nested)
 
 	/* Clear local program stuff */
 	current_prog = prog;
+	/* QA-FIX (G1/IC222A..IC237A file-status-48): namespace this program's
+	   NON-global, NON-external file handles so sequential/nested programs that
+	   each declare a file with the same COBOL name do not collide on a single
+	   shared "h_<cname>" module global.  Mirrors C, where every program owns a
+	   distinct function-local "static cob_file *".  GLOBAL files (shared with
+	   contained programs) and EXTERNAL files (shared across programs by their
+	   linkage name) are intentionally left untouched.  The outermost program
+	   (id 0) keeps the original name so single-program emission is unchanged. */
+	if (!nested) {
+		file_namespace_id = 0;
+	}
+	{
+		int		fns_id = file_namespace_id++;
+		cb_tree		fns_l;
+
+		if (fns_id > 0) {
+			for (fns_l = prog->file_list; fns_l; fns_l = CB_CHAIN (fns_l)) {
+				struct cb_file	*fns_f = CB_FILE (CB_VALUE (fns_l));
+
+				if (!fns_f->external && !fns_f->global) {
+					char	*fns_cn = cobc_malloc (strlen (fns_f->cname) + 16);
+
+					sprintf (fns_cn, "%s_%d", fns_f->cname, fns_id);
+					fns_f->cname = fns_cn;
+				}
+			}
+		}
+	}
 	param_id = 0;
 	stack_id = 0;
 	num_cob_fields = 0;

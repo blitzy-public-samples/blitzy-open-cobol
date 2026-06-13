@@ -486,7 +486,16 @@ def cob_string_init(dst, ptr):
 
     _string_dst = _copy_field(dst)
     _string_ptr = None
-    if ptr is not None:
+    # QA FIX (CRITICAL #4, emitter<->runtime contract): mirror the C guard
+    # ``if (ptr)`` (strings.c L370), NOT ``ptr is not None``.  The immutable
+    # front-end (typeck.c cb_emit_string) supplies ``cb_int0`` for an omitted
+    # ``WITH POINTER`` phrase, which the emitter renders as the literal integer
+    # ``0`` (== C NULL) - e.g. ``strings.cob_string_init(f_12, 0)``.  A truthiness
+    # test treats that ``0`` as "no pointer" exactly as C does, while a genuine
+    # ``cob_field`` (which defines no ``__bool__``/``__len__``) is always truthy.
+    # The previous ``is not None`` accepted the ``0`` and crashed in _copy_field
+    # with ``AttributeError: 'int' object has no attribute 'size'``.
+    if ptr:
         _string_ptr = _copy_field(ptr)
     _string_offset = 0
     common.cob_exception_code = 0
@@ -505,7 +514,12 @@ def cob_string_delimited(dlm):
     """
     global _string_dlm
     _string_dlm = None
-    if dlm is not None:
+    # QA FIX (CRITICAL #4): mirror the C guard ``if (dlm)`` (strings.c L389).
+    # typeck.c emits ``cb_int0`` (-> integer ``0``) for ``DELIMITED BY SIZE``
+    # (no delimiter), so a truthiness test is required: ``0`` means "no
+    # delimiter" while a real ``cob_field`` delimiter is truthy.  ``is not None``
+    # would pass ``0`` into _copy_field and raise AttributeError.
+    if dlm:
         _string_dlm = _copy_field(dlm)
 
 
@@ -575,7 +589,11 @@ def cob_unstring_init(src, ptr, num_dlm):
 
     _unstring_src = _copy_field(src)
     _unstring_ptr = None
-    if ptr is not None:
+    # QA FIX (CRITICAL #4): mirror the C guard ``if (ptr)`` (strings.c L448).
+    # typeck.c cb_emit_unstring passes ``cb_int0`` (-> integer ``0``) for an
+    # omitted ``WITH POINTER`` phrase; a truthiness test treats it as NULL,
+    # whereas ``is not None`` crashed in _copy_field on the integer ``0``.
+    if ptr:
         _unstring_ptr = _copy_field(ptr)
 
     _unstring_offset = 0
@@ -689,7 +707,11 @@ def cob_unstring_into(dst, dlm, cnt):
 
     # DELIMITER IN: deliver the matched delimiter, or a figurative fill when the
     # field ended without one (strings.c L565-L573).
-    if dlm is not None:
+    # QA FIX (CRITICAL #4): mirror the C guard ``if (dlm)`` (strings.c L565).
+    # cb_build_unstring_into defaults an omitted ``DELIMITER IN`` to ``cb_int0``
+    # (-> integer ``0``); a truthiness test treats ``0`` as "no receiver", while
+    # ``is not None`` would route ``0`` into cob_memcpy/_cob_move and fail.
+    if dlm:
         if dlm_data is not None:
             common.cob_memcpy(dlm, dlm_data[:dlm_size], dlm_size)
         elif common.COB_FIELD_IS_NUMERIC(dlm):
@@ -698,7 +720,9 @@ def cob_unstring_into(dst, dlm, cnt):
             _cob_move(common.cob_space, dlm)
 
     # COUNT IN: deliver the number of source characters moved (strings.c L575-L577).
-    if cnt is not None:
+    # QA FIX (CRITICAL #4): mirror the C guard ``if (cnt)`` (strings.c L577);
+    # an omitted ``COUNT IN`` is ``cb_int0`` (-> integer ``0``), so use truthiness.
+    if cnt:
         _cob_set_int(cnt, match_size)
 
 

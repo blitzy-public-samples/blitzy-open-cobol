@@ -684,11 +684,14 @@ cobc_print_info (void)
 	cobc_var_print ("COB_MODULE_EXT",	COB_MODULE_EXT);
 	cobc_var_print ("COB_EXEEXT",		COB_EXEEXT);
 
-#if	defined(USE_LIBDL) || defined(_WIN32)
-	cobc_var_print (_("Dynamic loading"),	_("System"));
-#else
-	cobc_var_print (_("Dynamic loading"),	_("Libtool"));
-#endif
+	/* MIGRATION (C->Python): The runtime no longer resolves modules through
+	   the native dynamic linker (USE_LIBDL/dlopen) or libltdl ("Libtool").
+	   libcob_py.call loads COBOL programs with importlib + sys.path, so the
+	   build-info summary now reports the Python loader unconditionally. The
+	   former USE_LIBDL/_WIN32 conditional and its stale "System"/"Libtool"
+	   strings are removed because neither backend is used by the Python
+	   runtime. (QA Issue 3: "--info still reports Dynamic loading: Libtool".) */
+	cobc_var_print (_("Dynamic loading"),	_("Python (importlib)"));
 
 #ifdef	COB_PARAM_CHECK
 	cobc_var_print ("\"CBL_\" param check",	_("Enabled"));
@@ -1849,23 +1852,67 @@ cobc_build_pyz (struct filename *primary, struct filename *modlist,
 	   directory, compiled .pyc and .pyo files, the pyproject.toml manifest, and -
 	   when COB_LIBPY_DIR points at the in-tree source rather than the installed
 	   pkgdatadir copy - the autotools Makefile / Makefile.am / Makefile.in.
-	   If the runtime dir is absent a build-time warning is written to stderr (the
-	   archive is then NOT self-contained) rather than silently producing a broken
-	   artifact. */
+
+	   QA FIX (CRITICAL Issue 2 - "generated .pyz is not self-contained"): the
+	   runtime directory is now resolved in three steps so the archive ALWAYS
+	   bundles libcob_py:
+	     1. use the directory cobc passed in argv[3] (= $COB_LIBPY_DIR or the
+	        COB_LIBPY_DIR macro = installed $(pkgdatadir)/libcob_py) when present;
+	     2. otherwise (e.g. compiling against an in-tree / PYTHONPATH-importable
+	        runtime before "make install"), locate libcob_py via importlib so it
+	        is still bundled from wherever it is importable;
+	     3. if it still cannot be found, FAIL HARD (write an error and exit 1)
+	        rather than the former warning-and-continue, because a self-contained
+	        -m/-x artifact is an AAP requirement - a non-self-contained archive
+	        would only fail later with ModuleNotFoundError at run time.
+	   The script is newline-delimited (real "\n" bytes in argv[2]); it is passed
+	   as a single execvp() argument by cobc_spawn_argv, so no shell parses it. */
 	static char	pyz_stage[] =
-		"import os,sys,shutil,tempfile,zipapp;"
-		"o=sys.argv[1];x=sys.argv[2]=='1';p=sys.argv[3];m=sys.argv[4:];"
-		"d=tempfile.mkdtemp();"
-		"[shutil.copy(s,os.path.join(d,os.path.basename(s))) for s in m];"
-		"shutil.copy(m[0],os.path.join(d,'__main__.py'));"
-		"shutil.copytree(p,os.path.join(d,'libcob_py'),"
-		"ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.pyo',"
-		"'pyproject.toml','Makefile','Makefile.am','Makefile.in')) "
-		"if os.path.isdir(p) else "
-		"sys.stderr.write('cobc: warning: libcob_py runtime not found at '+repr(p)"
-		"+'; generated .pyz is NOT self-contained\\n');"
-		"zipapp.create_archive(d,o,interpreter=(sys.executable if x else None));"
-		"shutil.rmtree(d)";
+		"import os, sys, shutil, tempfile, zipapp, importlib.util\n"
+		"outname = sys.argv[1]\n"
+		"as_exec = sys.argv[2] == '1'\n"
+		"libpy_dir = sys.argv[3]\n"
+		"modules = sys.argv[4:]\n"
+		"# (1)/(2) Resolve the libcob_py runtime directory to bundle.\n"
+		"if not os.path.isdir(libpy_dir):\n"
+		"    try:\n"
+		"        spec = importlib.util.find_spec('libcob_py')\n"
+		"    except Exception:\n"
+		"        spec = None\n"
+		"    if spec is not None and spec.origin:\n"
+		"        libpy_dir = os.path.dirname(spec.origin)\n"
+		"    elif spec is not None and spec.submodule_search_locations:\n"
+		"        libpy_dir = list(spec.submodule_search_locations)[0]\n"
+		"# (3) Hard error: a self-contained .pyz is required for -m/-x.\n"
+		"if not os.path.isdir(libpy_dir):\n"
+		"    sys.stderr.write(\"cobc: error: libcob_py runtime package not found \"\n"
+		"                     \"(looked in \" + repr(sys.argv[3]) + \" and via \"\n"
+		"                     \"importlib); cannot build a self-contained .pyz. \"\n"
+		"                     \"Set COB_LIBPY_DIR to the libcob_py directory or \"\n"
+		"                     \"install the runtime with 'make install'.\\n\")\n"
+		"    sys.exit(1)\n"
+		"stage = tempfile.mkdtemp()\n"
+		"# QA FIX (Issue G1 - inter-program CALL): the importable module name\n"
+		"# inside the archive must be the COBOL PROGRAM-ID (= the output base\n"
+		"# name) so a subprogram compiled with 'cobc -m' can be loaded by a CALL\n"
+		"# via importlib - libcob_py.call adds the .pyz to sys.path and imports\n"
+		"# <PROGRAM-ID>.  This mirrors the C resolver finding a <name>.so and\n"
+		"# dlsym-ing the PROGRAM-ID entry.  The temp-named copy is kept too (it is\n"
+		"# harmless and preserves any multi-module bundle's basenames), and the\n"
+		"# entry module is ALSO staged as __main__.py so 'cobc -x'/cobcrun still\n"
+		"# execute the archive directly.\n"
+		"modbase = os.path.splitext(os.path.basename(outname))[0]\n"
+		"for s in modules:\n"
+		"    shutil.copy(s, os.path.join(stage, os.path.basename(s)))\n"
+		"shutil.copy(modules[0], os.path.join(stage, modbase + '.py'))\n"
+		"shutil.copy(modules[0], os.path.join(stage, '__main__.py'))\n"
+		"shutil.copytree(libpy_dir, os.path.join(stage, 'libcob_py'),\n"
+		"                ignore=shutil.ignore_patterns('__pycache__', '*.pyc',\n"
+		"                '*.pyo', 'pyproject.toml', 'Makefile', 'Makefile.am',\n"
+		"                'Makefile.in'))\n"
+		"zipapp.create_archive(stage, outname,\n"
+		"                      interpreter=(sys.executable if as_exec else None))\n"
+		"shutil.rmtree(stage)\n";
 
 	/* MIGRATION (C->Python) / SECURITY (CWE-78): build a NULL-terminated argv
 	   vector rather than a shell command string.  Count the slots first:

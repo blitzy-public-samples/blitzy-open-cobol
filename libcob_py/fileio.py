@@ -110,6 +110,41 @@ def _cob_set_int(f, n):
     move.cob_set_int(f, n)
 
 
+def _set_sort_return(sort_return, n):
+    """Write the SORT-RETURN status *n* into the *sort_return* operand.
+
+    QA FIX (emitter<->runtime contract; same family as the STRING / Issue-4
+    fix).  typeck.c passes the SORT-RETURN special register to
+    :func:`cob_file_sort_init` via ``cb_build_cast_address()`` (typeck.c L5730),
+    which the Python code generator lowers to the *raw data buffer*
+    ``memoryview(b_N)[0:]`` - faithfully mirroring the C runtime, whose prototype
+    is ``void *sort_return`` and which stores the status with a plain native
+    integer write ``*(int *)sort_return = N`` (fileio.c L5662 init-0, and L5625
+    / L5728 / L5757 error-16).  The Python runtime previously mis-handled this
+    operand as a :class:`~libcob_py.common.cob_field` and routed it through
+    ``_cob_set_int(sort_return, N)`` -> ``cob_move`` -> ``dst.size``, raising
+    ``AttributeError: 'memoryview' object has no attribute 'size'`` for *every*
+    SORT/MERGE statement (the NIST ST/SG modules).  Mirror the C native store:
+    write *n* as a host-native 4-byte signed int directly into the buffer.
+    SORT-RETURN is a 4-byte ``COB_TYPE_NUMERIC_BINARY`` register stored in
+    native byte order (its attribute carries ``COB_FLAG_HAVE_SIGN`` only, never
+    ``COB_FLAG_BINARY_SWAP``), so the native pack is read back correctly when the
+    COBOL program later examines the register through its own field.  A genuine
+    ``cob_field`` operand (should one ever be supplied) is still routed through
+    the field-encoded ``_cob_set_int`` path for full generality.
+    """
+    if sort_return is None:
+        return
+    # A genuine cob_field carries both ``size`` and ``data``; a raw address
+    # operand (memoryview / bytearray / bytes-like) carries neither.
+    if hasattr(sort_return, "size") and hasattr(sort_return, "data"):
+        _cob_set_int(sort_return, n)
+        return
+    # Raw data buffer: native 4-byte signed store, exactly like the C
+    # ``*(int *)sort_return = N``.
+    struct.pack_into("=i", sort_return, 0, int(n))
+
+
 def _cob_add_int(f, n):
     """``cob_add_int`` via a deferred import of :mod:`libcob_py.numeric`."""
     from libcob_py import numeric  # deferred
@@ -1295,8 +1330,9 @@ def _key_index_of(f, key):
     """Resolve which declared key the search field *key* refers to.
 
     Mirrors the C ``for (k...) if (f->keys[k].field->data == key->data)`` probe
-    (fileio.c L2348) using object identity, then a data-identity fall-back, and
-    finally defaults to the primary key.
+    (fileio.c indexed_start_internal L2162) using object identity, then a
+    data-identity fall-back, then a data START-ADDRESS match, and finally
+    defaults to the primary key.
     """
     for i in range(f.nkeys):
         kf = f.keys[i].field
@@ -1306,6 +1342,34 @@ def _key_index_of(f, key):
         kf = f.keys[i].field
         if kf is not None and key is not None and kf.data is key.data:
             return i
+    # QA-FIX [Rule #7 emitter<->runtime contract; IX209A/210A/214A/215A generic
+    # (partial) alternate-key START]: the C runtime resolves the key of
+    # reference with a raw data-POINTER comparison -
+    #   for (k = 0; k < f->nkeys; k++)
+    #       if (f->keys[k].field->data == key->data) break;   (fileio.c L2161)
+    # When a START names a DATA ITEM SUBORDINATE TO a key that begins at the
+    # key's first byte (e.g. "KEY IS EQUAL TO IX-FS1-ALTKEY1-1-5", positions
+    # 1-5 of a 20-byte alternate key -- a generic/partial key), that item
+    # ALIASES the key's storage at the SAME start address, so the C pointer
+    # test matches the alternate key and START positions on it.  The two prior
+    # tiers only catch the whole-key field (object / .data identity); a
+    # subordinate item is a DISTINCT cob_field with its OWN memoryview, so they
+    # miss it and the function used to fall through to the primary key (index
+    # 0), making every generic alternate-key START search the wrong column and
+    # wrongly return INVALID KEY (status 23).  The emitter materialises every
+    # elementary item as an open-ended ``memoryview(b)[off:]`` into its record
+    # bytearray (codegen output_data), so "same underlying buffer AND same
+    # exposed length" is exactly equivalent to "same start offset"
+    # (off == len(buffer) - len(view)) -- i.e. the same byte address the C
+    # pointer test compares -- with no ctypes / address arithmetic required.
+    kd = key.data if key is not None else None
+    if isinstance(kd, memoryview):
+        for i in range(f.nkeys):
+            kf = f.keys[i].field
+            if (kf is not None and isinstance(kf.data, memoryview)
+                    and kf.data.obj is kd.obj
+                    and len(kf.data) == len(kd)):
+                return i
     return 0
 
 
@@ -1344,7 +1408,8 @@ class _IndexedDbm(object):
     """
 
     __slots__ = ("db", "filename", "mode", "keylen", "_sorted",
-                 "_idx", "_pending", "_last_key", "_resume_key")
+                 "_idx", "_pending", "_last_key", "_resume_key",
+                 "_last_read_key")
 
     def __init__(self, db, filename, mode, keylen):
         self.db = db
@@ -1355,6 +1420,13 @@ class _IndexedDbm(object):
         self._idx = -1          # index of last record returned (-1 = before first)
         self._pending = None    # index to return first after a START
         self._last_key = None   # last key written in sequential (load) mode
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX119A REWRITE wrong-key]:
+        # primary key of the last record served by READ / READ NEXT.  In
+        # SEQUENTIAL access mode the C runtime rewrites the record the cursor is
+        # positioned on (indexed_delete_internal uses DB_SEQ(DB_SET) - the
+        # cursor's current key - rather than the record-area key), so a REWRITE
+        # whose primary key was changed since the last read must be rejected.
+        self._last_read_key = None
         # QA F-PERF F3 migration: a random READ records the key it positioned on
         # here instead of eagerly computing ``_idx`` (which required an O(n)
         # scan of ``_sorted`` on every read).  The cursor index is resolved
@@ -1392,18 +1464,41 @@ class _IndexedDbm(object):
     # -- file verbs ---------------------------------------------------------
     def write(self, f, opt):
         kb = _record_key(f, 0)
-        if kb in self.db:
-            return COB_STATUS_22_KEY_EXISTS
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX109A/IX112A sequential
+        # WRITE status order]: the C runtime checks the ascending-sequence
+        # condition (status 21) BEFORE the duplicate-key condition (status 22),
+        # and the sequence test is STRICT - indexed_write (fileio.c L3305):
+        #     else if (f->access_mode == COB_ACCESS_SEQUENTIAL
+        #              && memcmp (p->last_key, p->key.data, p->key.size) > 0)
+        #         return COB_STATUS_21_KEY_INVALID;   (last > cur, i.e. cur < last)
+        #     memcpy (p->last_key, p->key.data, p->key.size);  (update, then dup)
+        # The previous order (duplicate first, and a non-strict "<=") returned
+        # status 22 for an out-of-ascending-sequence key that also already
+        # existed, where COBOL requires status 21.
         if f.access_mode == common.COB_ACCESS_SEQUENTIAL:
-            if self._last_key is not None and kb <= self._last_key:
+            if self._last_key is not None and kb < self._last_key:
                 return COB_STATUS_21_KEY_INVALID
             self._last_key = kb
+        if kb in self.db:
+            return COB_STATUS_22_KEY_EXISTS
         self.db[kb] = bytes(f.record.data[:f.record.size])
         self._sorted = None
         return COB_STATUS_00_SUCCESS
 
     def rewrite(self, f, opt):
         kb = _record_key(f, 0)
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX119A REWRITE wrong-key]:
+        # in SEQUENTIAL access mode a REWRITE acts on the record positioned by
+        # the preceding READ; the COBOL standard requires the primary key in the
+        # record area to equal that record's key.  The C BDB path enforces this
+        # implicitly (indexed_delete_internal positions via the cursor's current
+        # key, then indexed_write of the changed key collides -> status 22),
+        # while the standard documents status 21.  Mirror the standard: reject a
+        # changed prime key with status 21 (the IX119A oracle accepts 21 or 22).
+        if (f.access_mode == common.COB_ACCESS_SEQUENTIAL
+                and self._last_read_key is not None
+                and kb != self._last_read_key):
+            return COB_STATUS_21_KEY_INVALID
         if kb not in self.db:
             return COB_STATUS_23_KEY_NOT_EXISTS
         self.db[kb] = bytes(f.record.data[:f.record.size])
@@ -1447,6 +1542,7 @@ class _IndexedDbm(object):
         self._resume_key = kb
         self._idx = -1
         self._pending = None
+        self._last_read_key = kb   # IX119A: track last-read key for REWRITE check
         return COB_STATUS_00_SUCCESS
 
     def read_next(self, f, read_opts):
@@ -1472,10 +1568,27 @@ class _IndexedDbm(object):
                 idx = pos - 1 if previous else pos + 1
             else:
                 idx = pos - 1 if previous else pos
-        elif self._idx < 0:
+        elif self._last_read_key is None:
+            # No prior position in this open -> first record (last for PREVIOUS).
             idx = (n - 1) if previous else 0
         else:
-            idx = self._idx - 1 if previous else self._idx + 1
+            # QA-FIX [Rule #7 emitter<->runtime contract; IX103A/IX203A DELETE
+            # in sequential traversal]: position by the last key returned, NOT a
+            # cached ordinal.  A DELETE invalidates and rebuilds ``_sorted``,
+            # shifting every index past the removed key; stepping ``self._idx``
+            # +/- 1 then skipped the record that slid into the deleted slot, so
+            # the file was traversed short (400 of 500 records, 100 of 125
+            # deletes).  Re-resolve the last key with an O(log n) bisect, which
+            # is delete-safe: if it still exists step past it; if it was the
+            # just-deleted current record, its insertion point already is the
+            # next record forward (or ``pos-1`` backward), matching the Berkeley
+            # DB cursor the C runtime advanced after an in-traversal delete.
+            lk = self._last_read_key
+            pos = bisect.bisect_left(keys, lk)
+            if pos < n and keys[pos] == lk:
+                idx = pos - 1 if previous else pos + 1
+            else:
+                idx = pos - 1 if previous else pos
         if idx < 0 or idx >= n:
             return COB_STATUS_10_END_OF_FILE
         self._idx = idx
@@ -1485,6 +1598,7 @@ class _IndexedDbm(object):
         f.record.size = len(val)
         if f.keys[0].field is not None:
             f.keys[0].field.data[0:len(kb)] = kb
+        self._last_read_key = kb   # IX119A: track last-read key for REWRITE check
         return COB_STATUS_00_SUCCESS
 
     def start(self, f, cond, key):
@@ -1531,7 +1645,8 @@ class _IndexedSqlite(object):
     """
 
     __slots__ = ("conn", "filename", "mode", "nkeys", "keylens",
-                 "_curkey", "_lastcol", "_lastseq", "_pending_seq", "_last_pkey")
+                 "_curkey", "_lastcol", "_lastseq", "_pending_seq", "_last_pkey",
+                 "_last_read_pkey")
 
     def __init__(self, conn, filename, mode, nkeys, keylens):
         self.conn = conn
@@ -1544,6 +1659,11 @@ class _IndexedSqlite(object):
         self._lastseq = None    # last seq returned
         self._pending_seq = None  # row to serve first after a START
         self._last_pkey = None  # last primary key written in load mode
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX119A REWRITE wrong-key]:
+        # primary key of the last record served by READ / READ NEXT (see the
+        # _IndexedDbm counterpart).  Used to reject a SEQUENTIAL-access REWRITE
+        # whose primary key was changed since the last read with status 21.
+        self._last_read_pkey = None
 
     # -- positioning helpers ------------------------------------------------
     def _next_row(self, k, lastcol, lastseq, previous):
@@ -1616,6 +1736,20 @@ class _IndexedSqlite(object):
     # -- file verbs ---------------------------------------------------------
     def write(self, f, opt):
         keyvals = [_record_key(f, i) for i in range(self.nkeys)]
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX109A/IX112A sequential
+        # WRITE status order]: the C runtime checks the ascending-sequence
+        # condition (status 21) BEFORE the duplicate-key condition (status 22),
+        # with a STRICT comparison - indexed_write (fileio.c L3305):
+        #     else if (f->access_mode == COB_ACCESS_SEQUENTIAL
+        #              && memcmp (p->last_key, p->key.data, p->key.size) > 0)
+        #         return COB_STATUS_21_KEY_INVALID;   (last > cur, i.e. cur < last)
+        # The previous order (duplicate first, and a non-strict "<=") returned
+        # status 22 for an out-of-ascending-sequence key that also already
+        # existed, where COBOL requires status 21.
+        if f.access_mode == common.COB_ACCESS_SEQUENTIAL:
+            if self._last_pkey is not None and keyvals[0] < self._last_pkey:
+                return COB_STATUS_21_KEY_INVALID
+            self._last_pkey = keyvals[0]
         if self.conn.execute("SELECT 1 FROM recs WHERE k0 = ? LIMIT 1",
                              (keyvals[0],)).fetchone():
             return COB_STATUS_22_KEY_EXISTS
@@ -1624,10 +1758,6 @@ class _IndexedSqlite(object):
                 if self.conn.execute("SELECT 1 FROM recs WHERE k%d = ? LIMIT 1"
                                      % i, (keyvals[i],)).fetchone():
                     return COB_STATUS_22_KEY_EXISTS
-        if f.access_mode == common.COB_ACCESS_SEQUENTIAL:
-            if self._last_pkey is not None and keyvals[0] <= self._last_pkey:
-                return COB_STATUS_21_KEY_INVALID
-            self._last_pkey = keyvals[0]
         rec = bytes(f.record.data[:f.record.size])
         cols = ", ".join("k%d" % i for i in range(self.nkeys))
         marks = ", ".join("?" for _ in range(self.nkeys))
@@ -1644,11 +1774,25 @@ class _IndexedSqlite(object):
 
     def rewrite(self, f, opt):
         keyvals = [_record_key(f, i) for i in range(self.nkeys)]
-        row = self.conn.execute("SELECT seq FROM recs WHERE k0 = ?",
-                               (keyvals[0],)).fetchone()
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX119A REWRITE wrong-key]:
+        # in SEQUENTIAL access mode the REWRITE acts on the record positioned by
+        # the preceding READ, so the primary key in the record area must equal
+        # that record's key (the C runtime positions the delete via the cursor's
+        # current key; a changed prime key collides/violates the standard).
+        # Reject a changed prime key with status 21; alternate-key changes on the
+        # same primary key remain valid.
+        if (f.access_mode == common.COB_ACCESS_SEQUENTIAL
+                and self._last_read_pkey is not None
+                and keyvals[0] != self._last_read_pkey):
+            return COB_STATUS_21_KEY_INVALID
+        allcols = ", ".join("k%d" % i for i in range(self.nkeys))
+        row = self.conn.execute(
+            "SELECT seq, %s FROM recs WHERE k0 = ?" % allcols,
+            (keyvals[0],)).fetchone()
         if row is None:
             return COB_STATUS_23_KEY_NOT_EXISTS
         seq = row[0]
+        old_keyvals = [bytes(v) for v in row[1:]]
         for i in range(1, self.nkeys):
             if not f.keys[i].flag:
                 clash = self.conn.execute(
@@ -1656,10 +1800,37 @@ class _IndexedSqlite(object):
                     (keyvals[i], keyvals[0])).fetchone()
                 if clash:
                     return COB_STATUS_22_KEY_EXISTS
+        # QA-FIX [Rule #7 emitter<->runtime contract; IX215A START on a
+        # duplicate alternate key].  GnuCOBOL stores duplicate alternate keys
+        # with Berkeley DB ``DB_DUP`` (fileio.c L1999), i.e. in INSERTION order,
+        # NOT sorted.  On REWRITE the C runtime deletes and re-inserts the
+        # secondary entry of every CHANGED alternate key (indexed_delete_internal
+        # skips unchanged secondaries via ``rewrite_sec_key``), which appends the
+        # record to the END of that key's duplicate chain.  An in-place UPDATE
+        # preserves the original ``seq`` and would keep the record at its old
+        # position, so READ NEXT after a START on the duplicate key returned the
+        # records in the wrong order.  Mirror DB_DUP: if a duplicate-capable
+        # alternate key actually changed, re-assign ``seq`` (delete + re-insert,
+        # giving a fresh AUTOINCREMENT id) so the record moves to the chain tail.
+        # The primary key and any unique alternate keys are ordered by value, so
+        # the ``seq`` tie-break only affects duplicate chains - exactly as in C.
+        moved = False
+        for i in range(1, self.nkeys):
+            if f.keys[i].flag and keyvals[i] != old_keyvals[i]:
+                moved = True
+                break
         rec = bytes(f.record.data[:f.record.size])
-        sets = "rec = ?, " + ", ".join("k%d = ?" % i for i in range(self.nkeys))
-        self.conn.execute("UPDATE recs SET %s WHERE seq = ?" % sets,
-                          (rec, *keyvals, seq))
+        if moved:
+            self.conn.execute("DELETE FROM recs WHERE seq = ?", (seq,))
+            cols = ", ".join("k%d" % i for i in range(self.nkeys))
+            marks = ", ".join("?" for _ in range(self.nkeys))
+            self.conn.execute("INSERT INTO recs (rec, %s) VALUES (?, %s)"
+                              % (cols, marks), (rec, *keyvals))
+        else:
+            sets = "rec = ?, " + ", ".join("k%d = ?" % i
+                                           for i in range(self.nkeys))
+            self.conn.execute("UPDATE recs SET %s WHERE seq = ?" % sets,
+                              (rec, *keyvals, seq))
         # QA F-PERF F5 migration: no per-REWRITE commit (see ``write``); the
         # update is visible on this connection immediately and is flushed at the
         # ``cob_sync`` / ``cob_close`` / COMMIT boundaries.
@@ -1710,6 +1881,7 @@ class _IndexedSqlite(object):
         self._lastcol = colval
         self._lastseq = seq
         self._pending_seq = None
+        self._last_read_pkey = _record_key(f, 0)  # IX119A: REWRITE key check
         return COB_STATUS_00_SUCCESS
 
     def read_next(self, f, read_opts):
@@ -1730,6 +1902,7 @@ class _IndexedSqlite(object):
         self._lastseq = seq
         f.record.data[0:len(rec)] = rec
         f.record.size = len(rec)
+        self._last_read_pkey = _record_key(f, 0)  # IX119A: REWRITE key check
         # Duplicate alternate key ahead -> status 02 (fileio.c read_next).
         if k > 0:
             nxt = self._next_row(k, colval, seq, previous)
@@ -2455,7 +2628,7 @@ def cob_file_sort_init(f, nkeys, collating_sequence, sort_return, fnstatus):
     """Initialise a SORT/MERGE work area (port of fileio.c L5649-L5674)."""
     p = _cobsort(f, fnstatus, sort_return)
     if sort_return is not None:
-        _cob_set_int(sort_return, 0)
+        _set_sort_return(sort_return, 0)
     f.file = p
     f.keys = cob_file_key_array(nkeys)
     f.nkeys = 0
@@ -2667,7 +2840,7 @@ def cob_file_sort_giving(sort_file, varcnt, *fbase):
             else:
                 hp = sort_file.file
                 if hp is not None and hp.sort_return is not None:
-                    _cob_set_int(hp.sort_return, 16)
+                    _set_sort_return(hp.sort_return, 16)
                 sort_file.file_status[0] = ord("3")
                 sort_file.file_status[1] = ord("0")
             break
@@ -2717,7 +2890,7 @@ def cob_file_release(f):
         save_status(f, COB_STATUS_00_SUCCESS, fnstatus)
     else:
         if p is not None and p.sort_return is not None:
-            _cob_set_int(p.sort_return, 16)
+            _set_sort_return(p.sort_return, 16)
         save_status(f, COB_STATUS_30_PERMANENT_ERROR, fnstatus)
 
 
@@ -2732,7 +2905,7 @@ def cob_file_return(f):
         save_status(f, COB_STATUS_10_END_OF_FILE, fnstatus)
     else:
         if p is not None and p.sort_return is not None:
-            _cob_set_int(p.sort_return, 16)
+            _set_sort_return(p.sort_return, 16)
         save_status(f, COB_STATUS_30_PERMANENT_ERROR, fnstatus)
 
 

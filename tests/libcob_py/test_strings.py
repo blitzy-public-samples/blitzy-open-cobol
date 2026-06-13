@@ -522,6 +522,90 @@ class TestString:
 
 
 # ===========================================================================
+# Emitter <-> runtime contract: the generated code passes the integer 0 (C NULL,
+# from typeck.c's cb_int0) for an OMITTED optional cob_field* argument - NOT the
+# Python ``None`` the direct unit tests above use.  QA FINAL_ALT Issue #4 found
+# that ``strings.cob_string_init(f_12, 0)`` crashed the generated program with
+# ``AttributeError: 'int' object has no attribute 'size'`` because the runtime
+# guarded with ``is not None`` instead of C truthiness ``if (ptr)``.  These tests
+# pin the integer-0 == NULL contract so the regression cannot recur, and confirm
+# an explicit pointer ``cob_field`` is still honoured.
+# ===========================================================================
+class TestEmitterContractZeroPointer:
+    def test_string_init_zero_pointer_does_not_crash(self):
+        # The exact emitted form: STRING with no WITH POINTER -> second arg 0.
+        dst = alnum(".", size=6)
+        strings.cob_string_init(dst, 0)             # 0 == NULL (omitted POINTER)
+        strings.cob_string_delimited(0)             # 0 == DELIMITED BY SIZE
+        strings.cob_string_append(alnum("AB"))
+        strings.cob_string_append(alnum("CD"))
+        strings.cob_string_finish()
+        assert text_of(dst) == "ABCD.."
+        assert common.cob_exception_code == 0
+
+    def test_string_delimited_zero_is_by_size(self):
+        # cob_string_delimited(0) must behave as DELIMITED BY SIZE (no delimiter),
+        # appending the whole source - not crash on the integer 0.
+        dst = alnum(".", size=8)
+        strings.cob_string_init(dst, 0)
+        strings.cob_string_delimited(0)
+        strings.cob_string_append(alnum("A/B/C"))   # whole source, no split
+        strings.cob_string_finish()
+        assert text_of(dst) == "A/B/C..."
+
+    def test_string_init_explicit_pointer_field_still_works(self):
+        # A genuine WITH POINTER field (truthy cob_field) must still seed the
+        # cursor and be written back - the fix must not regress real pointers.
+        dst = alnum(".", size=6)
+        ptr = counter(digits=2, value=3)            # 1-based start at index 2
+        strings.cob_string_init(dst, ptr)
+        strings.cob_string_delimited(0)
+        strings.cob_string_append(alnum("XY"))
+        strings.cob_string_finish()
+        assert text_of(dst) == "..XY.."
+        assert cval(ptr) == 5
+
+    def test_unstring_init_zero_pointer_does_not_crash(self):
+        # UNSTRING with no WITH POINTER -> second arg 0.
+        src = alnum("AB,CD")
+        r1 = alnum(".", size=2)
+        r2 = alnum(".", size=2)
+        strings.cob_unstring_init(src, 0, 1)        # 0 == NULL (omitted POINTER)
+        strings.cob_unstring_delimited(alnum(","), 0)
+        strings.cob_unstring_into(r1, 0, 0)         # 0 == no DELIMITER IN / COUNT IN
+        strings.cob_unstring_into(r2, 0, 0)
+        strings.cob_unstring_finish()
+        assert text_of(r1) == "AB"
+        assert text_of(r2) == "CD"
+
+    def test_unstring_into_zero_dlm_and_cnt_do_not_crash(self):
+        # cob_unstring_into(dst, 0, 0): the omitted DELIMITER IN / COUNT IN
+        # receivers (integer 0) must be treated as "no receiver", not fields.
+        src = alnum("HELLO")
+        r1 = alnum(".", size=5)
+        strings.cob_unstring_init(src, 0, 0)        # DELIMITED BY SIZE
+        strings.cob_unstring_into(r1, 0, 0)
+        strings.cob_unstring_finish()
+        assert text_of(r1) == "HELLO"
+
+    def test_unstring_into_delimiter_and_count_fields_still_work(self):
+        # Explicit DELIMITER IN + COUNT IN fields (truthy) must still receive the
+        # matched delimiter and the moved-character count.
+        src = alnum("AB,CDE")
+        r1 = alnum(".", size=3)
+        dlm_out = alnum(".", size=1)
+        cnt_out = counter(digits=2, value=0)
+        strings.cob_unstring_init(src, 0, 1)
+        strings.cob_unstring_delimited(alnum(","), 0)
+        strings.cob_unstring_into(r1, dlm_out, cnt_out)
+        strings.cob_unstring_finish()
+        # "AB" moved into a 3-char receiver is space-padded (COBOL MOVE semantics).
+        assert text_of(r1) == "AB "
+        assert text_of(dlm_out) == ","
+        assert cval(cnt_out) == 2
+
+
+# ===========================================================================
 # UNSTRING
 # ===========================================================================
 class TestUnstring:

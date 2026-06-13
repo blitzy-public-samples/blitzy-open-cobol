@@ -1711,3 +1711,348 @@ def test_sequential_read_dual_cobc_byte_parity(tmp_path):
     assert out_c == out_py, (
         "sequential-file program output diverged between the C and Python "
         "backends (C1 regression)\nC : %r\nPy: %r" % (out_c, out_py))
+
+
+# ===========================================================================
+# QA Issue 5 (G2 branch coverage) - supplementary tests for fileio.py
+# error/status/lifecycle branches that the happy-path suite did not exercise.
+# These are TEST-ONLY additions; libcob_py/fileio.py behaviour is unchanged.
+# Each test targets specific previously-uncovered branches (open/close/status
+# helpers, WRITE ADVANCING on non-LINAGE files, the C$ filesystem error and
+# parameter-count paths, and the cob_init/exit_fileio environment branches).
+# ===========================================================================
+def test_save_status_fnstatus_and_eop(work_dir):
+    """``save_status`` writes both the connector and the optional fnstatus field,
+    and end-of-page (52) is latched WITHOUT raising an EC-I-O exception."""
+    f = make_file(work_dir / "ss.dat", 4)
+    fn = common.cob_field(2, bytearray(2), _ALNUM)
+
+    # Success path with an fnstatus field present -> "00" in both places.
+    fileio.save_status(f, 0, fn)
+    assert st(f) == "00"
+    assert bytes(fn.data[:2]) == b"00"
+
+    # Error path with fnstatus present -> digits copied + EC-I-O exception set.
+    common.cob_exception_code = 0
+    fileio.save_status(f, 35, fn)
+    assert st(f) == "35"
+    assert bytes(fn.data[:2]) == b"35"
+    assert common.cob_exception_code != 0
+
+    # End-of-page (52): the if-status!=52 guard is FALSE, so no exception is set.
+    common.cob_exception_code = 0
+    fileio.save_status(f, fileio.COB_STATUS_52_EOP, None)
+    assert st(f) == "52"
+    assert common.cob_exception_code == 0
+
+
+def test_cob_sync_variants(work_dir):
+    """``cob_sync`` handles a closed (handle-less) file, a regular file with an
+    OS fsync (mode 2), an INDEXED backend sync, and a SORT no-op."""
+    # handle is None -> early return.
+    f0 = make_file(work_dir / "nosync.dat", 4)
+    f0.file = None
+    fileio.cob_sync(f0, 2)
+
+    # Regular sequential file, mode 2 (flush + os.fsync).
+    f = make_file(work_dir / "syncseq.dat", 4)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    set_rec(f, b"AAAA")
+    fileio.cob_write(f, f.record, 0, None)
+    fileio.cob_sync(f, 2)
+    fileio.cob_close(f, 0, None)
+
+    # INDEXED backend sync (dbm).
+    fi = make_indexed(work_dir / "sync.idx", 8, 4)
+    fileio.cob_open(fi, common.COB_OPEN_OUTPUT, 0, None)
+    fileio.cob_sync(fi, 0)
+    fileio.cob_close(fi, 0, None)
+
+    # SORT organization with a (dummy) handle -> early return after the guard.
+    fs = make_file(work_dir / "sortx.dat", 4)
+    fs.organization = common.COB_ORG_SORT
+    fs.file = object()
+    fileio.cob_sync(fs, 0)
+
+
+def test_cob_file_unlock_variants(work_dir):
+    """``cob_file_unlock`` is a no-op on a CLOSED file and on an open file with
+    no backing handle, and calls the backend unlock on an open INDEXED file."""
+    # Closed file -> early return.
+    fc = make_file(work_dir / "ulck.dat", 4)
+    fc.open_mode = common.COB_OPEN_CLOSED
+    fileio.cob_file_unlock(fc)
+
+    # Open file, no handle -> early return.
+    fo = make_file(work_dir / "ulck2.dat", 4)
+    fo.open_mode = common.COB_OPEN_OUTPUT
+    fo.file = None
+    fileio.cob_file_unlock(fo)
+
+    # Open INDEXED file -> backend unlock call site exercised.
+    fi = make_indexed(work_dir / "ulck.idx", 8, 4)
+    fileio.cob_open(fi, common.COB_OPEN_OUTPUT, 0, None)
+    fileio.cob_file_unlock(fi)
+    fileio.cob_close(fi, 0, None)
+
+
+def test_cob_cache_file_idempotent(work_dir):
+    """``cob_cache_file`` registers a connector at most once."""
+    f = make_file(work_dir / "cache.dat", 4)
+    try:
+        fileio.cob_cache_file(f)
+        fileio.cob_cache_file(f)
+        assert fileio._file_cache.count(f) == 1
+    finally:
+        while f in fileio._file_cache:
+            fileio._file_cache.remove(f)
+
+
+def test_cob_file_write_opt_non_linage(work_dir):
+    """WRITE ADVANCING on a non-LINAGE sequential file: PAGE emits a form feed
+    and LINES emits blank lines (the non-LINAGE branch of cob_file_write_opt)."""
+    f = make_file(work_dir / "advance.dat", 4)
+    assert not (f.flag_select_features & common.COB_SELECT_LINAGE)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    assert fileio.cob_file_write_opt(f, common.COB_WRITE_PAGE) == 0
+    assert fileio.cob_file_write_opt(f, common.COB_WRITE_LINES | 3) == 0
+    fileio.cob_close(f, 0, None)
+    data = (work_dir / "advance.dat").read_bytes()
+    assert b"\f" in data
+    assert data.count(b"\n") >= 3
+
+
+def test_acuw_param_count_and_oserror(work_dir):
+    """C$ helpers honour the COB_CHK_PARMS count and map OS failures / None
+    fields / status-less calls to their documented return codes."""
+    src = work_dir / "p.dat"
+    src.write_bytes(b"data")
+    dst = work_dir / "pcopy.dat"
+    info = common.cob_field(16, bytearray(16), _ALNUM)
+
+    # Parameter-count short -> 128 (copyfile needs 3, file_info/delete need 2).
+    saved_params = getattr(common, "cob_call_params", 0)
+    try:
+        common.cob_call_params = 1
+        assert fileio.cob_acuw_copyfile(char_field(str(src)),
+                                        char_field(str(dst)), None) == 128
+        assert fileio.cob_acuw_file_info(char_field(str(src)), info) == 128
+        assert fileio.cob_acuw_file_delete(char_field(str(src)), None) == 128
+    finally:
+        common.cob_call_params = saved_params
+
+    # None file fields -> 128.
+    assert fileio.cob_acuw_file_info(None, info) == 128
+    assert fileio.cob_acuw_file_delete(None, None) == 128
+
+    # OS failures on valid, safe paths: copying/removing a directory raises.
+    adir = work_dir / "adir_copy"
+    adir.mkdir()
+    assert fileio.cob_acuw_copyfile(char_field(str(adir)),
+                                    char_field(str(dst)), None) == 128
+    assert fileio.cob_acuw_file_delete(char_field(str(adir)), None) == 128
+
+    # chdir with status=None: success branch returns 0 without touching status.
+    start = os.getcwd()
+    try:
+        assert fileio.cob_acuw_chdir(char_field(str(work_dir)), None) == 0
+    finally:
+        os.chdir(start)
+    # chdir OS failure (target is a regular file) with status=None -> 128.
+    afile = work_dir / "notadir.dat"
+    afile.write_bytes(b"x")
+    assert fileio.cob_acuw_chdir(char_field(str(afile)), None) == 128
+
+
+def test_init_fileio_env_branches(monkeypatch):
+    """``cob_init_fileio`` honours COB_SYNC=P (=2), ignores a non-numeric
+    COB_SORT_MEMORY, treats a leading-space COB_FILE_PATH as unset, and reads
+    COB_LS_NULLS / COB_LS_FIXED."""
+    saved = (fileio.cob_do_sync, fileio.cob_sort_memory, fileio.cob_file_path,
+             fileio.cob_ls_nulls, fileio.cob_ls_fixed)
+    try:
+        monkeypatch.setenv("COB_SYNC", "P")
+        monkeypatch.setenv("COB_SORT_MEMORY", "not-an-int")
+        monkeypatch.setenv("COB_FILE_PATH", " leading-space")
+        monkeypatch.setenv("COB_LS_NULLS", "1")
+        monkeypatch.setenv("COB_LS_FIXED", "1")
+        before_mem = fileio.cob_sort_memory
+        fileio.cob_init_fileio()
+        assert fileio.cob_do_sync == 2                 # "P" -> periodic sync
+        assert fileio.cob_sort_memory == before_mem    # invalid int -> unchanged
+        assert fileio.cob_file_path is None            # leading space -> unset
+        assert fileio.cob_ls_nulls == "1"
+        assert fileio.cob_ls_fixed == "1"
+    finally:
+        (fileio.cob_do_sync, fileio.cob_sort_memory, fileio.cob_file_path,
+         fileio.cob_ls_nulls, fileio.cob_ls_fixed) = saved
+
+
+def test_exit_fileio_implicit_close_with_assign(work_dir, capsys):
+    """``cob_exit_fileio`` implicitly closes a connector left open, decoding the
+    ASSIGN field for the diagnostic when present."""
+    f = make_file(work_dir / "leftopen.dat", 4)
+    f.select_name = "LEFTOPEN"
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    # Set the ASSIGN field AFTER opening so cob_exit_fileio takes the decode path.
+    f.assign = char_field("LEFTOPEN-ASSIGN")
+    assert f.open_mode != common.COB_OPEN_CLOSED
+    fileio.cob_exit_fileio()
+    assert f.open_mode == common.COB_OPEN_CLOSED
+    assert "Implicit CLOSE" in capsys.readouterr().err
+
+
+# ===========================================================================
+# Regression coverage for the COBOL-85 (NIST CCVS85) indexed-I/O fixes.
+# These exercise the emitter<->runtime status-contract and cursor-positioning
+# branches added for IX109A/IX112A (sequential WRITE status order), IX119A
+# (SEQUENTIAL REWRITE wrong prime key), IX103A/IX203A (DELETE during sequential
+# traversal) and IX215A (duplicate alternate-key REWRITE reorder), across both
+# the single-key ``dbm`` backend and the alternate-key ``sqlite3`` backend.
+# ===========================================================================
+def _build_indexed(path, payloads, recsize, keylen, **kw):
+    """Create and populate an indexed file with *payloads*, then close it."""
+    f = make_indexed(path, recsize, keylen, **kw)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    for p in payloads:
+        set_rec(f, p)
+        fileio.cob_write(f, f.record, 0, None)
+    fileio.cob_close(f, common.COB_CLOSE_NORMAL, None)
+    return f
+
+
+def test_indexed_dbm_sequential_write_status_order(work_dir):
+    """SEQUENTIAL-access WRITE must report status 21 (key out of ascending
+    sequence) BEFORE status 22 (duplicate) - IX109A/IX112A.  The dbm backend
+    checks the strict ascending-sequence condition first."""
+    f = make_indexed(work_dir / "ix_seqwr", 6, keylen=3,
+                     access=common.COB_ACCESS_SEQUENTIAL)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    set_rec(f, b"BBBxy")
+    fileio.cob_write(f, f.record, 0, None)
+    assert st(f) == "00"
+    # A lower key after a higher one violates ascending sequence -> 21 (not 22).
+    set_rec(f, b"AAAxy")
+    fileio.cob_write(f, f.record, 0, None)
+    assert st(f) == "21"
+    fileio.cob_close(f, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_dbm_sequential_rewrite_wrong_key_is_21(work_dir):
+    """A SEQUENTIAL-access REWRITE whose record-area prime key differs from the
+    last record READ is rejected with status 21 (IX119A); an unchanged key
+    rewrites successfully."""
+    path = work_dir / "ix_seqrw"
+    _build_indexed(path, [b"AAA001", b"BBB002", b"CCC003"], 6, keylen=3)
+    g = make_indexed(path, 6, keylen=3, access=common.COB_ACCESS_SEQUENTIAL)
+    _open_io(g)
+    fileio.cob_read(g, None, None, common.COB_READ_NEXT)        # -> AAA
+    assert st(g) == "00" and bytes(g.record.data[:3]) == b"AAA"
+    # Changed prime key -> 21.
+    set_rec(g, b"ZZZ999")
+    fileio.cob_rewrite(g, g.record, 0, None)
+    assert st(g) == "21"
+    # Same prime key -> 00.
+    fileio.cob_read(g, None, None, common.COB_READ_NEXT)        # -> BBB
+    assert st(g) == "00" and bytes(g.record.data[:3]) == b"BBB"
+    set_rec(g, b"BBB777")
+    fileio.cob_rewrite(g, g.record, 0, None)
+    assert st(g) == "00"
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_dbm_delete_during_sequential_traversal(work_dir):
+    """Deleting records mid-traversal must not skip the records that shift into
+    the freed slots - IX103A/IX203A.  Every one of the 10 records is seen
+    exactly once even though every 3rd is deleted as the scan proceeds."""
+    path = work_dir / "ix_deltrav"
+    payloads = [("K%02d" % i).encode() + b"_v" for i in range(10)]
+    _build_indexed(path, payloads, 6, keylen=3)
+    g = make_indexed(path, 6, keylen=3)
+    _open_io(g)
+    seen = []
+    while True:
+        fileio.cob_read(g, None, None, common.COB_READ_NEXT)
+        if st(g) == "10":
+            break
+        assert st(g) == "00"
+        seen.append(bytes(g.record.data[:3]))
+        if len(seen) % 3 == 0:
+            fileio.cob_delete(g, None)
+            assert st(g) == "00"
+    assert seen == [("K%02d" % i).encode() for i in range(10)]
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_dbm_read_previous_after_delete(work_dir):
+    """Descending traversal (READ PREVIOUS) is equally delete-safe: after the
+    current record is deleted, the prior record is returned, never skipped."""
+    path = work_dir / "ix_delprev"
+    payloads = [("K%02d" % i).encode() + b"_v" for i in range(6)]
+    _build_indexed(path, payloads, 6, keylen=3)
+    g = make_indexed(path, 6, keylen=3)
+    _open_io(g)
+    # Position at the last record via a keyed READ, then walk backward deleting.
+    set_search_key(g.keys[0].field, b"K05")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "00"
+    fileio.cob_delete(g, None)        # delete K05 (the served record)
+    assert st(g) == "00"
+    fileio.cob_read(g, None, None, common.COB_READ_PREVIOUS)
+    assert st(g) == "00" and bytes(g.record.data[:3]) == b"K04"
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_sqlite_sequential_write_and_rewrite_status(work_dir):
+    """The alternate-key (sqlite3) backend mirrors the same SEQUENTIAL WRITE
+    status order (21 before 22) and SEQUENTIAL REWRITE wrong-key (21) contract
+    as the dbm backend."""
+    # nkeys=2 routes to sqlite; alt key at offset 5, WITH DUPLICATES.
+    f = make_indexed(work_dir / "ix_sq_seq", 10, keylen=3, nkeys=2,
+                     altlen=3, altoff=5, dup_alt=True,
+                     access=common.COB_ACCESS_SEQUENTIAL)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    set_rec(f, b"BBB  XX001")
+    fileio.cob_write(f, f.record, 0, None)
+    assert st(f) == "00"
+    set_rec(f, b"AAA  XX002")          # out of ascending sequence -> 21
+    fileio.cob_write(f, f.record, 0, None)
+    assert st(f) == "21"
+    fileio.cob_close(f, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_sqlite_dup_alt_rewrite_reorder(work_dir):
+    """Changing a duplicate alternate key via REWRITE moves the record to the
+    tail of the new key's duplicate chain (Berkeley DB DB_DUP insertion order),
+    which the sqlite backend reproduces by delete+reinsert (IX215A)."""
+    path = work_dir / "ix_sq_dup"
+    # Two records initially share alt key "DUP"; primaries P01/P02.
+    _build_indexed(path, [b"P01  DUPaa", b"P02  DUPbb", b"P03  OTHcc"],
+                   10, keylen=3, nkeys=2, altlen=3, altoff=5, dup_alt=True)
+    g = make_indexed(path, 10, keylen=3, nkeys=2, altlen=3, altoff=5,
+                     dup_alt=True)
+    _open_io(g)
+    # READ P03, then REWRITE it to also carry the duplicate alt key "DUP".
+    set_search_key(g.keys[0].field, b"P03")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "00"
+    set_rec(g, b"P03  DUPcc")          # alt key OTH -> DUP (a duplicate now)
+    fileio.cob_rewrite(g, g.record, 0, None)
+    assert st(g) == "00"
+    # START on the duplicate alt key and walk the chain; P03 must appear last
+    # (appended), after P01 and P02 which were inserted earlier.
+    set_search_key(g.keys[1].field, b"DUP")
+    fileio.cob_start(g, common.COB_EQ, g.keys[1].field, None)
+    assert st(g) == "00"
+    chain = []
+    for _ in range(3):
+        fileio.cob_read(g, None, None, common.COB_READ_NEXT)
+        # Reading along a duplicate alternate-key chain yields status 02
+        # (SUCCESS-DUPLICATE) while more duplicates lie ahead, then 00 on the
+        # last of the chain; anything else (e.g. 10) ends the chain.
+        if st(g) not in ("00", "02"):
+            break
+        chain.append(bytes(g.record.data[:3]))
+    assert chain[:2] == [b"P01", b"P02"]
+    assert b"P03" in chain and chain.index(b"P03") == len(chain) - 1
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)

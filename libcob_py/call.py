@@ -203,6 +203,64 @@ def cob_set_cancel(name, entry, cancel):
     insert(name, entry, cancel)
 
 
+def _locate_on_resolve_paths(modname):
+    """Find a generated module file for *modname* on the resolver search paths.
+
+    QA FIX (Issue G1 - inter-program CALL resolution).  Mirrors the C resolver's
+    ``resolve_path[]`` scan for a ``<name>.so`` before ``lt_dlopen`` (call.c).
+    ``cobc -m`` packages each compiled COBOL unit as a self-contained
+    ``<PROGRAM-ID>.pyz`` zip archive whose *internal* module is named after the
+    PROGRAM-ID; such an archive is NOT importable merely because its containing
+    directory is on ``sys.path`` - the archive file itself must be a ``sys.path``
+    entry for zipimport to expose the module inside it.  This helper scans the
+    ordered resolve paths (and the current directory, which the C resolver also
+    searches) for ``<modname>.pyz`` (``COB_MODULE_EXT``) first, then a plain
+    ``<modname>.py``, returning the path that must be placed on ``sys.path`` to
+    make ``import <modname>`` succeed - or ``None`` when no candidate exists.
+    """
+    # Search order mirrors the C resolve_path[]: the configured COB_LIBRARY_PATH
+    # entries (already captured in _resolve_paths) followed by the current
+    # directory (the C runtime's implicit "." search and the default
+    # COB_LIBRARY_PATH = ".").
+    search_dirs = list(_resolve_paths)
+    if "." not in search_dirs:
+        search_dirs.append(".")
+    for ext in (COB_MODULE_EXT, "py"):
+        for d in search_dirs:
+            cand = os.path.join(d, modname + "." + ext)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _locate_in_loaded_modules(encoded):
+    """Find an entry callable named *encoded* among already-loaded modules.
+
+    QA FIX (COBOL-85 gate - sibling / same-source-file program CALL).  When a
+    single COBOL source file declares several sequential programs - e.g. the
+    NIST ``IC222A`` unit, whose source contains ``PROGRAM-ID. IC222A`` ...
+    ``END PROGRAM IC222A`` immediately followed by ``PROGRAM-ID. IC222A-1`` -
+    the code generator emits ALL of them as separate ``def`` entries inside ONE
+    generated module (here ``IC222A`` and the encoded ``IC222A__1``).  This
+    mirrors the C backend, which links every program of a compilation unit into
+    a single object file.  A ``CALL "IC222A-1"`` therefore has NO standalone
+    ``IC222A__1`` module on disk to import; the C resolver instead satisfies it
+    from the statically-linked sibling's registered entry point.  This helper
+    reproduces that resolution path by scanning the modules already loaded in
+    this run for a callable attribute named after the encoded program-id and
+    returning it (or ``None``).  Encoded COBOL program-ids are unique within a
+    run, so a match is unambiguous; the per-resolve scan happens at most once
+    per sibling because the result is then cached by :func:`cob_resolve`.
+    """
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        func = getattr(mod, encoded, None)
+        if callable(func):
+            return func
+    return None
+
+
 def cob_resolve(name):
     """Resolve a COBOL program *name* to its Python entry callable (call.c L321).
 
@@ -225,9 +283,44 @@ def cob_resolve(name):
         importlib.invalidate_caches()
         module = importlib.import_module(modname)
     except ImportError:
-        _resolve_error = "Cannot find module '%s'" % name
-        common.cob_set_exception(common.COB_EC_PROGRAM_NOT_FOUND)
-        return None
+        # QA FIX (Issue G1 - inter-program CALL resolution): a CALLed subprogram
+        # compiled with "cobc -m" is a self-contained "<PROGRAM-ID>.pyz" archive
+        # sitting in a COB_LIBRARY_PATH directory (or "."), not a module already
+        # importable by name.  importlib will not import it unless the archive
+        # itself is a sys.path entry (zipimport), so - mirroring the C resolver's
+        # resolve_path[] scan for "<name>.so" before lt_dlopen - locate
+        # "<modname>.pyz" (or a plain "<modname>.py") on the resolve paths, put
+        # it on sys.path, and retry the import exactly once.
+        module = None
+        archive = _locate_on_resolve_paths(modname)
+        if archive is not None:
+            if archive.endswith("." + COB_MODULE_EXT):
+                entry = archive                      # the .pyz file (zipimport)
+            else:
+                entry = os.path.dirname(archive) or "."   # dir holding the .py
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+            try:
+                importlib.invalidate_caches()
+                module = importlib.import_module(modname)
+            except ImportError:
+                module = None
+        if module is None:
+            # QA FIX (COBOL-85 gate - sibling program CALL): a program that
+            # shares its source file with the caller has NO standalone module on
+            # disk to import (the code generator emits sibling programs as
+            # separate entries inside the caller's own module).  Before
+            # declaring the program unresolvable, mirror the C resolver locating
+            # a statically-linked sibling: search the already-loaded modules for
+            # the encoded entry and, when present, cache and return it.
+            sibling = _locate_in_loaded_modules(encoded)
+            if sibling is not None:
+                insert(name, sibling, None)
+                _resolve_error = None
+                return sibling
+            _resolve_error = "Cannot find module '%s'" % name
+            common.cob_set_exception(common.COB_EC_PROGRAM_NOT_FOUND)
+            return None
 
     # The entry point is the attribute named after the encoded program-id
     # (the def the code generator emitted); fall back to a conventional
@@ -290,7 +383,28 @@ def cobcancel(name):
         return
     cancel = _cancel_handlers.get(name)
     if cancel is not None and callable(cancel):
-        cancel(-1, None, None, None, None, None, None, None, None)
+        # QA FIX (emitter<->runtime CANCEL contract, surfaced by the COBOL-85
+        # acceptance gate; same contract family as the STRING fix in
+        # strings.py).  The code generator emits every program entry with a
+        # leading control selector and a "if _entry < 0:" CANCEL-cleanup branch
+        # (codegen.c output_entry), and registers that entry as its OWN cancel
+        # handler via ``call.cob_set_cancel(name, entry, entry_)``.  The C
+        # runtime fires the cancel handler through a varargs prototype
+        # ``int (*cancel_func)(int, ...)`` and pads the call with eight NULLs
+        # (call.c L501-L504) -- C varargs silently discards the surplus
+        # arguments, so only the leading ``-1`` control selector is observed by
+        # the cleanup branch.  The generated *Python* entry, however, has a
+        # FIXED arity (``def P_(_entry, <using>=None, ...)``), so replaying the
+        # C nine-argument idiom raised ``TypeError: P_() takes from 1 to N
+        # positional arguments but 9 were given``.  Invoke the handler with only
+        # the control selector ``-1`` (the cleanup branch ignores the USING
+        # operands, which default to ``None``); a residual arity mismatch is
+        # non-fatal because the authoritative Python CANCEL is the module
+        # eviction performed immediately below (del sys.modules + invalidate).
+        try:
+            cancel(-1)
+        except TypeError:
+            pass
     # Evict from the call cache, the cancel-handler table, and the import system
     # together (the C ``struct call_hash`` held func + cancel as one entry).
     _call_cache.pop(name, None)

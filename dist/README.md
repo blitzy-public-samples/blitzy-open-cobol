@@ -79,6 +79,19 @@ At run time the archive is placed on `sys.path` — e.g. via `COB_LIBRARY_PATH`,
 honored by `libcob_py/call.py` — so the emitted COBOL `.py` modules can
 `import libcob_py` / `from libcob_py import …`.
 
+## Security note: the `SYSTEM` routine
+
+The COBOL `SYSTEM` / `CALL "SYSTEM"` service in `libcob_py/system.py` is defined
+by the language to hand its operand to the host command processor (`/bin/sh -c
+<command>`), exactly mirroring the original C runtime's `system()` call. A full
+command line — pipes, redirection, `&&` — is therefore a **legitimate and
+required** feature, so shell metacharacters execute by design. `SYSTEM` is a
+**trusted-command-only** facility: the command text must originate in the
+running COBOL program (the same trust boundary as the original toolchain) and
+**must not** be assembled from untrusted external input (CWE-78, OS command
+injection). See the `SYSTEM` docstring in `libcob_py/system.py` for the full
+rationale and the NUL-truncation / length-cap hardening that is applied.
+
 ---
 
 Part of GNU Cobol. The packaged runtime replaces the C `libcob` run-time library.
