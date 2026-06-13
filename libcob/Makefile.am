@@ -20,15 +20,31 @@
 # You should have received a copy of the GNU General Public License
 # along with GNU Cobol.  If not, see <http://www.gnu.org/licenses/>.
 
-lib_LTLIBRARIES = libcob.la
-libcob_la_SOURCES = common.c call.c strings.c move.c numeric.c \
+# MIGRATION (C→Python): The C runtime shared library libcob.la is NO LONGER BUILT.
+# The GNU Cobol runtime has been re-implemented as the pure-Python, standard-library
+# package libcob_py/ (added to the top-level SUBDIRS; see AAP §0.1.1/§0.4.1). The C
+# sources in this directory are RETAINED AS REFERENCE ONLY: they remain the
+# authoritative semantic source for the libcob_py re-implementation and are still
+# shipped in the distribution (EXTRA_DIST below), but they are NOT compiled or linked.
+#
+# Original C runtime build target (DISABLED — preserved as documentation of what was
+# removed and why; do NOT re-enable without restoring the full C backend):
+#   lib_LTLIBRARIES = libcob.la
+#   libcob_la_SOURCES = common.c call.c strings.c move.c numeric.c \
+#       intrinsic.c fileio.c termio.c screenio.c
+#   libcob_la_CFLAGS = $(AM_CFLAGS) $(LIBCOB_CFLAGS) -I$(top_srcdir)
+#   libcob_la_LIBADD = $(LIBCOB_LIBS)
+#   libcob_la_LDFLAGS = -version-info 1:0:0 -no-undefined
+#   AM_LDFLAGS = $(COB_FIX_LIB)
+
+# MIGRATION (C→Python): retain the C runtime sources (and the internal header
+# coblocal.h) in the distribution as reference material, without compiling them.
+EXTRA_DIST = coblocal.h \
+	common.c call.c strings.c move.c numeric.c \
 	intrinsic.c fileio.c termio.c screenio.c
-
-libcob_la_CFLAGS = $(AM_CFLAGS) $(LIBCOB_CFLAGS) -I$(top_srcdir)
-libcob_la_LIBADD = $(LIBCOB_LIBS)
-libcob_la_LDFLAGS = -version-info 1:0:0 -no-undefined
-AM_LDFLAGS = $(COB_FIX_LIB)
-
-EXTRA_DIST = coblocal.h
+# MIGRATION (C→Python): the public headers below document the cob_* API surface that
+# the pure-Python libcob_py package mirrors; they are retained for reference and are
+# still installed (this header install is the meaningful work that keeps libcob/ in
+# the top-level SUBDIRS).
 pkgincludedir = $(includedir)/libcob
 pkginclude_HEADERS = common.h exception.def codegen.h system.def

@@ -20,6 +20,44 @@
    Boston, MA 02110-1301 USA
 */
 
+/*
+   ============================================================================
+   MIGRATION (C -> Python backend)
+   ============================================================================
+   This code generator has been re-targeted from emitting C source text to
+   emitting Python 3.11+ source text that targets the "libcob_py" runtime
+   package, instead of C source text that targeted "libcob.h".
+
+   Contract summary:
+     * One self-contained ".py" module is emitted per COBOL compilation unit
+       (the former three-stream model -- ".c" + storage ".h" + local ".l.h" --
+       is collapsed into a single Python module stream).
+     * Every emitted "cob_*" call-site is emitted as a module-qualified
+       "libcob_py.<module>.<fn>(...)" call.  The module is resolved by
+       codegen_pymod() below, following the libcob source file each routine
+       lives in (common/numeric/move/strings/intrinsic/fileio/call/screenio/
+       termio/system).  Names whose module cannot be determined are routed
+       through the "libcob_py" facade so no symbol is ever emitted bare.
+     * Numeric byte-layout parity with the former C runtime is preserved: the
+       immutable front-end field layout (field.c) is consumed unchanged and the
+       identical cob_field_attr (type/digits/scale/flags/pic) and data
+       offsets/sizes are emitted, so the libcob_py runtime can reproduce the
+       same bytes for every USAGE/PICTURE.
+     * Data storage becomes a Python "bytearray" backing store; a data
+       reference becomes a "memoryview(b_N)[offset:]" sharing that buffer
+       (mutable, byte-exact).  Fields/attrs become common.cob_field(...) /
+       common.cob_field_attr(...) constructor calls.
+     * Procedure-division control flow (paragraphs/sections, GO TO and PERFORM)
+       is reproduced with a recursive segmented dispatch model -- see the
+       MIGRATION note on output_internal_function().
+
+   IMMUTABLE IDENTITY: this file REMAINS a C source compiled into the "cobc"
+   binary (it is NOT itself Python).  The public entry point
+   "void codegen (struct cb_program *prog, const int nested)" and the
+   "#include \"libcob/system.def\"" system-routine table are preserved.
+   ============================================================================
+*/
+
 
 #include "config.h"
 
@@ -44,6 +82,13 @@
 #define COB_USE_SETJMP		0
 #define COB_MAX_SUBSCRIPTS	16
 
+/* MIGRATION (C -> Python): Python uses indentation (not braces) to delimit
+   blocks, so every nesting level must add a UNIFORM number of leading spaces.
+   COB_PY_INDENT is that fixed unit; output_block_open()/output_block_close()
+   and the reworked output_indent() are the only places that change the
+   emitted indentation level. */
+#define COB_PY_INDENT		4
+
 #define INITIALIZE_NONE		0
 #define INITIALIZE_ONE		1
 #define INITIALIZE_DEFAULT	2
@@ -56,12 +101,27 @@ static int			inside_stack[64];
 #endif
 static int			param_id = 0;
 static int			stack_id = 0;
+/* QA-FIX (G1/IC222A..IC237A file-status-48): per-source-file program counter
+   used to namespace NON-global, NON-external file-handle module globals so two
+   sequential/nested programs declaring a file with the same COBOL name (e.g.
+   PRINT-FILE) do not collide on one shared "h_<name>" global.  In C each
+   program owns a function-local "static cob_file *" (emitted into its own
+   .lN.h), so they never collide; the Python lowering must reproduce that
+   per-program ownership.  Reset to 0 for each outermost program (nested == 0);
+   the first program (id 0) keeps the unsuffixed name so single-program output
+   is byte-for-byte unchanged. */
+static int			file_namespace_id = 0;
 static int			num_cob_fields = 0;
 static int			loop_counter = 0;
 static int			progid = 0;
+/* MIGRATION (C->Python): set when a main program is generated so codegen()
+   can emit the "if __name__ == \"__main__\":" trigger AFTER the module data is
+   flushed (when every referenced name already exists). */
+static int			gen_main_trigger = 0;
 static int			last_line = 0;
 static int			needs_exit_prog = 0;
-static int			need_double = 0;
+/* MIGRATION (C -> Python): the former "need_double" double-cast flag was dead
+   (always 0) and its only consumers in output_integer() have been removed. */
 static int			gen_ebcdic = 0;
 static int			gen_ebcdic_ascii = 0;
 static int			gen_full_ebcdic = 0;
@@ -74,6 +134,108 @@ static int			i_counters[COB_MAX_SUBSCRIPTS];
 
 static int			output_indent_level = 0;
 static FILE			*output_target;
+
+/* MIGRATION (C -> Python): empty-suite tracking.  Python forbids an empty
+   block body -- a "def f():", "if x:", "for i in ...:", etc. MUST be followed
+   by at least one indented statement, otherwise the source is a SyntaxError.
+   The C backend had no such rule (an empty "{}" or a lone ";" was legal).  We
+   therefore track, for each currently-open Python block, whether any body
+   content has been emitted into it.  When a block is closed with no content,
+   output_block_close() emits a single "pass" statement so the suite is valid.
+   block_content_stack[d] is 1 once the block at depth d has received a line;
+   block_depth is the count of currently-open blocks. */
+#define COB_PY_MAX_BLOCK_DEPTH	256
+static int			block_content_stack[COB_PY_MAX_BLOCK_DEPTH];
+static int			block_depth = 0;
+
+/* MIGRATION (C -> Python): control-flow segmentation state.  The C backend
+   emitted procedure code as a flat instruction stream with C labels "l_N:"
+   and goto.  Python has neither labels nor goto, so the procedure body is
+   emitted as a recursive dispatch function _dispatch(_pc, _through) whose
+   body is a sequence of "if _pc == <label-id>:" segments.  output_segment_open
+   tracks whether a segment block is currently open so the next need_begin
+   LABEL can first emit the fall-through ("_pc = <id>; continue") and close the
+   prior segment before opening its own.  The dispatch skeleton, the _CobGoto /
+   _CobExit / _CobPerformExit helper exceptions, and the program-exit cleanup
+   are emitted by the function wrapper (output_internal_function). */
+static int			output_segment_open = 0;
+
+/* MIGRATION (C -> Python): stack of cycle-label ids for the inline PERFORM
+   loops (TIMES / UNTIL / FOREVER) currently being emitted.  EXIT PERFORM CYCLE
+   is lowered by the front-end (parser.y) to a GO TO targeting the innermost
+   inline PERFORM's cycle_label, which sits at the END of the loop body.  In C
+   that GO TO simply jumped forward to a label still inside the for/while loop,
+   so control naturally fell through to the next iteration.  In Python a GO TO
+   normally becomes "raise _CobGoto(<id>)" which is caught by the _dispatch
+   handler OUTSIDE every loop -- that would unwind the whole loop and run only a
+   single iteration (the cycle_label dispatch segment is emitted after the
+   loop).  The faithful translation of "skip the rest of this iteration and run
+   the next one" is the Python "continue" statement.  output_goto_1 therefore
+   emits "continue" when the GO TO target is the active (innermost) loop's
+   cycle_label.  Only genuine loop performs push here; an inline ONCE perform is
+   not a loop, so its cycle GO TO keeps the _CobGoto path (jump to the after-body
+   segment), and a bare "continue" -- which would be a Python SyntaxError outside
+   a loop -- is never emitted for it. */
+#define COB_PERFORM_CYCLE_MAX	64
+static int			perform_cycle_stack[COB_PERFORM_CYCLE_MAX];
+static int			perform_cycle_depth = 0;
+
+/* Push the cycle_label id of an inline loop PERFORM (0 when the body contains
+   no EXIT PERFORM CYCLE).  Depth is always incremented so pop stays balanced
+   even past the (generously sized) stack bound. */
+static void
+perform_cycle_push (struct cb_perform *p)
+{
+	int	id = 0;
+
+	if (p->cycle_label) {
+		id = CB_LABEL (cb_ref (p->cycle_label))->id;
+	}
+	if (perform_cycle_depth < COB_PERFORM_CYCLE_MAX) {
+		perform_cycle_stack[perform_cycle_depth] = id;
+	}
+	perform_cycle_depth++;
+}
+
+static void
+perform_cycle_pop (void)
+{
+	if (perform_cycle_depth > 0) {
+		perform_cycle_depth--;
+	}
+}
+
+/* Non-zero when label id is the cycle_label of the innermost inline loop
+   PERFORM currently open, i.e. an EXIT PERFORM CYCLE that must become a Python
+   "continue" of that loop rather than a loop-unwinding _CobGoto. */
+static int
+is_active_cycle_target (int id)
+{
+	if (id != 0
+	    && perform_cycle_depth > 0
+	    && perform_cycle_depth <= COB_PERFORM_CYCLE_MAX) {
+		return perform_cycle_stack[perform_cycle_depth - 1] == id;
+	}
+	return 0;
+}
+
+/* MIGRATION (C -> Python): single-module assembly buffers.
+   The former C backend wrote THREE streams per compilation unit: the ".c"
+   body (yyout), a storage header ".h" (cb_storage_file) and a per-program
+   local header ".l.h" (local_storage_file).  The Python backend emits ONE
+   self-contained ".py" module, so the storage and local declarations are
+   accumulated into these in-memory streams during traversal and flushed into
+   the single module stream (yyout) at finalization.  open_memstream() keeps
+   the backing buffer/length updated on fflush; the separate cb_storage_file /
+   local_storage_file temp files opened by cobc.c are simply left empty and
+   removed by the existing cleanup there. */
+static FILE			*storage_mem = NULL;
+static char			*storage_mem_buf = NULL;
+static size_t			storage_mem_len = 0;
+static FILE			*local_mem = NULL;
+static char			*local_mem_buf = NULL;
+static size_t			local_mem_len = 0;
+
 static const char		*excp_current_program_id = NULL;
 static const char		*excp_current_section = NULL;
 static const char		*excp_current_paragraph = NULL;
@@ -164,6 +326,24 @@ static void output_integer (cb_tree x);
 static void output_index (cb_tree x);
 static void output_func_1 (const char *name, cb_tree x);
 static void output_param (cb_tree x, int id);
+/* MIGRATION (C -> Python): output_param now emits runtime bounds-check calls
+   inline (as Python tuple elements), so it forward-references output_funcall,
+   which is defined later in the file. */
+static void output_funcall (cb_tree x);
+
+/* MIGRATION (C -> Python): BASED / non-parameter LINKAGE items have no own
+   storage until ALLOCATE / SET ADDRESS binds them.  The C backend modelled the
+   binding by re-pointing the item's "cob_field.data" through "&item->data";
+   Python cannot take the address of a name, so the backing bytearray name
+   "b_<id>" is instead REBOUND by assignment.  These helpers identify such items
+   and the founder field that ALLOCATE / FREE / SET ADDRESS funcall arguments
+   refer to, so the emitter can (a) emit a module-level "b_<id> = None"
+   initialiser, (b) declare "global b_<id>" in the dispatch scope that rebinds
+   it, and (c) lower ALLOCATE / FREE / SET ADDRESS to name-rebinding
+   assignments. */
+static int linkage_is_parameter (struct cb_program *prog, struct cb_field *f01);
+static int is_rebindable_base (struct cb_program *prog, struct cb_field *f01);
+static struct cb_field *funcall_based_field (cb_tree arg);
 
 static void
 lookup_call (const char *p)
@@ -247,11 +427,28 @@ output_newline (void)
 	}
 }
 
+/* MIGRATION (C -> Python): mark the innermost currently-open Python block as
+   having received body content, so output_block_close() will NOT inject a
+   spurious "pass".  Called from output_prefix(), which begins every indented
+   statement line (directly or via output_line()).  Tracking is independent of
+   output_target so the logical block structure stays consistent even when no
+   bytes are being written. */
+static void
+output_mark_content (void)
+{
+	if (block_depth > 0 && block_depth <= COB_PY_MAX_BLOCK_DEPTH) {
+		block_content_stack[block_depth - 1] = 1;
+	}
+}
+
 static void
 output_prefix (void)
 {
 	int	i;
 
+	/* MIGRATION (C -> Python): any prefixed line counts as body content for
+	   the enclosing Python suite. */
+	output_mark_content ();
 	if (output_target) {
 		for (i = 0; i < output_indent_level; i++) {
 			fputc (' ', output_target);
@@ -273,78 +470,377 @@ output_line (const char *fmt, ...)
 	}
 }
 
+/* MIGRATION (C -> Python): emit an indented Python comment line "# ...".
+   CRITICAL: unlike output_line(), this deliberately does NOT mark the
+   enclosing block as having body content.  A Python comment is NOT a
+   statement and cannot satisfy a block suite -- "if x:\n    # c" is a
+   SyntaxError.  By not marking content, output_block_close() still injects a
+   "pass" for a block that contains only comments, keeping the suite valid.
+   The indentation spaces are written directly here (mirroring output_prefix
+   without the content-marking side effect). */
 static void
-output_indent (const char *str)
+output_comment (const char *fmt, ...)
 {
-	const char	*p;
-	int		level = 2;
+	va_list		ap;
+	int		i;
 
-	for (p = str; *p == ' '; p++) {
-		level++;
-	}
-
-	if (*p == '}' && strcmp (str, "})") != 0) {
-		output_indent_level -= level;
-	}
-
-	output_line (str);
-
-	if (*p == '{' && strcmp (str, ")}") != 0) {
-		output_indent_level += level;
+	if (output_target) {
+		for (i = 0; i < output_indent_level; i++) {
+			fputc (' ', output_target);
+		}
+		fputs ("# ", output_target);
+		va_start (ap, fmt);
+		vfprintf (output_target, fmt, ap);
+		va_end (ap);
+		fputc ('\n', output_target);
 	}
 }
 
+/* MIGRATION (C -> Python): open a Python block.  Unlike the C emitter, no
+   "{" token is written -- the trailing ":" that introduces the block is
+   emitted by the caller (e.g. "if cond:") and the body that follows is simply
+   indented one COB_PY_INDENT unit deeper.  Emits nothing itself. */
+static void
+output_block_open (void)
+{
+	/* Opening a child block means the parent suite is non-empty. */
+	output_mark_content ();
+	output_indent_level += COB_PY_INDENT;
+	/* Push a fresh, empty content slot for the newly opened block. */
+	if (block_depth < COB_PY_MAX_BLOCK_DEPTH) {
+		block_content_stack[block_depth] = 0;
+	}
+	block_depth++;
+}
+
+/* MIGRATION (C -> Python): close a Python block.  No "}" token is written;
+   the block ends purely by dedenting.  If the block being closed never
+   received any body content, a lone "pass" is emitted first so the Python
+   suite is syntactically valid (Python forbids empty blocks). */
+static void
+output_block_close (void)
+{
+	int	had_content;
+
+	if (block_depth > 0) {
+		block_depth--;
+		had_content = (block_depth < COB_PY_MAX_BLOCK_DEPTH)
+				? block_content_stack[block_depth] : 1;
+		if (!had_content) {
+			/* Emit "pass" at the (still-indented) body level.  This
+			   output_line() call re-enters output_prefix(), which marks
+			   the PARENT block as non-empty -- correct, since a child
+			   block (even an empty one) is parent content. */
+			output_line ("pass");
+		}
+	}
+	output_indent_level -= COB_PY_INDENT;
+	if (output_indent_level < 0) {
+		output_indent_level = 0;
+	}
+}
+
+/* MIGRATION (C -> Python): the legacy output_indent() brace-shim has been
+   removed now that every block delimiter is expressed directly through
+   output_block_open()/output_block_close().  The Python indentation level is
+   tracked by output_indent_level and advanced one uniform COB_PY_INDENT per
+   nesting step. */
+
+/* MIGRATION (C -> Python): emit a Python bytes literal b"..." in place of a C
+   string literal.  COBOL data is raw bytes, so a Python bytes literal is the
+   byte-exact representation and the safe choice for round-trip fidelity.
+   Printable ASCII bytes are emitted verbatim (with '"' and '\\' escaped); all
+   other bytes are emitted as \xNN hex escapes.  Python consumes exactly two
+   hex digits after \x, so a hex escape immediately followed by literal text is
+   unambiguous (e.g. b"\x41A" is the two bytes 0x41,0x41). */
 static void
 output_string (const unsigned char *s, int size)
 {
 	int	i;
 	int	c;
-	int	printable = 1;
 
-	for (i = 0; i < size; i++) {
-		if (!isprint (s[i])) {
-			printable = 0;
-		}
-	}
-
-	output ("\"");
+	output ("b\"");
 	for (i = 0; i < size; i++) {
 		c = s[i];
-		if (printable) {
-			if (c == '\"' || c == '\\') {
-				output ("\\%c", c);
-			} else {
-				output ("%c", c);
-			}
+		if (isprint (c) && c != '\"' && c != '\\') {
+			output ("%c", c);
 		} else {
-			output ("\\%03o", c);
+			output ("\\x%02x", c);
 		}
 	}
 	output ("\"");
 }
 
+/* MIGRATION (C -> Python): lazily open the in-memory storage stream. */
+static void
+output_storage_open (void)
+{
+	if (!storage_mem) {
+		storage_mem = open_memstream (&storage_mem_buf, &storage_mem_len);
+	}
+}
+
+/* MIGRATION (C -> Python): lazily open the in-memory local-declaration
+   stream. */
+static void
+output_local_open (void)
+{
+	if (!local_mem) {
+		local_mem = open_memstream (&local_mem_buf, &local_mem_len);
+	}
+}
+
+/* MIGRATION (C -> Python): storage (the former ".h") now accumulates into an
+   in-memory stream that is flushed into the single module at finalization,
+   instead of a separate storage header file. */
 static void
 output_storage (const char *fmt, ...)
 {
 	va_list		ap;
 
-	if (cb_storage_file) {
+	output_storage_open ();
+	if (storage_mem) {
 		va_start (ap, fmt);
-		vfprintf (cb_storage_file, fmt, ap);
+		vfprintf (storage_mem, fmt, ap);
 		va_end (ap);
 	}
 }
 
+/* MIGRATION (C -> Python): local declarations (the former ".l.h") now
+   accumulate into an in-memory stream that is flushed into the single module
+   at finalization, instead of a separate per-program local header file. */
 static void
 output_local (const char *fmt, ...)
 {
 	va_list		ap;
 
-	if (current_prog->local_storage_file) {
+	output_local_open ();
+	if (local_mem) {
 		va_start (ap, fmt);
-		vfprintf (current_prog->local_storage_file, fmt, ap);
+		vfprintf (local_mem, fmt, ap);
 		va_end (ap);
 	}
+}
+
+/* MIGRATION (C -> Python): flush the in-memory storage + local streams into
+   the single module stream (yyout) and release them.  Called once at the end
+   of codegen() (outermost finalization).  ORDER MATTERS for Python: the storage
+   data (b_N bytearrays, a_N attributes, f_N/c_N cob_field objects, collating
+   tables) is emitted FIRST because the local declarations that follow reference
+   it at module-load time -- the alphabet cob_field uses an a_N attribute and the
+   screen objects use f_N fields.  Both buffers are written verbatim regardless
+   of the current output_target so the single module is self-contained.  The
+   program-body functions were already written directly to yyout above; they
+   reference this module-level data only at call time, so emitting the data
+   after the function defs is safe (the __main__ trigger is emitted after this
+   flush, once every name exists). */
+static void
+output_flush_module_buffers (void)
+{
+	if (storage_mem) {
+		fflush (storage_mem);
+		if (yyout && storage_mem_buf && storage_mem_len) {
+			fwrite (storage_mem_buf, 1, storage_mem_len, yyout);
+		}
+		fclose (storage_mem);
+		free (storage_mem_buf);
+		storage_mem = NULL;
+		storage_mem_buf = NULL;
+		storage_mem_len = 0;
+	}
+	if (local_mem) {
+		fflush (local_mem);
+		if (yyout && local_mem_buf && local_mem_len) {
+			fwrite (local_mem_buf, 1, local_mem_len, yyout);
+		}
+		fclose (local_mem);
+		free (local_mem_buf);
+		local_mem = NULL;
+		local_mem_buf = NULL;
+		local_mem_len = 0;
+	}
+}
+
+/*
+ * MIGRATION (C -> Python): runtime-symbol module resolver.
+ *
+ * The former C backend emitted every runtime entry point as a bare C
+ * identifier (e.g. "cob_move (...)") resolved at link time against the single
+ * libcob shared object.  The Python backend instead emits each runtime symbol
+ * module-qualified against the libcob_py package (e.g. "move.cob_move(...)").
+ *
+ * codegen_pymod() maps a "cob_*" runtime symbol to the libcob_py submodule
+ * that provides it.  The assignment follows the libcob source file each
+ * routine lives in (AAP 0.4.1 / 0.6.5), verified directly against the
+ * libcob C sources:
+ *
+ *   common.c    -> "common"    numeric.c  -> "numeric"   move.c    -> "move"
+ *   strings.c   -> "strings"   intrinsic.c-> "intrinsic" fileio.c  -> "fileio"
+ *   call.c      -> "call"      screenio.c -> "screenio"  termio.c  -> "termio"
+ *   system.def  -> "system"    codegen.h inline helpers  -> "numeric"/"common"
+ *
+ * The checks are ordered most-specific-first.  Any symbol that cannot be
+ * classified is routed through the "libcob_py" facade (libcob_py/__init__.py
+ * re-exports every cob_* name), so NO symbol is ever emitted bare/undefined.
+ */
+static const char *
+codegen_pymod (const char *name)
+{
+	/* 0. Runtime globals/objects (attribute access, not calls) live on the
+	      common module.  Must precede the cob_call_ prefix rule below so that
+	      cob_call_params is classified here and not as a call.c routine. */
+	if (!strcmp (name, "cob_exception_code") ||
+	    !strcmp (name, "cob_initialized") ||
+	    !strcmp (name, "cob_current_module") ||
+	    !strcmp (name, "cob_call_params") ||
+	    !strcmp (name, "cob_save_call_params") ||
+	    !strcmp (name, "cob_user_parameters") ||
+	    !strcmp (name, "cob_procedure_parameters")) {
+		return "common";
+	}
+
+	/* 1. The ~128 fixed-width binary helpers from libcob/codegen.h all end in
+	      "_binary" and belong to the numeric subsystem. */
+	{
+		size_t	len = strlen (name);
+		if (len > 7 && !strcmp (name + len - 7, "_binary")) {
+			return "numeric";
+		}
+	}
+
+	/* 2. Packed-decimal helpers (numeric). */
+	if (strstr (name, "_packed") != NULL) {
+		return "numeric";
+	}
+
+	/* 3. Decimal arithmetic family (numeric). */
+	if (!strncmp (name, "cob_decimal", 11)) {
+		return "numeric";
+	}
+
+	/* 4. Named arithmetic helpers add/sub/mul/div (numeric). */
+	if (!strncmp (name, "cob_add", 7) ||
+	    !strncmp (name, "cob_sub", 7) ||
+	    !strncmp (name, "cob_mul", 7) ||
+	    !strncmp (name, "cob_div", 7)) {
+		return "numeric";
+	}
+
+	/* 5. Specific compare helpers (numeric).  Note the trailing underscore:
+	      the generic "cob_cmp" (no suffix) lives in common.c and is handled by
+	      the default branch below. */
+	if (!strncmp (name, "cob_cmp_", 8)) {
+		return "numeric";
+	}
+
+	/* 6. INSPECT / STRING / UNSTRING (strings). */
+	if (!strncmp (name, "cob_inspect_", 12) ||
+	    !strncmp (name, "cob_string_", 11) ||
+	    !strncmp (name, "cob_unstring_", 13)) {
+		return "strings";
+	}
+
+	/* 7. Intrinsic FUNCTIONs (intrinsic). */
+	if (!strncmp (name, "cob_intr_", 9)) {
+		return "intrinsic";
+	}
+
+	/* 8. SCREEN SECTION I/O (screenio). */
+	if (!strncmp (name, "cob_screen_", 11) ||
+	    !strcmp (name, "cob_field_display") ||
+	    !strcmp (name, "cob_field_accept")) {
+		return "screenio";
+	}
+
+	/* 9. Data-movement family (move) -- the GAP module (AAP 0.6.5). */
+	if (!strcmp (name, "cob_move") ||
+	    !strcmp (name, "cob_set_int") ||
+	    !strcmp (name, "cob_get_int")) {
+		return "move";
+	}
+
+	/* 10. File I/O, SORT/MERGE, file status (fileio). */
+	if (!strncmp (name, "cob_file_", 9) ||
+	    !strcmp (name, "cob_open") ||
+	    !strcmp (name, "cob_close") ||
+	    !strcmp (name, "cob_read") ||
+	    !strcmp (name, "cob_write") ||
+	    !strcmp (name, "cob_rewrite") ||
+	    !strcmp (name, "cob_delete") ||
+	    !strcmp (name, "cob_start") ||
+	    !strcmp (name, "cob_commit") ||
+	    !strcmp (name, "cob_rollback") ||
+	    !strcmp (name, "cob_unlock_file") ||
+	    !strcmp (name, "cob_default_error_handle")) {
+		return "fileio";
+	}
+
+	/* 11. Dynamic CALL / CANCEL machinery (call). */
+	if (!strncmp (name, "cob_call_", 9) ||
+	    !strncmp (name, "cob_resolve", 11) ||
+	    !strcmp (name, "cob_set_cancel") ||
+	    !strcmp (name, "cob_field_cancel")) {
+		return "call";
+	}
+
+	/* 12. Plain terminal ACCEPT/DISPLAY fallback (termio).  The ACCEPT FROM
+	      DATE/DAY/TIME and command-line/environment variants live in common.c
+	      and fall through to the default branch. */
+	if (!strcmp (name, "cob_accept") ||
+	    !strcmp (name, "cob_display")) {
+		return "termio";
+	}
+
+	/* 13. Raw byte-buffer helpers emitted as funcall names by typeck.c map to
+	      the libcob_py.common byte-buffer helpers. */
+	if (!strcmp (name, "memcpy") ||
+	    !strcmp (name, "memcmp") ||
+	    !strcmp (name, "memset") ||
+	    !strcmp (name, "memmove")) {
+		return "common";
+	}
+
+	/* 14. Default: every remaining cob_* routine is provided by common.c
+	      (cob_cmp, cob_accept_*, cob_display_*, cob_check_*, cob_table_sort*,
+	      cob_get_numdisp, cob_get_pointer, cob_get_prog_pointer, cob_get_switch,
+	      cob_set_switch, cob_set_environment, cob_get_environment,
+	      cob_external_addr, cob_init, cob_stop_run, cob_chain_setup,
+	      cob_check_version, cob_fatal_error, cob_malloc, cob_allocate,
+	      cob_free_alloc, cob_ready_trace, cob_reset_trace, cob_set_location). */
+	if (!strncmp (name, "cob_", 4)) {
+		return "common";
+	}
+
+	/* 15. Anything else: route through the libcob_py facade so the emitted
+	      reference is always defined (libcob_py/__init__.py re-exports cob_*). */
+	return "libcob_py";
+}
+
+/* MIGRATION (C -> Python): emit a runtime symbol as its module-qualified
+   Python name, e.g. "move.cob_move".  Used by output_funcall() and by the
+   direct call emissions scattered through this file. */
+static void
+output_pyfunc (const char *name)
+{
+	/* MIGRATION (C -> Python) [QA finding: Rule #7 emitter<->runtime contract;
+	   NC174A class-condition over-qualification]: user-defined CLASS conditions
+	   (the COBOL "CLASS name IS ..." clause) are lowered by the immutable
+	   front-end into funcalls whose name is the class cname "is_<name>"
+	   (cobc/tree.c cb_build_class_name: snprintf(..., "is_%s",
+	   to_cname(p->name))).  Unlike the cob_* runtime symbols, these helpers are
+	   NOT part of libcob_py: the emitter writes each one as a module-local
+	   "def is_<name> (f):" function (see output_class_name_definition).  They
+	   must therefore be CALLED unqualified -- emitting
+	   "libcob_py.is_<name>(...)" raises AttributeError at runtime
+	   ("module 'libcob_py' has no attribute 'is_<name>'").  No cob_* runtime
+	   routine and no libcob_py facade symbol begins with "is_", so the "is_"
+	   prefix is an unambiguous, safe discriminator for these locally-defined
+	   class-condition functions, and single-class programs are unaffected. */
+	if (!strncmp (name, "is_", 3)) {
+		output ("%s", name);
+		return;
+	}
+	output ("%s.%s", codegen_pymod (name), name);
 }
 
 /*
@@ -355,8 +851,6 @@ static void
 output_base (struct cb_field *f)
 {
 	struct cb_field		*f01;
-	struct cb_field		*p;
-	struct cb_field		*v;
 	struct base_list	*bl;
 	char			*nmp;
 	char			name[COB_MINI_BUFF];
@@ -393,22 +887,112 @@ output_base (struct cb_field *f)
 				bl->next = base_cache;
 				base_cache = bl;
 			} else {
+				/* MIGRATION (C->Python): a LOCAL-STORAGE BASED item becomes a
+				   Python name initialised to None (re-bound when its based
+				   storage is allocated).  For a global-use program a save_
+				   shadow name preserves the binding across recursive entry. */
 				if (current_prog->flag_global_use) {
-					output_local ("unsigned char\t\t*%s%s = NULL;",
+					output_local ("%s%s = None",
 							CB_PREFIX_BASE, name);
-					output_local ("\t/* %s */\n", f01->name);
-					output_local ("static unsigned char\t*save_%s%s;\n",
+					output_local ("\t# %s\n", f01->name);
+					output_local ("save_%s%s = None\n",
 							CB_PREFIX_BASE, name);
 				} else {
-					output_local ("unsigned char\t*%s%s = NULL;",
+					output_local ("%s%s = None",
 							CB_PREFIX_BASE, name);
-					output_local ("\t/* %s */\n", f01->name);
+					output_local ("\t# %s\n", f01->name);
 				}
 			}
 		}
 		f01->flag_base = 1;
 	}
+	/* MIGRATION (C -> Python): emit ONLY the bytearray name here (e.g. "b_5",
+	   or "b_WS_FOO" for an external item).  The byte offset within the buffer
+	   is emitted separately by output_base_offset() so the whole reference can
+	   be wrapped by output_data() as memoryview(b_N)[offset:]. */
 	output ("%s%s", CB_PREFIX_BASE, name);
+}
+
+/* MIGRATION (C -> Python): return non-zero when LINKAGE founder *f01* is a
+   PROCEDURE DIVISION USING parameter of *prog*.  A parameter item's backing
+   name "b_<id>" is the entry-function argument (a function-local) and must NOT
+   be given a module-level initialiser or a "global" declaration; only
+   non-parameter LINKAGE items (SET ADDRESS targets) get module-level storage. */
+static int
+linkage_is_parameter (struct cb_program *prog, struct cb_field *f01)
+{
+	cb_tree	l;
+
+	for (l = prog->parameter_list; l; l = CB_CHAIN (l)) {
+		if (cb_field_founder (cb_field (CB_VALUE (l))) == f01) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* MIGRATION (C -> Python): return non-zero when founder *f01* needs a
+   MODULE-LEVEL, pointer-rebindable backing name "b_<id> = None": a BASED
+   founder in WORKING-STORAGE or LINKAGE, or a non-parameter LINKAGE founder.
+   EXTERNAL items use a named shared buffer handled elsewhere; LOCAL-STORAGE
+   BASED items are per-invocation function-locals (emitted in the prologue) and
+   are deliberately excluded so they are never declared "global". */
+static int
+is_rebindable_base (struct cb_program *prog, struct cb_field *f01)
+{
+	if (f01->flag_external) {
+		return 0;
+	}
+	if (f01->storage == CB_STORAGE_LOCAL) {
+		return 0;
+	}
+	if (f01->flag_item_based) {
+		return 1;
+	}
+	if (f01->storage == CB_STORAGE_LINKAGE
+	    && !linkage_is_parameter (prog, f01)) {
+		return 1;
+	}
+	return 0;
+}
+
+/* MIGRATION (C -> Python): extract the BASED/LINKAGE founder field that an
+   ALLOCATE / FREE funcall argument addresses.  The front-end (immutable
+   typeck.c) wraps the target in cb_build_cast_addr_of_addr (FREE data-name /
+   ALLOCATE) or cb_build_cast_address (FREE ADDRESS OF), so peel one or two CAST
+   layers down to the underlying reference and return its founder.  Returns NULL
+   for the "ALLOCATE n CHARACTERS RETURNING ptr" form (a NULL/charcount arg with
+   no based target). */
+static struct cb_field *
+funcall_based_field (cb_tree arg)
+{
+	struct cb_cast	*cp;
+
+	if (arg == NULL) {
+		return NULL;
+	}
+	while (CB_CAST_P (arg)) {
+		cp = CB_CAST (arg);
+		if (cp->val == NULL) {
+			return NULL;
+		}
+		arg = cp->val;
+	}
+	if (CB_REF_OR_FIELD_P (arg)) {
+		return cb_field_founder (cb_field (arg));
+	}
+	return NULL;
+}
+
+/* MIGRATION (C -> Python): emit the byte offset of a field within its base
+   buffer as a Python int expression, each term prefixed with " + " so it can
+   follow a leading "0" inside a memoryview slice (memoryview(b)[0 + ...:]).
+   Emits nothing when the field sits at offset 0 with no variable address. */
+static void
+output_base_offset (struct cb_field *f)
+{
+	struct cb_field		*p;
+	struct cb_field		*v;
 
 	if (cb_field_variable_address (f)) {
 		for (p = f->parent; p; f = f->parent, p = f->parent) {
@@ -438,14 +1022,18 @@ output_data (cb_tree x)
 	struct cb_field		*f;
 	cb_tree			lsub;
 
+	/* MIGRATION (C -> Python): a data reference becomes a mutable
+	   memoryview(b_N)[offset:] over the backing bytearray (byte-exact with the
+	   former "unsigned char *" pointer), or a bytes literal for literal data. */
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_LITERAL:
 		l = CB_LITERAL (x);
 		if (CB_TREE_CLASS (x) == CB_CLASS_NUMERIC) {
-			output ("(unsigned char *)\"%s%s\"", l->data,
+			/* Numeric literal: digit bytes followed by an optional sign
+			   byte, emitted as a Python bytes literal. */
+			output ("b\"%s%s\"", l->data,
 				(l->sign < 0) ? "-" : (l->sign > 0) ? "+" : "");
 		} else {
-			output ("(unsigned char *)");
 			output_string (l->data, (int) l->size);
 		}
 		break;
@@ -453,8 +1041,15 @@ output_data (cb_tree x)
 		r = CB_REFERENCE (x);
 		f = CB_FIELD (r->value);
 
-		/* Base address */
+		/* MIGRATION (C -> Python): build memoryview(b_N)[ 0 + <offsets> : ].
+		   The leading "0" cleanly absorbs the " + " prefix of every offset
+		   term (base offset, subscripts, reference-modification offset). */
+		output ("memoryview(");
 		output_base (f);
+		output (")[0");
+
+		/* Base byte offset / variable-address arithmetic */
+		output_base_offset (f);
 
 		/* Subscripts */
 		if (r->subs) {
@@ -471,22 +1066,26 @@ output_data (cb_tree x)
 			}
 		}
 
-		/* Offset */
+		/* Offset (reference modification) */
 		if (r->offset) {
 			output (" + ");
 			output_index (r->offset);
 		}
+
+		output (":]");
 		break;
 	case CB_TAG_CAST:
-		output ("&");
+		/* MIGRATION (C -> Python): the address-of decoration is dropped;
+		   output_param yields the object reference directly. */
 		output_param (x, 0);
 		break;
 	case CB_TAG_INTRINSIC:
-		output ("module.cob_procedure_parameters[%d]->data", field_iteration);
+		/* MIGRATION (C -> Python): "->" member access becomes "." */
+		output ("module.cob_procedure_parameters[%d].data", field_iteration);
 		break;
 	case CB_TAG_CONST:
 		if (x == cb_null) {
-			output ("NULL");
+			output ("None");
 			return;
 		}
 		/* Fall through */
@@ -505,6 +1104,13 @@ output_size (cb_tree x)
 	struct cb_field		*p;
 	struct cb_field		*q;
 
+	/* MIGRATION (C -> Python): output_size emits the byte size of a field as an
+	   integer expression.  The original C already emitted only plain integer
+	   arithmetic (integer literals plus '+', '-', '*' and calls to output_index /
+	   output_integer); that arithmetic is valid Python verbatim, and output_index
+	   / output_integer now emit Python integer expressions, so no surface change
+	   is required here.  Reference-modification size keeps the COBOL semantics
+	   "f->size - (offset - 1)" -> "f->size - offset + 1". */
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_CONST:
 		output ("1");
@@ -674,19 +1280,25 @@ output_attr (cb_tree x)
 		ABORT ();
 	}
 
-	output ("&%s%d", CB_PREFIX_ATTR, id);
+	/* MIGRATION (C -> Python): emit the attribute object reference "a_N"
+	   (a common.cob_field_attr instance defined in the storage section);
+	   the C address-of decoration is dropped. */
+	output ("%s%d", CB_PREFIX_ATTR, id);
 }
 
+/* MIGRATION (C -> Python): a field literal becomes a common.cob_field(...)
+   constructor call -- common.cob_field(size, data, attr) -- instead of the C
+   aggregate "{size, data, attr}". */
 static void
 output_field (cb_tree x)
 {
-	output ("{");
+	output ("common.cob_field(");
 	output_size (x);
 	output (", ");
 	output_data (x);
 	output (", ");
 	output_attr (x);
-	output ("}");
+	output (")");
 }
 
 /*
@@ -745,12 +1357,31 @@ output_integer (cb_tree x)
 
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_CONST:
+		/* MIGRATION (C -> Python): integer-context figurative constants.  ZERO
+		   folds to the integer 0.  NULL folds to the integer 0 as well: in
+		   INTEGER context NULL is a pointer VALUE, and the C backend compared
+		   pointers as integer addresses where NULL == (void *)0.  The pointer
+		   condition "IF p = NULL" is lowered to "(<p-as-int> - <null-as-int>)
+		   == 0", so NULL must read as the integer 0 (not None) or the
+		   subtraction raises TypeError.  The pointer STORE paths
+		   (cob_set_pointer / cob_resolve_addr) treat 0 and None identically
+		   (both are NULL), so SET p TO NULL / SET ADDRESS OF x TO NULL are
+		   unaffected.  The remaining constants carry a literal integer string
+		   ("1"/"0" for TRUE/FALSE), valid Python verbatim.  As a defensive
+		   measure a val beginning with '&' is rewritten to the module-qualified
+		   runtime object (common.cob_<x>), matching output_param's CONST. */
 		if (x == cb_zero) {
 			output ("0");
 		} else if (x == cb_null) {
-			output ("(unsigned char *)NULL");
+			output ("0");
 		} else {
-			output ("%s", CB_CONST (x)->val);
+			const char	*cval = CB_CONST (x)->val;
+
+			if (cval && cval[0] == '&') {
+				output ("%s.%s", codegen_pymod (cval + 1), cval + 1);
+			} else {
+				output ("%s", cval ? cval : "None");
+			}
 		}
 		break;
 	case CB_TAG_INTEGER:
@@ -760,23 +1391,44 @@ output_integer (cb_tree x)
 		output ("%d", cb_get_int (x));
 		break;
 	case CB_TAG_BINARY_OP:
+		/* MIGRATION (C -> Python): integer arithmetic re-expressed with Python
+		   operators.
+		     '^' (exponentiation) -> int(x ** y): with integer operands x ** y is
+		         an exact Python int, and int() truncates toward zero exactly as
+		         the former "(int) pow()" did.
+		     '/' (division) -> common.cob_trunc_div(x, y): this is the one operator
+		         that is NOT a direct Python translation.  C integer division
+		         truncates toward zero, whereas Python's '//' floors toward
+		         negative infinity, so the two DISAGREE whenever the operands have
+		         opposite signs (e.g. C: -7 / 2 == -3, Python: -7 // 2 == -4).  A
+		         '/' tree can reach this integer path through a computed subscript
+		         or an integer cast (parser.c builds cb_build_binary_op(.,'/',.)),
+		         and a variable operand's sign is unknown at compile time, so a
+		         bare '//' would break byte-for-byte parity.  We therefore emit a
+		         runtime helper that performs C-style truncate-toward-zero integer
+		         division for all signs and magnitudes (arbitrary precision, no
+		         float).  [CONTRACT for libcob_py.common: cob_trunc_div(a, b)
+		         returns int(a / b) truncated toward zero, i.e. C "a / b".]
+		     '+', '-', '*' -> the identical Python operators.
+		   The former need_double double-cast path was dead code (need_double was
+		   always 0) and is dropped. */
 		p = CB_BINARY_OP (x);
 		if (p->op == '^') {
-			output ("(int) pow (");
+			output ("int(");
+			output_integer (p->x);
+			output (" ** ");
+			output_integer (p->y);
+			output (")");
+		} else if (p->op == '/') {
+			output ("common.cob_trunc_div (");
 			output_integer (p->x);
 			output (", ");
 			output_integer (p->y);
 			output (")");
 		} else {
 			output ("(");
-			if (need_double) {
-				output ("(double)");
-			}
 			output_integer (p->x);
 			output (" %c ", p->op);
-			if (need_double) {
-				output ("(double)");
-			}
 			output_integer (p->y);
 			output (")");
 		}
@@ -785,8 +1437,30 @@ output_integer (cb_tree x)
 		cp = CB_CAST (x);
 		switch (cp->type) {
 		case CB_CAST_ADDRESS:
-			output ("(");
-			output_data (cp->val);
+			/* MIGRATION (C -> Python): ADDRESS OF x read as a pointer VALUE in
+			   integer context (pointer comparison, SET p TO ADDRESS OF x).  The
+			   C backend yielded the raw machine address; Python yields the
+			   synthetic integer address via common.cob_ptr_addr(view) so the
+			   result is an int that subtracts/compares cleanly and round-trips
+			   through pointer storage (cob_ptr_addr registers the buffer so a
+			   stored copy can later be resolved by SET ADDRESS OF).  For a
+			   BASED / LINKAGE item the backing name "b_<id>" may be None
+			   (unallocated / unbound / SET ADDRESS ... TO NULL) and
+			   memoryview(None) raises TypeError, so the data view is guarded:
+			   an unbound item passes None to cob_ptr_addr, which maps it to 0
+			   (NULL) - exactly the C "&item is NULL" semantics. */
+			output ("common.cob_ptr_addr (");
+			if (CB_REF_OR_FIELD_P (cp->val)
+			    && (cb_field (cp->val)->flag_item_based
+				|| cb_field (cp->val)->storage == CB_STORAGE_LINKAGE)) {
+				output ("(");
+				output_data (cp->val);
+				output (" if ");
+				output_base (cb_field (cp->val));
+				output (" is not None else None)");
+			} else {
+				output_data (cp->val);
+			}
 			output (")");
 			break;
 		case CB_CAST_PROGRAM_POINTER:
@@ -798,150 +1472,32 @@ output_integer (cb_tree x)
 		}
 		break;
 	case CB_TAG_REFERENCE:
+		/* MIGRATION (C -> Python): the C emitter had many inline fast paths
+		   (native pointer casts, COB_BSWAP_* byte swaps, zoned/packed
+		   decoders) for reading a field as an integer.  Every one of those
+		   produced the SAME value the general cob_get_int() accessor returns --
+		   they were pure speed optimizations.  Python cannot express raw
+		   pointer casts or byte swaps inline, so every read collapses to a
+		   module-qualified runtime accessor that decodes the field per its
+		   cob_field_attr, preserving byte-for-byte results.  Only the POINTER
+		   usages yield a pointer object (not an int) and therefore use the
+		   dedicated pointer accessors in libcob_py.common. */
 		f = cb_field (x);
 		switch (f->usage) {
-		case CB_USAGE_INDEX:
-		case CB_USAGE_LENGTH:
-			output ("(*(int *) (");
-			output_data (x);
-			output ("))");
-			return;
-
 		case CB_USAGE_POINTER:
-#ifdef	COB_NON_ALIGNED
-			output ("(cob_get_pointer (");
-			output_data (x);
-			output ("))");
-#else
-			output ("(*(unsigned char **) (");
-			output_data (x);
-			output ("))");
-#endif
+			output_func_1 ("cob_get_pointer", x);
 			return;
-
 		case CB_USAGE_PROGRAM_POINTER:
-#ifdef	COB_NON_ALIGNED
-			output ("(cob_get_prog_pointer (");
-			output_data (x);
-			output ("))");
-#else
-			output ("(*(void **) (");
-			output_data (x);
-			output ("))");
-#endif
+			output_func_1 ("cob_get_prog_pointer", x);
 			return;
-
-		case CB_USAGE_DISPLAY:
-			if (f->pic && f->pic->scale >= 0
-			    && f->size - f->pic->scale > 0
-			    && f->size - f->pic->scale <= 9
-			    && f->pic->have_sign == 0) {
-				output ("cob_get_numdisp (");
-				output_data (x);
-				output (", %d)", f->size - f->pic->scale);
-				return;
-			}
-			break;
-
-		case CB_USAGE_PACKED:
-			if (f->pic->scale == 0 && f->pic->digits < 10) {
-				output_func_1 ("cob_get_packed_int", x);
-				return;
-			}
-			break;
-
-		case CB_USAGE_BINARY:
-		case CB_USAGE_COMP_5:
-		case CB_USAGE_COMP_X:
-			if (f->size == 1) {
-				output ("(*(");
-				if (!f->pic->have_sign) {
-					output ("unsigned ");
-				} else {
-					output ("signed ");
-				}
-				output ("char *) (");
-				output_data (x);
-				output ("))");
-				return;
-			}
-#ifdef	COB_NON_ALIGNED
-			if (f->storage != CB_STORAGE_LINKAGE && f->indexes == 0 && (
-#ifdef	COB_SHORT_BORK
-				(f->size == 2 && (f->offset % 4 == 0)) ||
-#else
-				(f->size == 2 && (f->offset % 2 == 0)) ||
-#endif
-				(f->size == 4 && (f->offset % 4 == 0)) ||
-				(f->size == 8 && (f->offset % 8 == 0)))) {
-#else
-			if (f->size == 2 || f->size == 4 || f->size == 8) {
-#endif
-				if (f->flag_binary_swap) {
-					output ("((");
-					if (!f->pic->have_sign) {
-						output ("unsigned ");
-					}
-					switch (f->size) {
-					case 2:
-						output ("short)COB_BSWAP_16(");
-						break;
-					case 4:
-						output ("int)COB_BSWAP_32(");
-						break;
-					case 8:
-						output ("long long)COB_BSWAP_64(");
-						break;
-					}
-					output ("*(");
-					switch (f->size) {
-					case 2:
-						output ("short *)(");
-						break;
-					case 4:
-						output ("int *)(");
-						break;
-					case 8:
-						output ("long long *)(");
-						break;
-					}
-					output_data (x);
-					output (")))");
-					return;
-				} else {
-					output ("(*(");
-					if (!f->pic->have_sign) {
-						output ("unsigned ");
-					}
-					switch (f->size) {
-					case 2:
-						output ("short *)(");
-						break;
-					case 4:
-						output ("int *)(");
-						break;
-					case 8:
-						output ("long long *)(");
-						break;
-					}
-					output_data (x);
-					output ("))");
-					return;
-				}
-			}
-			if (f->pic->have_sign == 0) {
-				output ("(unsigned int)");
-			}
-			break;
-
 		default:
 			break;
 		}
-
 		output_func_1 ("cob_get_int", x);
 		break;
 	case CB_TAG_INTRINSIC:
-		output ("cob_get_int (");
+		/* MIGRATION (C -> Python): module-qualified integer accessor. */
+		output ("move.cob_get_int (");
 		output_param (x, -1);
 		output (")");
 		break;
@@ -954,6 +1510,11 @@ output_integer (cb_tree x)
 static void
 output_index (cb_tree x)
 {
+	/* MIGRATION (C -> Python): a subscript / offset is emitted as a zero-based
+	   integer expression (COBOL is 1-based, so 1 is subtracted).  Constant
+	   subscripts fold to an integer literal; a computed subscript becomes
+	   "(<int-expr> - 1)" where <int-expr> is produced by output_integer (now a
+	   Python integer expression).  All forms are valid Python verbatim. */
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_INTEGER:
 		output ("%d", CB_INTEGER (x)->val - 1);
@@ -988,20 +1549,41 @@ output_param (cb_tree x, int id)
 	struct cb_alphabet_name	*rbp;
 	cb_tree			l;
 	int			n;
-	int			extrefs;
+	/* MIGRATION (C -> Python): the local "extrefs" tracker was write-only in
+	   the original C (its value was never read); the EXTERNAL/BASED state is
+	   carried entirely by the f->flag_* fields, which are still set below.  The
+	   dead tracker is removed.  "fname" named the reusable C temp cob_field for
+	   dynamic references; Python constructs each dynamic field inline via
+	   common.cob_field(...) and needs no temp, but the name is retained to keep
+	   the non-GNUC comma-tracking path intact. */
 	int			sav_stack_id;
 	char			fname[12];
 
 	param_id = id;
 
 	if (x == NULL) {
-		output ("NULL");
+		/* MIGRATION (C -> Python): a NULL field pointer -> None */
+		output ("None");
 		return;
 	}
 
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_CONST:
-		output ("%s", CB_CONST (x)->val);
+		/* MIGRATION (C -> Python): figurative-constant runtime fields were
+		   emitted as "&cob_zero", "&cob_space", ... in C.  In Python these are
+		   module-qualified runtime objects (common.cob_zero, ...); a NULL data
+		   pointer becomes None. */
+		if (x == cb_null) {
+			output ("None");
+		} else {
+			const char	*cval = CB_CONST (x)->val;
+
+			if (cval && cval[0] == '&') {
+				output ("%s.%s", codegen_pymod (cval + 1), cval + 1);
+			} else {
+				output ("%s", cval ? cval : "None");
+			}
+		}
 		break;
 	case CB_TAG_INTEGER:
 		output_integer (x);
@@ -1013,6 +1595,9 @@ output_param (cb_tree x, int id)
 		output_param (CB_LOCALE_NAME(x)->list, id);
 		break;
 	case CB_TAG_ALPHABET_NAME:
+		/* MIGRATION (C -> Python): translation tables (cob_a2e / cob_ebcdic_ascii
+		   / s_<name>) are module-level "bytes" objects in the emitted module, so
+		   they are referenced bare; the NATIVE table (C "NULL") becomes None. */
 		abp = CB_ALPHABET_NAME (x);
 		switch (abp->type) {
 		case CB_ALPHABET_STANDARD_1:
@@ -1024,12 +1609,12 @@ output_param (cb_tree x, int id)
 #endif
 		case CB_ALPHABET_NATIVE:
 			gen_native = 1;
-			output ("NULL");
+			output ("None");
 			break;
 		case CB_ALPHABET_EBCDIC:
 #ifdef	COB_EBCDIC_MACHINE
 			gen_native = 1;
-			output ("NULL");
+			output ("None");
 #else
 			gen_ebcdic = 1;
 			output ("cob_a2e");
@@ -1042,6 +1627,10 @@ output_param (cb_tree x, int id)
 		}
 		break;
 	case CB_TAG_CAST:
+		/* MIGRATION (C -> Python): address-of decorations are dropped; the
+		   referenced object (memoryview / field / int / size) is passed
+		   directly.  ADDRESS-OF-ADDRESS becomes common.cob_addr_of(data), a
+		   runtime pointer-to-pointer wrapper. */
 		cp = CB_CAST (x);
 		switch (cp->type) {
 		case CB_CAST_INTEGER:
@@ -1051,8 +1640,9 @@ output_param (cb_tree x, int id)
 			output_data (cp->val);
 			break;
 		case CB_CAST_ADDR_OF_ADDR:
-			output ("&");
+			output ("common.cob_addr_of(");
 			output_data (cp->val);
+			output (")");
 			break;
 		case CB_CAST_LENGTH:
 			output_size (cp->val);
@@ -1063,24 +1653,47 @@ output_param (cb_tree x, int id)
 		}
 		break;
 	case CB_TAG_DECIMAL:
-		output ("&d%d", CB_DECIMAL (x)->id);
+		/* MIGRATION (C -> Python): decimal temp object d<N> (a
+		   numeric.cob_decimal); address-of dropped. */
+		output ("d%d", CB_DECIMAL (x)->id);
 		break;
 	case CB_TAG_FILE:
 		output ("%s%s", CB_PREFIX_FILE, CB_FILE (x)->cname);
 		break;
 	case CB_TAG_LITERAL:
-		output ("&%s%d", CB_PREFIX_CONST, lookup_literal (x));
+		/* MIGRATION (C -> Python): constant field object c_<N>; address-of
+		   dropped. */
+		output ("%s%d", CB_PREFIX_CONST, lookup_literal (x));
 		break;
 	case CB_TAG_FIELD:
-		/* TODO: remove me */
+		/* MIGRATION (C -> Python): normalise a raw CB_FIELD operand into a
+		   field REFERENCE before emission.  output_param's emission logic is
+		   driven by cb_reference nodes (they carry the subscript/ref-mod and
+		   bounds-check chain), so a bare field is wrapped via
+		   cb_build_field_reference and re-dispatched through the
+		   CB_TAG_REFERENCE arm below.  (Inherited verbatim from the C emitter,
+		   where this arm was tagged with a "remove me" note; the wrap is still
+		   required because some callers pass unwrapped fields.) */
 		output_param (cb_build_field_reference (CB_FIELD (x), NULL), id);
 		break;
 	case CB_TAG_REFERENCE:
 		r = CB_REFERENCE (x);
-		extrefs = 0;
+		/* MIGRATION (C -> Python): the C backend wrapped the runtime bounds
+		   checks for a subscripted / reference-modified item in a GCC statement-
+		   expression "({ check; check; field; })" whose value is the field.
+		   Python has no statement-expression, so this is emitted as a tuple whose
+		   final element is the field reference and whose leading elements are the
+		   checks, then sub-scripted with [-1]:  "(check, check, field)[-1]".  Tuple
+		   elements evaluate left-to-right, so the checks (which raise on a bounds
+		   violation) run before the field view is built -- identical to C.  Every
+		   value on r->check is a FUNCALL (cob_check_subscript / cob_check_odo /
+		   cob_check_ref_mod, built by typeck.c via cb_build_funcall_4); each is
+		   emitted as a module-qualified call expression followed by ", ".  The
+		   closing "(...)[-1]" is emitted after the field expression below.  The
+		   __GNUC__ path is the live/authoritative path for the Python backend. */
 		if (r->check) {
 #ifdef __GNUC__
-			output_indent (" ({");
+			output (" (");
 #else
 			inside_stack[inside_check] = 0;
 			++inside_check;
@@ -1088,16 +1701,25 @@ output_param (cb_tree x, int id)
 #endif
 			for (l = r->check; l; l = CB_CHAIN (l)) {
 				sav_stack_id = stack_id;
-				output_stmt (CB_VALUE (l));
+				if (CB_FUNCALL_P (CB_VALUE (l))) {
+					output_funcall (CB_VALUE (l));
+					output (", ");
+				} else {
+					/* Defensive: all checks are FUNCALLs today, so this
+					   branch is unreachable; keep a safe fallback. */
+					output_stmt (CB_VALUE (l));
+				}
 				stack_id = sav_stack_id;
 			}
 		}
 
 		if (CB_FILE_P (r->value)) {
+			/* MIGRATION (C -> Python): a FILE reference is the module-level
+			   file object h_<cname> (no address-of). */
 			output ("%s%s", CB_PREFIX_FILE, CB_FILE (r->value)->cname);
 			if (r->check) {
 #ifdef __GNUC__
-				output ("; })");
+				output (")[-1]");
 #else
 				--inside_check;
 				output (" )");
@@ -1106,36 +1728,39 @@ output_param (cb_tree x, int id)
 			break;
 		}
 		if (CB_ALPHABET_NAME_P (r->value)) {
+			/* MIGRATION (C -> Python): an alphabet reference resolves to a
+			   module-level cob_field object (f_ebcdic_ascii / f_native /
+			   f_ebcdic / f_<cname>); the C address-of is dropped. */
 			rbp = CB_ALPHABET_NAME (r->value);
 			switch (rbp->type) {
 			case CB_ALPHABET_STANDARD_1:
 			case CB_ALPHABET_STANDARD_2:
 #ifdef	COB_EBCDIC_MACHINE
 				gen_ebcdic_ascii = 1;
-				output ("&f_ebcdic_ascii");
+				output ("f_ebcdic_ascii");
 				break;
 #endif
 			case CB_ALPHABET_NATIVE:
 				gen_native = 1;
-				output ("&f_native");
+				output ("f_native");
 				break;
 			case CB_ALPHABET_EBCDIC:
 #ifdef	COB_EBCDIC_MACHINE
 				gen_native = 1;
-				output ("&f_native");
+				output ("f_native");
 #else
 				gen_full_ebcdic = 1;
-				output ("&f_ebcdic");
+				output ("f_ebcdic");
 #endif
 				break;
 			case CB_ALPHABET_CUSTOM:
 				gen_custom = 1;
-				output ("&f_%s", rbp->cname);
+				output ("f_%s", rbp->cname);
 				break;
 			}
 			if (r->check) {
 #ifdef __GNUC__
-				output ("; })");
+				output (")[-1]");
 #else
 				--inside_check;
 				output (" )");
@@ -1145,7 +1770,6 @@ output_param (cb_tree x, int id)
 		}
 		f = CB_FIELD (r->value);
 		if (f->redefines && f->redefines->flag_external) {
-			extrefs = 1;
 			f->flag_item_external = 1;
 			f->flag_external = 1;
 		}
@@ -1154,12 +1778,10 @@ output_param (cb_tree x, int id)
 		}
 		for (pechk = f->parent; pechk; pechk = pechk->parent) {
 			if (pechk->flag_external) {
-				extrefs = 1;
 				f->flag_item_external = 1;
 				break;
 			}
 			if (pechk->redefines && pechk->redefines->flag_external) {
-				extrefs = 1;
 				f->flag_item_external = 1;
 				f->flag_external = 1;
 				break;
@@ -1196,24 +1818,61 @@ output_param (cb_tree x, int id)
 				output_target = savetarget;
 			}
 			if (f->flag_local) {
+				/* MIGRATION (C -> Python): a LOCAL / BASED / LINKAGE or ANY
+				   LENGTH item is a cached cob_field whose backing .data must be
+				   re-pointed at run time.  The C comma-expression
+				   "(f_N.data = <data>, &f_N)" becomes the runtime setter
+				   common.cob_field_set_data(f_N, <data>), which assigns the new
+				   data view and returns the field object so it can be passed as
+				   an argument.  An ANY LENGTH item already fixed up earlier is
+				   referenced by name only (address-of dropped). */
 				if (f->flag_any_length && f->flag_anylen_done) {
-					output ("&%s%d", CB_PREFIX_FIELD, f->id);
+					output ("%s%d", CB_PREFIX_FIELD, f->id);
 				} else {
-					output ("(%s%d.data = ", CB_PREFIX_FIELD, f->id);
+					/* MIGRATION (C -> Python): a LINKAGE / BASED item's backing
+					   base may legitimately be None at run time - an OMITTED
+					   CALL argument ("CALL ... USING OMITTED"), a BASED item not
+					   yet ALLOCATEd, or a linkage pointer SET to NULL.  The C
+					   runtime stored a NULL data pointer in cob_field and the
+					   only legal operation on it was the OMITTED class test
+					   (cob_is_omitted -> data == NULL).  memoryview(None) raises
+					   a TypeError, so guard the view: when the base is None pass
+					   None straight through to cob_field_set_data (which records
+					   field.data = None, exactly mirroring the NULL pointer), so
+					   cob_is_omitted reports True and the byte-exact behaviour is
+					   preserved for every bound (non-None) reference. */
+					output ("common.cob_field_set_data (%s%d, (", CB_PREFIX_FIELD, f->id);
 					output_data (x);
-					output (", &%s%d)", CB_PREFIX_FIELD, f->id);
+					output (" if ");
+					output_base (f);
+					output (" is not None else None))");
 					if (f->flag_any_length) {
 						f->flag_anylen_done = 1;
 					}
 				}
 			} else {
+				/* MIGRATION (C -> Python): a fixed, cached field is referenced by
+				   its module-level object name (s_<id> for SCREEN items, f_<id>
+				   otherwise); the C address-of is dropped. */
 				if (screenptr && f->storage == CB_STORAGE_SCREEN) {
-					output ("&s_%d", f->id);
+					output ("s_%d", f->id);
 				} else {
-					output ("&%s%d", CB_PREFIX_FIELD, f->id);
+					output ("%s%d", CB_PREFIX_FIELD, f->id);
 				}
 			}
 		} else {
+			/* MIGRATION (C -> Python): a dynamic field reference (subscripted,
+			   reference-modified, or of variable size / address) was emitted in C
+			   as a comma-expression that mutated a reusable temp "fN" and returned
+			   its address: "(fN.size = <size>, fN.data = <data>, fN.attr = <attr>,
+			   &fN)".  In Python each such reference is a freshly constructed
+			   common.cob_field(<size>, <data>, <attr>); no temp is reused and
+			   there is no pointer aliasing.  The C temp counter (stack_id /
+			   num_cob_fields) and the sprintf into fname are retained here only to
+			   keep the dead non-GNUC comma-tracking path syntactically consistent;
+			   the temp-field declaration block at storage finalization (which
+			   would otherwise emit "cob_field fN;") is converted to emit nothing
+			   under the single-module Python model. */
 			if (stack_id >= num_cob_fields) {
 				num_cob_fields = stack_id + 1;
 			}
@@ -1226,18 +1885,18 @@ output_param (cb_tree x, int id)
 				}
 			}
 #endif
-			output ("(%s.size = ", fname);
+			output ("common.cob_field (");
 			output_size (x);
-			output (", %s.data = ", fname);
+			output (", ");
 			output_data (x);
-			output (", %s.attr = ", fname);
+			output (", ");
 			output_attr (x);
-			output (", &%s)", fname);
+			output (")");
 		}
 
 		if (r->check) {
 #ifdef __GNUC__
-			output ("; })");
+			output (")[-1]");
 #else
 			--inside_check;
 			output (" )");
@@ -1245,8 +1904,13 @@ output_param (cb_tree x, int id)
 		}
 		break;
 	case CB_TAG_BINARY_OP:
+		/* MIGRATION (C -> Python): the COBOL binary-operation helper is module-
+		   qualified to the intrinsic runtime (intrinsic.cob_intr_binop); both
+		   operands are passed as field / value objects, the operator stays an
+		   integer opcode. */
 		bp = CB_BINARY_OP (x);
-		output ("cob_intr_binop (");
+		output_pyfunc ("cob_intr_binop");
+		output (" (");
 		output_param (bp->x, id);
 		output (", ");
 		output ("%d", bp->op);
@@ -1255,9 +1919,13 @@ output_param (cb_tree x, int id)
 		output (")");
 		break;
 	case CB_TAG_INTRINSIC:
+		/* MIGRATION (C -> Python): the intrinsic-function runtime routine is
+		   module-qualified (every intr_routine is a cob_intr_* name, so it
+		   resolves to the "intrinsic" module).  A NULL field argument -> None. */
 		n = 0;
 		ip = CB_INTRINSIC (x);
-		output ("%s (", ip->intr_tab->intr_routine);
+		output_pyfunc (ip->intr_tab->intr_routine);
+		output (" (");
 		if (ip->intr_tab->refmod) {
 			if (ip->offset) {
 				output_integer (ip->offset);
@@ -1276,7 +1944,7 @@ output_param (cb_tree x, int id)
 		}
 		if (ip->intr_field) {
 			if (ip->intr_field == cb_int0) {
-				output ("NULL");
+				output ("None");
 			} else if (ip->intr_field == cb_int1) {
 				for (l = ip->args; l; l = CB_CHAIN (l)) {
 					n++;
@@ -1318,40 +1986,52 @@ output_funcall (cb_tree x)
 
 	p = CB_FUNCALL (x);
 	if (p->name[0] == '$') {
+		/* MIGRATION (C -> Python): the three "$" pseudo-funcalls are inline
+		   single-byte operations the C emitter wrote with raw pointer
+		   dereferences ("*(ptr)").  output_data now yields a writable
+		   memoryview slice ("memoryview(b_N)[off:]"), so the first byte is
+		   addressed with "[0]" (memoryview item access reads/writes the
+		   underlying bytearray and returns/accepts a plain int 0..255).  The C
+		   "(int)" cast is unnecessary because memoryview indexing already yields
+		   an int.  The set operation masks with "& 0xFF" to reproduce C's silent
+		   truncation of an out-of-range value into an unsigned char (and to avoid
+		   a Python ValueError), which is byte-identical to "*(unsigned char*) =
+		   val".  Result values match the C byte arithmetic exactly. */
 		switch (p->name[1]) {
 		case 'E':
-			/* Set of one character */
-			output ("*(");
+			/* Set of one character: <data>[0] = (<val>) & 0xFF */
 			output_data (p->argv[0]);
-			output (") = ");
+			output ("[0] = (");
 			output_param (p->argv[1], 1);
+			output (") & 0xFF");
 			break;
 		case 'F':
-			/* Move of one character */
-			output ("*(");
+			/* Move of one character: <dst>[0] = <src>[0] */
 			output_data (p->argv[0]);
-			output (") = *(");
+			output ("[0] = ");
 			output_data (p->argv[1]);
-			output (")");
+			output ("[0]");
 			break;
 		case 'G':
-			/* Test of one character */
-			output ("(int)(*(");
+			/* Test of one character: (<data>[0] - <ref-byte>) */
+			output ("(");
 			output_data (p->argv[0]);
+			output ("[0]");
 			if (p->argv[1] == cb_space) {
-				output (") - ' ')");
+				output (" - 0x20)");
 			} else if (p->argv[1] == cb_zero) {
-				output (") - '0')");
+				output (" - 0x30)");
 			} else if (p->argv[1] == cb_low) {
-				output ("))");
+				/* LOW-VALUE is byte 0x00, so nothing is subtracted */
+				output (")");
 			} else if (p->argv[1] == cb_high) {
-				output (") - 255)");
+				output (" - 0xFF)");
 			} else if (CB_LITERAL_P (p->argv[1])) {
-				output (") - %d)", *(CB_LITERAL (p->argv[1])->data));
+				output (" - %d)", *(CB_LITERAL (p->argv[1])->data));
 			} else {
-				output (") - *(");
+				output (" - ");
 				output_data (p->argv[1]);
-				output ("))");
+				output ("[0])");
 			}
 			break;
 		default:
@@ -1359,8 +2039,54 @@ output_funcall (cb_tree x)
 		}
 		return;
 	}
+
+	/* MIGRATION (C -> Python): ALLOCATE / FREE of a BASED (or non-parameter
+	   LINKAGE) item cannot be a plain call - the C backend passed "&item->data"
+	   so cob_allocate/cob_free_alloc could re-point the item's storage pointer
+	   in place.  Python has no address-of-name, so these are lowered to a
+	   name-REBINDING assignment of the module-level backing name "b_<id>":
+	     ALLOCATE item [RETURNING ret]  ->  b_<id> = common.cob_alloc_based(ret, size)
+	     FREE item / FREE ADDRESS OF item ->  b_<id> = common.cob_free_based(b_<id>)
+	   The founder is recovered from the cast-wrapped first/relevant argument.
+	   The "ALLOCATE n CHARACTERS RETURNING ptr" form (no based target) has no
+	   founder and falls through to the ordinary call below.  The name is
+	   declared "global" in the dispatch scope (see output_internal_function). */
+	if (!strcmp (p->name, "cob_allocate")) {
+		struct cb_field	*bf = funcall_based_field (p->argv[0]);
+		if (bf && is_rebindable_base (current_prog, bf)) {
+			output_base (bf);
+			output (" = common.cob_alloc_based (");
+			/* arg[1] = RETURNING data pointer (or NULL); arg[2] = size */
+			output_param (p->argv[1], 1);
+			output (", ");
+			output_param (p->argv[2], 2);
+			output (")");
+			return;
+		}
+	} else if (!strcmp (p->name, "cob_free_alloc")) {
+		struct cb_field	*bf = funcall_based_field (p->argv[0]);
+		if (bf == NULL) {
+			bf = funcall_based_field (p->argv[1]);
+		}
+		if (bf && is_rebindable_base (current_prog, bf)) {
+			output_base (bf);
+			output (" = common.cob_free_based (");
+			output_base (bf);
+			output (")");
+			return;
+		}
+	}
+
+	/* MIGRATION (C -> Python): a normal runtime call.  The C runtime function
+	   name (chosen by the immutable typeck.c front-end) is emitted module-
+	   qualified as libcob_py.<module>.<name>(...) via output_pyfunc /
+	   codegen_pymod; address-of / cast decorations are dropped by output_param /
+	   output_data.  The variadic convention is preserved verbatim: a variable
+	   funcall emits the leading argument count (p->varcnt) followed by the
+	   flattened argument list, exactly as the C ABI the runtime mirrors. */
 	screenptr = p->screenptr;
-	output ("%s (", p->name);
+	output_pyfunc (p->name);
+	output (" (");
 	for (i = 0; i < p->argc; i++) {
 		if (p->varcnt && i + 1 == p->argc) {
 			output ("%d, ", p->varcnt);
@@ -1385,7 +2111,10 @@ output_funcall (cb_tree x)
 static void
 output_func_1 (const char *name, cb_tree x)
 {
-	output ("%s (", name);
+	/* MIGRATION (C -> Python): emit a module-qualified single-argument runtime
+	   call, e.g. "move.cob_get_int(<field>)" or "common.cob_get_pointer(...)". */
+	output_pyfunc (name);
+	output (" (");
 	output_param (x, param_id);
 	output (")");
 }
@@ -1399,12 +2128,27 @@ output_cond (cb_tree x, int save_flag)
 {
 	struct cb_binary_op	*p;
 
+	/* MIGRATION (C -> Python): a COBOL condition is lowered to a numeric value
+	   that is compared against 0 (e.g. cob_cmp(a,b) <op> 0).  The C emitter
+	   produced C boolean operators and an "(int)" cast; this re-expresses the
+	   same tree as a Python boolean expression:
+	     - logical NOT/AND/OR  ->  not / and / or
+	     - the redundant "(int)" cast is dropped (the inner value is already an
+	       int in Python: a memoryview byte, a cob_cmp* result, etc.)
+	     - a condition that needs intermediate statements (the decimal-comparison
+	       path builds a LIST of FUNCALLs ending in cob_decimal_cmp) was a GCC
+	       statement-expression "({ s1; s2; sN; })"; it becomes the Python tuple
+	       "(s1, s2, ..., sN)[-1]" (every list element is a FUNCALL, verified
+	       against typeck.c's decimal_expand/dpush)
+	     - when save_flag is set the C emitter captured the value with
+	       "(ret = <expr>)"; in Python this is the walrus assignment
+	       "(ret := <expr>)". */
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_CONST:
 		if (x == cb_true) {
-			output ("1");
+			output ("True");
 		} else if (x == cb_false) {
-			output ("0");
+			output ("False");
 		} else {
 			ABORT ();
 		}
@@ -1413,7 +2157,7 @@ output_cond (cb_tree x, int save_flag)
 		p = CB_BINARY_OP (x);
 		switch (p->op) {
 		case '!':
-			output ("!");
+			output ("not ");
 			output_cond (p->x, save_flag);
 			break;
 
@@ -1421,7 +2165,7 @@ output_cond (cb_tree x, int save_flag)
 		case '|':
 			output ("(");
 			output_cond (p->x, save_flag);
-			output (p->op == '&' ? " && " : " || ");
+			output (p->op == '&' ? " and " : " or ");
 			output_cond (p->y, save_flag);
 			output (")");
 			break;
@@ -1432,20 +2176,20 @@ output_cond (cb_tree x, int save_flag)
 		case '>':
 		case ']':
 		case '~':
-			output ("((int)");
+			output ("(");
 			output_cond (p->x, save_flag);
 			switch (p->op) {
 			case '=':
 				output (" == 0");
 				break;
 			case '<':
-				output (" <  0");
+				output (" < 0");
 				break;
 			case '[':
 				output (" <= 0");
 				break;
 			case '>':
-				output (" >  0");
+				output (" > 0");
 				break;
 			case ']':
 				output (" >= 0");
@@ -1464,7 +2208,7 @@ output_cond (cb_tree x, int save_flag)
 		break;
 	case CB_TAG_FUNCALL:
 		if (save_flag) {
-			output ("(ret = ");
+			output ("(ret := ");
 		}
 		output_funcall (x);
 		if (save_flag) {
@@ -1473,24 +2217,20 @@ output_cond (cb_tree x, int save_flag)
 		break;
 	case CB_TAG_LIST:
 		if (save_flag) {
-			output ("(ret = ");
+			output ("(ret := ");
 		}
-#ifdef __GNUC__
-		output_indent ("({");
-#else
-		inside_stack[inside_check] = 0;
-		++inside_check;
-		output ("(\n");
-#endif
+		output ("(");
 		for (; x; x = CB_CHAIN (x)) {
-			output_stmt (CB_VALUE (x));
+			if (CB_FUNCALL_P (CB_VALUE (x))) {
+				output_funcall (CB_VALUE (x));
+			} else {
+				/* Defensive: condition lists hold only FUNCALLs today
+				   (decimal_expand/dpush), so this is unreachable. */
+				output_funcall (CB_VALUE (x));
+			}
+			output (", ");
 		}
-#ifdef __GNUC__
-		output_indent ("})");
-#else
-		--inside_check;
-		output (")");
-#endif
+		output (")[-1]");
 		if (save_flag) {
 			output (")");
 		}
@@ -1508,6 +2248,11 @@ output_cond (cb_tree x, int save_flag)
 static void
 output_move (cb_tree src, cb_tree dst)
 {
+	/* MIGRATION (C -> Python): unchanged.  This helper builds a MOVE funcall
+	   tree and routes it through output_stmt -> output_funcall, where the
+	   selected cob_move / data-movement family name is module-qualified to the
+	   "move" runtime module (codegen_pymod rule for cob_move / cob_set_int /
+	   cob_get_int) -- the GAP module per AAP 0.6.5.  No surface change here. */
 	/* suppress warnings */
 	suppress_warn = 1;
 	output_stmt (cb_build_move (src, dst));
@@ -1627,20 +2372,23 @@ initialize_uniform_char (struct cb_field *f)
 static void
 output_figurative (cb_tree x, struct cb_field *f, const int value)
 {
+	/* MIGRATION (C -> Python): fill a field with a single figurative byte.  A
+	   one-byte field is set via memoryview item assignment ("<data>[0] = v");
+	   wider fields use the module-qualified common.memset.  "value" is a
+	   compile-time figurative byte (0..255), so no masking is required. */
 	output_prefix ();
 	if (f->size == 1) {
-		output ("*(unsigned char *)(");
 		output_data (x);
-		output (") = %d;\n", value);
+		output ("[0] = %d\n", value);
 	} else {
-		output ("memset (");
+		output ("common.memset (");
 		output_data (x);
 		if (CB_REFERENCE_P(x) && CB_REFERENCE(x)->length) {
 			output (", %d, ", value);
 			output_size (x);
-			output (");\n");
+			output (")\n");
 		} else {
-			output (", %d, %d);\n", value, f->size);
+			output (", %d, %d)\n", value, f->size);
 		}
 	}
 }
@@ -1651,62 +2399,74 @@ output_initialize_literal (cb_tree x, struct cb_field *f, struct cb_literal *l)
 	size_t	i;
 	size_t	n;
 
+	/* MIGRATION (C -> Python): memset/memcpy are module-qualified (common.*);
+	   the data pointer arithmetic "<data> + (i0 * sz)" becomes a memoryview
+	   slice "<data>[i0 * sz:]"; the C "for (i0=0; i0<N; i0++)" loop becomes a
+	   Python "for i0 in range(N):" block.  IMPORTANT byte-parity detail: in C
+	   the loop counter equals N after the loop, so the trailing remainder copy
+	   "<data> + (i0 * sz)" addresses offset N*sz; a Python "for" leaves i0 at
+	   N-1, so the remainder copy emits the EXPLICIT literal offset (i * l->size,
+	   i.e. f->size - n) instead of reusing i0 -- preserving the exact target
+	   offset. */
 	if (l->size == 1) {
 		output_prefix ();
-		output ("memset (");
+		output ("common.memset (");
 		output_data (x);
 		if (CB_REFERENCE_P(x) && CB_REFERENCE(x)->length) {
 			output (", %d, ", l->data[0]);
 			output_size (x);
-			output (");\n");
+			output (")\n");
 		} else {
-			output (", %d, %d);\n", l->data[0], f->size);
+			output (", %d, %d)\n", l->data[0], f->size);
 		}
 		return;
 	}
 	if (l->size >= f->size) {
 		output_prefix ();
-		output ("memcpy (");
+		output ("common.memcpy (");
 		output_data (x);
 		output (", ");
 		output_string (l->data, f->size);
-		output (", %d);\n", f->size);
+		output (", %d)\n", f->size);
 		return;
 	}
 	i = f->size / l->size;
 	i_counters[0] = 1;
-	output_line ("for (i0 = 0; i0 < %u; i0++)", (unsigned int)i);
-	output_indent ("  {");
+	output_line ("for i0 in range(%u):", (unsigned int)i);
+	output_block_open ();
 	output_prefix ();
-	output ("memcpy (");
+	output ("common.memcpy (");
 	output_data (x);
-	output (" + (i0 * %u), ", (unsigned int)l->size);
+	output ("[i0 * %u:], ", (unsigned int)l->size);
 	output_string (l->data, l->size);
-	output (", %u);\n", (unsigned int)l->size);
-	output_indent ("  }");
+	output (", %u)\n", (unsigned int)l->size);
+	output_block_close ();
 	n = f->size % l->size;
 	if (n) {
 		output_prefix ();
-		output ("memcpy (");
+		output ("common.memcpy (");
 		output_data (x);
-		output (" + (i0 * %u), ", (unsigned int)l->size);
+		output ("[%u:], ", (unsigned int)(i * l->size));
 		output_string (l->data, n);
-		output (", %u);\n", (unsigned int)n);
+		output (", %u)\n", (unsigned int)n);
 	}
 }
 
 static void
 output_initialize_fp (cb_tree x, struct cb_field *f)
 {
+	/* MIGRATION (C -> Python): zero a floating-point field.  The C code copied
+	   the bytes of a 0.0 float/double into the field.  IEEE-754 positive zero is
+	   an all-zero byte pattern, so this is byte-identical to a zero-fill of the
+	   field's 4 (COMP-1) or 8 (COMP-2) bytes via common.memset. */
 	output_prefix ();
-	if (f->usage == CB_USAGE_FLOAT) {
-		output ("{float temp = 0.0;");
-	} else {
-		output ("{double temp = 0.0;");
-	}
-	output (" memcpy (");
+	output ("common.memset (");
 	output_data (x);
-	output (", (char *)&temp, sizeof(temp));}\n");
+	if (f->usage == CB_USAGE_FLOAT) {
+		output (", 0, 4)\n");
+	} else {
+		output (", 0, 8)\n");
+	}
 }
 
 static void
@@ -1715,10 +2475,18 @@ output_initialize_external (cb_tree x, struct cb_field *f)
 	unsigned char	*p;
 	char		name[COB_MINI_BUFF];
 
+	/* MIGRATION (C -> Python): an EXTERNAL data item is backed by named shared
+	   storage.  The C emitter assigned the external address to the field's base
+	   pointer.  In Python the module-level base object (b_N) is rebound to the
+	   shared buffer returned by common.cob_external_addr(name, size); output_base
+	   names the assignable base (output_data would yield a non-assignable
+	   memoryview slice).  [CONTRACT for libcob_py.common: cob_external_addr
+	   returns a persistent writable buffer keyed by name+size, shared across
+	   compilation units, that memoryview() can wrap.] */
 	output_prefix ();
-	output_data (x);
+	output_base (f);
 	if (f->ename) {
-		output (" = cob_external_addr (\"%s\", %d);\n", f->ename, f->size);
+		output (" = common.cob_external_addr (\"%s\", %d)\n", f->ename, f->size);
 	} else {
 		strcpy (name, f->name);
 		for (p = (unsigned char *)name; *p; p++) {
@@ -1726,27 +2494,30 @@ output_initialize_external (cb_tree x, struct cb_field *f)
 				*p = (unsigned char)toupper (*p);
 			}
 		}
-		output (" = cob_external_addr (\"%s\", %d);\n", name, f->size);
+		output (" = common.cob_external_addr (\"%s\", %d)\n", name, f->size);
 	}
 }
 
 static void
 output_initialize_uniform (cb_tree x, int c, int size)
 {
+	/* MIGRATION (C -> Python): fill "size" bytes with the uniform byte "c".  A
+	   one-byte target uses memoryview item assignment ("<data>[0] = c"); wider
+	   targets use module-qualified common.memset.  "c" is a compile-time byte
+	   (0..255). */
 	output_prefix ();
 	if (size == 1) {
-		output ("*(unsigned char *)(");
 		output_data (x);
-		output (") = %d;\n", c);
+		output ("[0] = %d\n", c);
 	} else {
-		output ("memset (");
+		output ("common.memset (");
 		output_data (x);
 		if (CB_REFERENCE_P(x) && CB_REFERENCE(x)->length) {
 			output (", %d, ", c);
 			output_size (x);
-			output (");\n");
+			output (")\n");
 		} else {
-			output (", %d, %d);\n", c, size);
+			output (", %d, %d)\n", c, size);
 		}
 	}
 }
@@ -1769,10 +2540,12 @@ output_initialize_one (struct cb_initialize *p, cb_tree x)
 
 	/* CHAINING */
 	if (f->flag_chained) {
+		/* MIGRATION (C -> Python): module-qualified call; drop ';'. */
 		output_prefix ();
-		output ("cob_chain_setup (");
+		output_pyfunc ("cob_chain_setup");
+		output (" (");
 		output_data (x);
-		output (", %d, %d);\n", f->param_num, f->size);
+		output (", %d, %d)\n", f->param_num, f->size);
 		return;
 	}
 	/* Initialize by value */
@@ -1828,11 +2601,16 @@ output_initialize_one (struct cb_initialize *p, cb_tree x)
 				memcpy (buff, l->data, l->size);
 				memset (buff + l->size, ' ', f->size - l->size);
 			}
+			/* MIGRATION (C -> Python): the run-length analysis of "buff"
+			   is a compile-time optimization that is preserved verbatim; only
+			   the EMITTED primitives change -- memset/memcpy are module-
+			   qualified (common.*), a one-byte store uses memoryview item
+			   assignment, the C "<data> + off" pointer arithmetic becomes the
+			   memoryview slice "<data>[off:]", and trailing ';' are dropped. */
 			output_prefix ();
 			if (f->size == 1) {
-				output ("*(unsigned char *) (");
 				output_data (x);
-				output (") = %d;\n", *(unsigned char *)buff);
+				output ("[0] = %d\n", *(unsigned char *)buff);
 			} else {
 				buffchar = *buff;
 				for (i = 0; i < f->size; i++) {
@@ -1841,9 +2619,9 @@ output_initialize_one (struct cb_initialize *p, cb_tree x)
 					}
 				}
 				if (i == f->size) {
-					output ("memset (");
+					output ("common.memset (");
 					output_data (x);
-					output (", %d, %d);\n", buffchar, f->size);
+					output (", %d, %d)\n", buffchar, f->size);
 				} else {
 					if (f->size >= 8) {
 						buffchar = *(buff + f->size - 1);
@@ -1854,25 +2632,25 @@ output_initialize_one (struct cb_initialize *p, cb_tree x)
 							}
 						}
 						if (n > 2) {
-							output ("memcpy (");
+							output ("common.memcpy (");
 							output_data (x);
 							output (", ");
 							output_string ((ucharptr) buff,
 								       f->size - n);
-							output (", %d);\n", f->size - n);
+							output (", %d)\n", f->size - n);
 							output_prefix ();
-							output ("memset (");
+							output ("common.memset (");
 							output_data (x);
-							output (" + %d, %d, %d);\n",
+							output ("[%d:], %d, %d)\n",
 								f->size - n, buffchar, n);
 							return;
 						}
 					}
-					output ("memcpy (");
+					output ("common.memcpy (");
 					output_data (x);
 					output (", ");
 					output_string ((ucharptr) buff, f->size);
-					output (", %d);\n", f->size);
+					output (", %d)\n", f->size);
 				}
 			}
 		}
@@ -1972,11 +2750,16 @@ output_initialize_compound (struct cb_initialize *p, cb_tree x)
 		default:
 			if (f->flag_occurs) {
 				/* Begin occurs loop */
+				/* MIGRATION (C -> Python): the C 1-based inclusive loop
+				   "for (iN = 1; iN <= max; iN++)" becomes the Python
+				   "for iN in range (1, max + 1):" form (range stop is
+				   exclusive, hence the "+ 1").  The C brace block becomes
+				   an indented Python suite opened by output_block_open(). */
 				i = f->indexes;
 				i_counters[i] = 1;
-				output_line ("for (i%d = 1; i%d <= %d; i%d++)",
-					     i, i, f->occurs_max, i);
-				output_indent ("  {");
+				output_line ("for i%d in range (1, %d + 1):",
+					     i, f->occurs_max);
+				output_block_open ();
 				CB_REFERENCE (c)->subs =
 				    cb_cons (cb_i[i], CB_REFERENCE (c)->subs);
 			}
@@ -1989,8 +2772,11 @@ output_initialize_compound (struct cb_initialize *p, cb_tree x)
 
 			if (f->flag_occurs) {
 				/* Close loop */
+				/* MIGRATION (C -> Python): close the occurs-loop suite by
+				   dedenting; output_block_close() injects "pass" if the
+				   loop body emitted nothing. */
 				CB_REFERENCE (c)->subs = CB_CHAIN (CB_REFERENCE (c)->subs);
-				output_indent ("  }");
+				output_block_close ();
 			}
 		}
 		if(f == ff) break;
@@ -2033,6 +2819,9 @@ output_initialize (struct cb_initialize *p)
  * SEARCH
  */
 
+/* MIGRATION (C -> Python): emits a Python integer expression for the number
+   of occurrences -- either the OCCURS DEPENDING ON count (via output_integer)
+   or the literal maximum.  Already valid Python; used as a sub-expression. */
 static void
 output_occurs (struct cb_field *p)
 {
@@ -2064,8 +2853,9 @@ output_search_whens (cb_tree table, cb_tree var, cb_tree stmt, cb_tree whens)
 	}
 
 	/* Start loop */
-	output_line ("for (;;)");
-	output_indent ("  {");
+	/* MIGRATION (C -> Python): "for (;;) { ... }" -> "while True:" suite. */
+	output_line ("while True:");
+	output_block_open ();
 
 	/* End test */
 	output_prefix ();
@@ -2073,28 +2863,38 @@ output_search_whens (cb_tree table, cb_tree var, cb_tree stmt, cb_tree whens)
 	output_integer (idx);
 	output (" > ");
 	output_occurs (p);
-	output (")\n");
-	output_indent ("  {");
+	output ("):\n");
+	output_block_open ();
 	if (stmt) {
 		output_stmt (stmt);
 	}
-	output_line ("break;");
-	output_indent ("  }");
+	output_line ("break");
+	output_block_close ();
 
 	/* WHEN test */
+	/* MIGRATION (C -> Python): output_stmt(whens) emits the WHEN tests as a
+	   flat Python if/elif chain (see output_stmt IF handling); the "else:"
+	   appended here therefore binds to that chain and runs when no WHEN
+	   matched -- bumping the index and continuing the search loop. */
 	output_stmt (whens);
-	output_line ("else");
-	output_indent ("  {");
+	output_line ("else:");
+	output_block_open ();
+	/* MIGRATION (C -> Python): "idx++" has no Python form on a COBOL index;
+	   emit the runtime SETTER move.cob_set_int(field, current + 1) (the
+	   current value is read by output_integer via move.cob_get_int). */
 	output_prefix ();
+	output ("move.cob_set_int (");
+	output_param (idx, -1);
+	output (", ");
 	output_integer (idx);
-	output ("++;\n");
+	output (" + 1)\n");
 	if (var && var != idx) {
 		output_move (idx, var);
 	}
-	output_line ("continue;");
-	output_indent ("  }");
-	output_line ("break;");
-	output_indent ("  }");
+	output_line ("continue");
+	output_block_close ();
+	output_line ("break");
+	output_block_close ();
 }
 
 static void
@@ -2106,57 +2906,65 @@ output_search_all (cb_tree table, cb_tree stmt, cb_tree cond, cb_tree when)
 	p = cb_field (table);
 	idx = CB_VALUE (p->index_list);
 	/* Header */
-	output_indent ("{");
-	output_line ("int ret;");
-	output_line ("int head = %d - 1;", p->occurs_min);
+	/* MIGRATION (C -> Python): the C bare scope "{ int ret; int head;
+	   int tail; ... }" becomes plain Python locals -- Python has no block
+	   scope, so no brace/indent is emitted for the scope itself.  "ret" is
+	   created by the walrus in output_cond(cond, 1); "head"/"tail" are plain
+	   Python ints.  The binary-search midpoint divides two provably
+	   non-negative operands, so Python floor "//" equals C truncation. */
+	output_line ("head = %d - 1", p->occurs_min);
 	output_prefix ();
-	output ("int tail = ");
+	output ("tail = ");
 	output_occurs (p);
-	output (" + 1;\n");
+	output (" + 1\n");
 
 	/* Start loop */
-	output_line ("for (;;)");
-	output_indent ("  {");
+	output_line ("while True:");
+	output_block_open ();
 
 	/* End test */
-	output_line ("if (head >= tail - 1)");
-	output_indent ("  {");
+	output_line ("if (head >= tail - 1):");
+	output_block_open ();
 	if (stmt) {
 		output_stmt (stmt);
 	}
-	output_line ("break;");
-	output_indent ("  }");
+	output_line ("break");
+	output_block_close ();
 
 	/* Next index */
 	output_prefix ();
-	output_integer (idx);
-	output (" = (head + tail) / 2;\n");
+	output ("move.cob_set_int (");
+	output_param (idx, -1);
+	output (", (head + tail) // 2)\n");
 
 	/* WHEN test */
 	output_prefix ();
 	output ("if (");
 	output_cond (cond, 1);
-	output (")\n");
-	output_indent_level += 2;
+	output ("):\n");
+	output_block_open ();
 	output_stmt (when);
-	output_indent_level -= 2;
-	output_line ("else");
-	output_indent ("  {");
-	output_line ("if (ret < 0)");
+	output_block_close ();
+	output_line ("else:");
+	output_block_open ();
+	output_line ("if (ret < 0):");
+	output_block_open ();
 	output_prefix ();
-	output ("  head = ");
+	output ("head = ");
 	output_integer (idx);
-	output (";\n");
-	output_line ("else");
+	output ("\n");
+	output_block_close ();
+	output_line ("else:");
+	output_block_open ();
 	output_prefix ();
-	output ("  tail = ");
+	output ("tail = ");
 	output_integer (idx);
-	output (";\n");
-	output_line ("continue;");
-	output_indent ("  }");
-	output_line ("break;");
-	output_indent ("  }");
-	output_indent ("}");
+	output ("\n");
+	output_block_close ();
+	output_line ("continue");
+	output_block_close ();
+	output_line ("break");
+	output_block_close ();
 }
 
 static void
@@ -2189,6 +2997,11 @@ output_call (struct cb_call *p)
 	size_t			retptr;
 	int			dynamic_link = 1;
 	int			sizes;
+	/* MIGRATION (C -> Python): BY VALUE width/signedness, formerly expressed
+	   as a C cast "(unsigned short)(...)", are now passed to the runtime
+	   helper call.cob_value_int(value, nbytes, unsigned_flag). */
+	int			vbytes;
+	int			vunsigned;
 
 	retptr = 0;
 	if (p->returning && CB_TREE_CLASS(p->returning) == CB_CLASS_POINTER) {
@@ -2213,12 +3026,11 @@ output_call (struct cb_call *p)
 	}
 
 	/* Local variables */
-	output_indent ("{");
-#ifdef	COB_NON_ALIGNED
-	if (dynamic_link && retptr) {
-		output_line ("void *temptr;");
-	}
-#endif
+	/* MIGRATION (C -> Python): the former C bare scope "{ ... }" that
+	   declared content_N unions / ptr_N pointers / temptr is dropped --
+	   Python has no block scope and needs no pre-declaration; the temporary
+	   argument copies below become ordinary Python locals created on first
+	   assignment. */
 
 	if (CB_REFERENCE_P (p->name)
 	    && CB_FIELD_P (CB_REFERENCE (p->name)->value)
@@ -2227,70 +3039,38 @@ output_call (struct cb_call *p)
 	}
 
 	/* Setup arguments */
-	for (l = p->args, n = 1; l; l = CB_CHAIN (l), n++) {
-		x = CB_VALUE (l);
-		switch (CB_PURPOSE_INT (l)) {
-		case CB_CALL_BY_REFERENCE:
-			if (CB_NUMERIC_LITERAL_P (x) || CB_BINARY_OP_P (x)) {
-				output_line ("union {");
-				output_line ("\tunsigned char data[8];");
-				output_line ("\tlong long     datall;");
-				output_line ("\tint           dataint;");
-				output_line ("} content_%d;", (int)n);
-			} else if (CB_CAST_P (x)) {
-				output_line ("void *ptr_%d;", (int)n);
-			}
-			break;
-		case CB_CALL_BY_CONTENT:
-			if (CB_CAST_P (x)) {
-				output_line ("void *ptr_%d;", (int)n);
-			} else if (CB_TREE_TAG (x) != CB_TAG_INTRINSIC &&
-			    x != cb_null && !(CB_CAST_P (x))) {
-				output_line ("union {");
-				output ("\tunsigned char data[");
-				if (CB_NUMERIC_LITERAL_P (x) ||
-				    CB_BINARY_OP_P (x) || CB_CAST_P(x)) {
-					output ("8");
-				} else {
-					if (CB_REF_OR_FIELD_P (x)) {
-						output ("%d", (int)cb_field (x)->size);
-					} else {
-						output_size (x);
-					}
-				}
-				output ("];\n");
-				output_line ("\tlong long     datall;");
-				output_line ("\tint           dataint;");
-				output_line ("} content_%d;", (int)n);
-			}
-			break;
-		}
-	}
-	output ("\n");
+	/* MIGRATION (C -> Python): the C declaration pass is skipped entirely;
+	   only the value-building assignments are emitted.  BY CONTENT / BY
+	   REFERENCE temporaries become Python objects:
+	     - a numeric literal or expression passed by reference/content is
+	       materialised into a writable native-endian buffer via
+	       call.cob_content_int(value, fits_int);
+	     - a data item passed BY CONTENT is copied into a fresh writable
+	       buffer via call.cob_content_buffer(data, size) so the callee
+	       cannot mutate the caller's storage (correct BY CONTENT semantics);
+	     - a CAST (e.g. ADDRESS OF) yields a pointer value stored in ptr_N. */
 	for (l = p->args, n = 1; l; l = CB_CHAIN (l), n++) {
 		x = CB_VALUE (l);
 		switch (CB_PURPOSE_INT (l)) {
 		case CB_CALL_BY_REFERENCE:
 			if (CB_NUMERIC_LITERAL_P (x)) {
 				output_prefix ();
+				output ("content_%d = call.cob_content_int (", (int)n);
 				if (cb_fits_int (x)) {
-					output ("content_%d.dataint = ", (int)n);
-					output ("%d", cb_get_int (x));
+					output ("%d, 1)\n", cb_get_int (x));
 				} else {
-					output ("content_%d.datall = ", (int)n);
-					output ("%lldLL", cb_get_long_long (x));
+					output ("%lldLL, 0)\n", cb_get_long_long (x));
 				}
-				output (";\n");
 			} else if (CB_BINARY_OP_P (x)) {
 				output_prefix ();
-				output ("content_%d.dataint = ", (int)n);
+				output ("content_%d = call.cob_content_int (", (int)n);
 				output_integer (x);
-				output (";\n");
+				output (", 1)\n");
 			} else if (CB_CAST_P (x)) {
 				output_prefix ();
 				output ("ptr_%d = ", (int)n);
 				output_integer (x);
-				output (";\n");
+				output ("\n");
 			}
 			break;
 		case CB_CALL_BY_CONTENT:
@@ -2298,39 +3078,43 @@ output_call (struct cb_call *p)
 				output_prefix ();
 				output ("ptr_%d = ", (int)n);
 				output_integer (x);
-				output (";\n");
-			} else if (CB_TREE_TAG (x) != CB_TAG_INTRINSIC) {
+				output ("\n");
+			} else if (CB_TREE_TAG (x) != CB_TAG_INTRINSIC &&
+			    x != cb_null && !(CB_CAST_P (x))) {
 				if (CB_NUMERIC_LITERAL_P (x)) {
 					output_prefix ();
+					output ("content_%d = call.cob_content_int (", (int)n);
 					if (cb_fits_int (x)) {
-						output ("content_%d.dataint = ", (int)n);
-						output ("%d", cb_get_int (x));
+						output ("%d, 1)\n", cb_get_int (x));
 					} else {
-						output ("content_%d.datall = ", (int)n);
-						output ("%lldLL", cb_get_long_long (x));
+						output ("%lldLL, 0)\n", cb_get_long_long (x));
 					}
-					output (";\n");
 				} else if (CB_REF_OR_FIELD_P (x) &&
-					   CB_TREE_CATEGORY (x) == CB_CATEGORY_NUMERIC &&
-					   cb_field (x)->usage == CB_USAGE_LENGTH) {
+				    CB_TREE_CATEGORY (x) == CB_CATEGORY_NUMERIC &&
+				    cb_field (x)->usage == CB_USAGE_LENGTH) {
 					output_prefix ();
-					output ("content_%d.dataint = ", (int)n);
+					output ("content_%d = call.cob_content_int (", (int)n);
 					output_integer (x);
-					output (";\n");
-				} else if (x != cb_null && !(CB_CAST_P (x))) {
+					output (", 1)\n");
+				} else {
 					output_prefix ();
-					output ("memcpy (content_%d.data, ", (int)n);
+					output ("content_%d = call.cob_content_buffer (", (int)n);
 					output_data (x);
 					output (", ");
 					output_size (x);
-					output (");\n");
+					output (")\n");
 				}
 			}
 			break;
 		}
 	}
 
-	/* Function name */
+	/* Function name / parameter table */
+	/* MIGRATION (C -> Python): "module.cob_procedure_parameters[N]" is a
+	   member of the per-program cob_module object (NOT the runtime global),
+	   so it keeps its "module." qualifier verbatim; the global cob_call_params
+	   is exposed by the runtime facade as common.cob_call_params.  NULL
+	   becomes Python None. */
 	n = 0;
 	for (l = p->args; l; l = CB_CHAIN (l), n++) {
 		x = CB_VALUE (l);
@@ -2351,85 +3135,69 @@ output_call (struct cb_call *p)
 				output_param (x, -1);
 				break;
 			default:
-				output ("NULL");
+				output ("None");
 				break;
 			}
 			break;
 		default:
-			output ("NULL");
+			output ("None");
 			break;
 		}
-		output (";\n");
+		output ("\n");
 	}
 	for (parmnum = n; parmnum < n + 4; parmnum++) {
-		output_line ("module.cob_procedure_parameters[%d] = NULL;", (int)parmnum);
+		output_line ("module.cob_procedure_parameters[%d] = None", (int)parmnum);
 	}
 	parmnum = n;
-	output_prefix ();
-	output ("cob_call_params = %d;\n", (int)n);
-	output_prefix ();
+	output_line ("common.cob_call_params = %d", (int)n);
+
+	/* Resolve the target into a single Python callable "_unifunc". */
+	/* MIGRATION (C -> Python): the C union machinery (cob_unifunc /
+	   call_<name> with overlapping funcptr/funcint/func_void members)
+	   collapses to one Python variable holding a callable -- a Python
+	   COBOL program / system routine returns its int return-code (or a
+	   pointer) directly, so no type-punning union is needed.  Python has
+	   no static linking, so even a "static" literal CALL is resolved
+	   dynamically through call.cob_resolve (importlib's module cache makes
+	   this inexpensive); the *_1 resolver variants abort on failure (used
+	   when there is no ON OVERFLOW/EXCEPTION handler) while the non-_1
+	   variants return None (used so the handler can test for it). */
 	if (!dynamic_link) {
 		if (CB_REFERENCE_P (p->name) &&
 		    CB_FIELD_P (CB_REFERENCE (p->name)->value) &&
 		    CB_FIELD (CB_REFERENCE (p->name)->value)->usage ==
 		    CB_USAGE_PROGRAM_POINTER) {
-			output ("cob_unifunc.func_void = ");
-			output_integer (p->name);
-			output (";\n");
+			/* PROGRAM POINTER: the field already holds a callable. */
 			output_prefix ();
-			if (retptr) {
-#ifdef	COB_NON_ALIGNED
-				output ("temptr");
-#else
-				output_integer (p->returning);
-#endif
-				output (" = cob_unifunc.funcptr");
-			} else {
-				output_integer (current_prog->cb_return_code);
-				output (" = cob_unifunc.funcint");
-			}
+			output ("_unifunc = ");
+			output_integer (p->name);
+			output ("\n");
+		} else if (system_call) {
+			/* System routine: a function in libcob_py.system. */
+			output_line ("_unifunc = system.%s", system_call);
 		} else {
-			/* Static link */
-			if (retptr) {
-#ifdef	COB_NON_ALIGNED
-				output ("temptr");
-#else
-				output_integer (p->returning);
-#endif
-			} else {
-				output_integer (current_prog->cb_return_code);
-			}
-			output (" = ");
-			if (retptr) {
-				output ("(void *)");
-			}
-			if (system_call) {
-				output ("%s", system_call);
-			} else {
-				output ("%s",
-					cb_encode_program_id ((char *)(CB_LITERAL (p->name)->data)));
-			}
+			/* Static literal CALL -> resolved dynamically in Python. */
+			output_line ("_unifunc = call.cob_resolve (\"%s\")",
+				     (char *)(CB_LITERAL (p->name)->data));
 		}
 	} else {
 		/* Dynamic link */
 		if (CB_LITERAL_P (p->name)) {
 			callp = cb_encode_program_id ((char *)(CB_LITERAL (p->name)->data));
+			/* Registration retained for the call cache (its module-level
+			   declaration is a no-op under the Python backend). */
 			lookup_call (callp);
-			output ("if (unlikely(call_%s.func_void == NULL)) {\n", callp);
-			output_prefix ();
-			output ("  call_%s.func_void = ", callp);
 			if (!p->stmt1) {
-				output ("cob_resolve_1 ((const char *)\"%s\");\n",
-					 (char *)(CB_LITERAL (p->name)->data));
+				output_line ("_unifunc = call.cob_resolve_1 (\"%s\")",
+					     (char *)(CB_LITERAL (p->name)->data));
 			} else {
-				output ("cob_resolve ((const char *)\"%s\");\n",
-					 (char *)(CB_LITERAL (p->name)->data));
+				output_line ("_unifunc = call.cob_resolve (\"%s\")",
+					     (char *)(CB_LITERAL (p->name)->data));
 			}
-			output_prefix ();
-			output ("}\n");
 		} else {
 			callp = NULL;
-			output ("cob_unifunc.func_void = ");
+			output_prefix ();
+			output ("_unifunc = ");
 			if (!p->stmt1) {
 				output_funcall (cb_build_funcall_1 (
 						"cob_call_resolve_1", p->name));
@@ -2437,54 +3205,53 @@ output_call (struct cb_call *p)
 				output_funcall (cb_build_funcall_1 (
 						"cob_call_resolve", p->name));
 			}
-			output (";\n");
-		}
-		if (p->stmt1) {
-			if (callp) {
-				output_line ("if (unlikely(call_%s.func_void == NULL))", callp);
-			} else {
-				output_line ("if (unlikely(cob_unifunc.func_void == NULL))");
-			}
-			output_indent_level += 2;
-			output_stmt (p->stmt1);
-			output_indent_level -= 2;
-			output_line ("else");
-			output_indent ("  {");
-		}
-		output_prefix ();
-		if (retptr) {
-#ifdef	COB_NON_ALIGNED
-			output ("temptr");
-#else
-			output_integer (p->returning);
-#endif
-			if (callp) {
-				output (" = call_%s.funcptr", callp);
-			} else {
-				output (" = cob_unifunc.funcptr");
-			}
-		} else {
-			output_integer (current_prog->cb_return_code);
-			if (callp) {
-				output (" = call_%s.funcint", callp);
-			} else {
-				output (" = cob_unifunc.funcint");
-			}
+			output ("\n");
 		}
 	}
 
+	/* ON OVERFLOW / ON EXCEPTION handler (dynamic link only). */
+	if (p->stmt1) {
+		output_line ("if (_unifunc is None):");
+		output_block_open ();
+		output_stmt (p->stmt1);
+		output_block_close ();
+		output_line ("else:");
+		output_block_open ();
+	}
+
+	/* The call itself + return-code / RETURNING-pointer capture. */
+	/* MIGRATION (C -> Python): "<retcode> = funcptr (args)" becomes the
+	   runtime SETTER move.cob_set_int / move.cob_set_pointer applied to the
+	   call result.  The callee contract is that every emitted COBOL program
+	   (and system routine) returns an int return-code (default 0). */
+	output_prefix ();
+	if (retptr) {
+		output ("move.cob_set_pointer (");
+		output_param (p->returning, -1);
+		output (", _unifunc (");
+	} else {
+		output ("move.cob_set_int (");
+		output_param (current_prog->cb_return_code, -1);
+		output (", _unifunc (");
+	}
+
 	/* Arguments */
-	output (" (");
 	for (l = p->args, n = 1; l; l = CB_CHAIN (l), n++) {
 		x = CB_VALUE (l);
 		switch (CB_PURPOSE_INT (l)) {
 		case CB_CALL_BY_REFERENCE:
 			if (CB_NUMERIC_LITERAL_P (x) || CB_BINARY_OP_P (x)) {
-				output ("content_%d.data", (int)n);
+				output ("content_%d", (int)n);
 			} else if (CB_REFERENCE_P (x) && CB_FILE_P (cb_ref (x))) {
 				output_param (cb_ref (x), -1);
 			} else if (CB_CAST_P (x)) {
-				output ("&ptr_%d", (int)n);
+				/* MIGRATION (C -> Python): the C "&ptr_N" passed a
+				   pointer-to-pointer so the callee could write the
+				   pointer back; Python passes the pointer value
+				   ptr_N directly (pointer write-back through a CALL
+				   argument is not modeled -- a documented edge case
+				   left unchanged per the minimal-change clause). */
+				output ("ptr_%d", (int)n);
 			} else {
 				output_data (x);
 			}
@@ -2492,9 +3259,9 @@ output_call (struct cb_call *p)
 		case CB_CALL_BY_CONTENT:
 			if (CB_TREE_TAG (x) != CB_TAG_INTRINSIC && x != cb_null) {
 				if (CB_CAST_P (x)) {
-					output ("&ptr_%d", (int)n);
+					output ("ptr_%d", (int)n);
 				} else {
-					output ("content_%d.data", (int)n);
+					output ("content_%d", (int)n);
 				}
 			} else {
 				output_data (x);
@@ -2533,10 +3300,16 @@ output_call (struct cb_call *p)
 					case CB_USAGE_DISPLAY:
 						sizes = CB_SIZES_INT (l);
 						if (sizes == CB_SIZE_AUTO) {
+							/* MIGRATION (C -> Python): the original
+							   C selects an UNSIGNED cast when the
+							   PICTURE has a sign here; this looks
+							   counter-intuitive but is preserved
+							   verbatim for byte-for-byte parity with
+							   the C toolchain. */
 							if (f->pic->have_sign) {
-								output ("(unsigned ");
+								vunsigned = 1;
 							} else {
-								output ("(");
+								vunsigned = 0;
 							}
 							if (f->usage == CB_USAGE_PACKED ||
 							    f->usage == CB_USAGE_DISPLAY) {
@@ -2575,31 +3348,31 @@ output_call (struct cb_call *p)
 							}
 						} else {
 							if (CB_SIZES_INT_UNSIGNED(l)) {
-								output ("(unsigned ");
+								vunsigned = 1;
 							} else {
-								output ("(");
+								vunsigned = 0;
 							}
 						}
 						switch (sizes) {
 						case CB_SIZE_1:
-							output ("char");
+							vbytes = 1;
 							break;
 						case CB_SIZE_2:
-							output ("short");
+							vbytes = 2;
 							break;
 						case CB_SIZE_4:
-							output ("int");
+							vbytes = 4;
 							break;
 						case CB_SIZE_8:
-							output ("long long");
+							vbytes = 8;
 							break;
 						default:
-							output ("int");
+							vbytes = 4;
 							break;
 						}
-						output (")(");
+						output ("call.cob_value_int (");
 						output_integer (x);
-						output (")");
+						output (", %d, %d)", vbytes, vunsigned);
 						break;
 					case CB_USAGE_INDEX:
 					case CB_USAGE_LENGTH:
@@ -2608,9 +3381,11 @@ output_call (struct cb_call *p)
 						output_integer (x);
 						break;
 					default:
-						output ("*(");
+						/* MIGRATION (C -> Python): C dereferenced
+						   the first data byte "*(data)"; Python
+						   reads element 0 of the memoryview. */
 						output_data (x);
-						output (")");
+						output ("[0]");
 						break;
 					}
 					break;
@@ -2630,11 +3405,12 @@ output_call (struct cb_call *p)
 				if (n != 0 || parmnum != 0) {
 					output (", ");
 				}
-				output ("NULL");
+				output ("None");
 			}
 		}
 	}
-	output (");\n");
+	/* Close "_unifunc (" and the enclosing move.cob_set_* (". */
+	output ("))\n");
 	if (p->returning) {
 		if (!retptr) {
 			/* suppress warnings */
@@ -2645,9 +3421,9 @@ output_call (struct cb_call *p)
 #ifdef	COB_NON_ALIGNED
 		} else {
 			output_prefix ();
-			output ("memcpy (");
+			output ("common.memcpy (");
 			output_data (p->returning);
-			output (", &temptr, %d);\n", sizeof (void *));
+			output (", common.cob_addr_of (temptr), %d)\n", sizeof (void *));
 #endif
 		}
 	}
@@ -2655,9 +3431,11 @@ output_call (struct cb_call *p)
 		output_stmt (p->stmt2);
 	}
 	if (dynamic_link && p->stmt1) {
-		output_indent ("  }");
+		/* MIGRATION (C -> Python): close the ON OVERFLOW "else:" suite. */
+		output_block_close ();
 	}
-	output_indent ("}");
+	/* MIGRATION (C -> Python): the former bare-scope close is dropped (no
+	   Python block was opened for it). */
 }
 
 /*
@@ -2667,7 +3445,30 @@ output_call (struct cb_call *p)
 static void
 output_goto_1 (cb_tree x)
 {
-	output_line ("goto %s%d;", CB_PREFIX_LABEL, CB_LABEL (cb_ref (x))->id);
+	int	id = CB_LABEL (cb_ref (x))->id;
+
+	/* MIGRATION (C -> Python): EXIT PERFORM CYCLE special case.  The front-end
+	   lowers EXIT PERFORM CYCLE to a GO TO whose target is the innermost inline
+	   PERFORM's cycle_label, which is emitted at the END of that loop's body.
+	   The COBOL meaning is "skip the rest of this iteration and start the next
+	   one", which is exactly Python's "continue" for the enclosing for/while
+	   loop.  Emitting the usual "raise _CobGoto(<id>)" here would instead unwind
+	   the entire loop (its handler lives outside every loop, and the cycle_label
+	   dispatch segment is emitted after the loop), running only one iteration.
+	   is_active_cycle_target() is true only while that loop is the innermost one
+	   being emitted, so "continue" always targets the correct Python loop. */
+	if (is_active_cycle_target (id)) {
+		output_line ("continue");
+		return;
+	}
+
+	/* MIGRATION (C -> Python): "goto l_N;" becomes "raise _CobGoto(<id>)".
+	   A Python exception is used instead of "_pc = <id>; continue" because a
+	   GO TO may appear nested inside an inline PERFORM for/while loop, where a
+	   bare "continue" would target that inner loop rather than the outer
+	   _dispatch loop.  The exception escapes any nesting and is caught by the
+	   _dispatch "except _CobGoto" handler, which resumes at the target. */
+	output_line ("raise _CobGoto (%d)", id);
 }
 
 static void
@@ -2677,29 +3478,47 @@ output_goto (struct cb_goto *p)
 	int	i = 1;
 
 	if (p->depending) {
+		/* MIGRATION (C -> Python): GO TO ... DEPENDING ON n.  The C "switch"
+		   over the 1-based selector becomes an if/elif chain that raises
+		   _CobGoto for the chosen target; an out-of-range selector matches no
+		   branch and falls through, matching COBOL semantics. */
 		output_prefix ();
-		output ("switch (");
+		output ("_dep%d = ", loop_counter);
 		output_param (cb_build_cast_integer (p->depending), 0);
-		output (")\n");
-		output_indent ("  {");
+		output ("\n");
 		for (l = p->target; l; l = CB_CHAIN (l)) {
-			output_indent_level -= 2;
-			output_line ("case %d:", i++);
-			output_indent_level += 2;
+			if (i == 1) {
+				output_line ("if _dep%d == %d:", loop_counter, i);
+			} else {
+				output_line ("elif _dep%d == %d:", loop_counter, i);
+			}
+			output_block_open ();
 			output_goto_1 (CB_VALUE (l));
+			output_block_close ();
+			i++;
 		}
-		output_indent ("  }");
+		loop_counter++;
 	} else if (p->target == NULL) {
+		/* MIGRATION (C -> Python): implicit GOBACK at end / GO TO with no
+		   target.  "goto exit_program" becomes "raise _CobExit()", which
+		   propagates through every nested _dispatch level (the per-level
+		   _CobGoto handler does NOT catch it) up to the program-function
+		   wrapper that performs module-pop cleanup and returns the
+		   return-code.  When not implicit-init, a main program (module.next is
+		   None) falls through instead of exiting, as in the C original. */
 		needs_exit_prog = 1;
 		if (cb_flag_implicit_init) {
-			output_line ("goto exit_program;");
+			output_line ("raise _CobExit ()");
 		} else {
-			output_line ("if (module.next)");
-			output_line ("  goto exit_program;");
+			output_line ("if module.next is not None:");
+			output_block_open ();
+			output_line ("raise _CobExit ()");
+			output_block_close ();
 		}
 	} else if (p->target == cb_int1) {
+		/* MIGRATION (C -> Python): EXIT PROGRAM -> raise _CobExit(). */
 		needs_exit_prog = 1;
-		output_line ("goto exit_program;");
+		output_line ("raise _CobExit ()");
 	} else {
 		output_goto_1 (p->target);
 	}
@@ -2712,85 +3531,61 @@ output_goto (struct cb_goto *p)
 static void
 output_perform_call (struct cb_label *lb, struct cb_label *le)
 {
-#ifndef	__GNUC__
-	struct label_list *l;
-#endif
-
+	/* MIGRATION (C -> Python): PERFORM <lb> [THRU <le>] becomes a synchronous
+	   recursive dispatch call "_dispatch(<lb.id>, <le.id>)".  The Python call
+	   stack supplies the frame stack the C backend maintained explicitly
+	   (frame_ptr++/--, return_address, perform_through): the call runs the
+	   paragraph range and returns when the range's THRU paragraph reaches its
+	   exit (see output_perform_exit).  No frame push/pop, no return address,
+	   and no synthetic resume label are required.  The former cb_flag_stack_check
+	   overflow guard is superseded by CPython's own recursion limit (raised in
+	   the emitted module preamble), which raises RecursionError on overflow. */
 	if (lb == le) {
-		output_line ("/* PERFORM %s */", lb->name);
+		output_comment ("PERFORM %s", lb->name);
 	} else {
-		output_line ("/* PERFORM %s THRU %s */", lb->name, le->name);
+		output_comment ("PERFORM %s THRU %s", lb->name, le->name);
 	}
-	output_line ("frame_ptr++;");
-	if (cb_flag_stack_check) {
-		output_line ("if (unlikely(frame_ptr == frame_overflow))");
-		output_line ("    cob_fatal_error (COB_FERROR_STACK);");
-	}
-	output_line ("frame_ptr->perform_through = %d;", le->id);
-#ifndef	__GNUC__
-	l = cobc_malloc (sizeof (struct label_list));
-	l->next = label_cache;
-	l->id = cb_id;
-	if (label_cache == NULL) {
-		l->call_num = 0;
-	} else {
-		l->call_num = label_cache->call_num + 1;
-	}
-	label_cache = l;
-	output_line ("frame_ptr->return_address = %d;", l->call_num);
-	output_line ("goto %s%d;", CB_PREFIX_LABEL, lb->id);
-	output_line ("%s%d:", CB_PREFIX_LABEL, cb_id);
-#elif	COB_USE_SETJMP
-	output_line ("if (setjmp (frame_ptr->return_address) == 0)");
-	output_line ("  goto %s%d;", CB_PREFIX_LABEL, lb->id);
-#else
-	output_line ("frame_ptr->return_address = &&%s%d;",
-		     CB_PREFIX_LABEL, cb_id);
-	output_line ("goto %s%d;", CB_PREFIX_LABEL, lb->id);
-	output_line ("%s%d:", CB_PREFIX_LABEL, cb_id);
-#endif
-	cb_id++;
-	output_line ("frame_ptr--;");
+	output_line ("_dispatch (%d, %d)", lb->id, le->id);
 }
 
 static void
 output_perform_exit (struct cb_label *l)
 {
 	if (l->is_global) {
+		/* MIGRATION (C -> Python): a GLOBAL (declaratives) paragraph's exit
+		   checks the active entry point and, on match, pops the module and
+		   returns from the current dispatch.  "_entry" is established by the
+		   program-function wrapper. */
 		output_newline ();
-		output_line ("if (entry == %d) {", l->id);
+		output_line ("if _entry == %d:", l->id);
+		output_block_open ();
 		if (cb_flag_traceall) {
-			output_line ("  cob_reset_trace ();");
+			output_line ("common.cob_reset_trace ()");
 		}
 		/* Fixme - Check module push/pop */
-		output_line ("  cob_current_module = cob_current_module->next;");
-		output_line ("  return 0;");
-		output_line ("}");
+		output_line ("common.cob_current_module = common.cob_current_module.next");
+		output_line ("return 0");
+		output_block_close ();
 	}
 	if (!cb_perform_osvs) {
+		/* MIGRATION (C -> Python): non-OS/VS perform return.  When this
+		   paragraph is the THRU target of the active PERFORM (_through), return
+		   from the current _dispatch invocation, which unwinds to the PERFORM
+		   call site.  "return" is robust at any nesting depth, replacing the C
+		   "goto *frame_ptr->return_address". */
 		output_newline ();
-		output_line ("if (frame_ptr->perform_through == %d)", l->id);
-#ifndef	__GNUC__
-		output_line ("  goto P_switch;");
-#elif	COB_USE_SETJMP
-		output_line ("  longjmp (frame_ptr->return_address, 1);");
-#else
-		output_line ("  goto *frame_ptr->return_address;");
-#endif
+		output_line ("if _through == %d:", l->id);
+		output_block_open ();
+		output_line ("return 0");
+		output_block_close ();
 	} else {
-		output_line
-		    ("for (temp_index = frame_ptr; temp_index->perform_through; temp_index--) {");
-		output_line ("  if (temp_index->perform_through == %d) {", l->id);
-		output_line ("    frame_ptr = temp_index;");
-#ifndef	__GNUC__
-		output_line ("    goto P_switch;");
-#elif	COB_USE_SETJMP
-		output_line ("    longjmp (frame_ptr->return_address, 1);");
-#else
-		output_line ("    goto *frame_ptr->return_address;");
-#endif
-		output_line ("  }");
-		output_line ("}");
+		/* MIGRATION (C -> Python): OS/VS perform return.  The C backend
+		   searched the whole frame stack for a matching perform_through and
+		   unwound to it.  The recursive model reproduces multi-level unwinding
+		   by raising _CobPerformExit(<id>); each _dispatch level consumes it
+		   when its _through matches and otherwise re-raises (handler emitted by
+		   the program-function wrapper). */
+		output_line ("raise _CobPerformExit (%d)", l->id);
 	}
 }
 
@@ -2815,16 +3610,24 @@ output_perform_until (struct cb_perform *p, cb_tree l)
 	cb_tree				next;
 
 	if (l == NULL) {
-		/* Perform body at the end */
+		/* Perform body at the end.
+		   MIGRATION (C -> Python): the body sits inside the innermost
+		   "while True:" suite emitted below, so mark this loop as the active
+		   inline PERFORM -- EXIT PERFORM CYCLE in the body then emits
+		   "continue", restarting the loop (re-testing the UNTIL condition)
+		   instead of unwinding it via _CobGoto. */
+		perform_cycle_push (p);
 		output_perform_once (p);
+		perform_cycle_pop ();
 		return;
 	}
 
 	v = CB_PERFORM_VARYING (CB_VALUE (l));
 	next = CB_CHAIN (l);
 
-	output_line ("for (;;)");
-	output_indent ("  {");
+	/* MIGRATION (C -> Python): "for (;;) { ... }" -> "while True:" suite. */
+	output_line ("while True:");
+	output_block_open ();
 
 	if (next && CB_PERFORM_VARYING (CB_VALUE (next))->name) {
 		output_move (CB_PERFORM_VARYING (CB_VALUE (next))->from,
@@ -2835,11 +3638,15 @@ output_perform_until (struct cb_perform *p, cb_tree l)
 		output_perform_until (p, next);
 	}
 
+	/* MIGRATION (C -> Python): "if (cond) break;" -> "if cond:" suite with
+	   "break".  output_cond emits a complete Python boolean expression. */
 	output_prefix ();
-	output ("if (");
+	output ("if ");
 	output_cond (v->until, 0);
-	output (")\n");
-	output_line ("  break;");
+	output (":\n");
+	output_block_open ();
+	output_line ("break");
+	output_block_close ();
 
 	if (p->test == CB_BEFORE) {
 		output_perform_until (p, next);
@@ -2849,7 +3656,7 @@ output_perform_until (struct cb_perform *p, cb_tree l)
 		output_stmt (v->step);
 	}
 
-	output_indent ("  }");
+	output_block_close ();
 }
 
 static void
@@ -2867,14 +3674,22 @@ output_perform (struct cb_perform *p)
 		output_perform_once (p);
 		break;
 	case CB_PERFORM_TIMES:
+		/* MIGRATION (C -> Python): "for (n = COUNT; n > 0; n--)" runs COUNT
+		   times -> "for _nN in range(COUNT):" (same iteration count, and a
+		   non-positive COUNT yields zero iterations exactly as the C did).
+		   The loop variable is unused; only the repetition count matters. */
 		output_prefix ();
-		output ("for (n%d = ", loop_counter);
+		output ("for _n%d in range (", loop_counter);
 		output_param (cb_build_cast_integer (p->data), 0);
-		output ("; n%d > 0; n%d--)\n", loop_counter, loop_counter);
+		output ("):\n");
 		loop_counter++;
-		output_indent ("  {");
+		output_block_open ();
+		/* MIGRATION (C -> Python): mark this for-loop as the active inline
+		   PERFORM so EXIT PERFORM CYCLE inside the body emits "continue". */
+		perform_cycle_push (p);
 		output_perform_once (p);
-		output_indent ("  }");
+		perform_cycle_pop ();
+		output_block_close ();
 		break;
 	case CB_PERFORM_UNTIL:
 		v = CB_PERFORM_VARYING (CB_VALUE (p->varying));
@@ -2884,11 +3699,15 @@ output_perform (struct cb_perform *p)
 		output_perform_until (p, p->varying);
 		break;
 	case CB_PERFORM_FOREVER:
-		output_prefix ();
-		output ("for (;;)\n");
-		output_indent ("  {");
+		/* MIGRATION (C -> Python): "for (;;) { ... }" -> "while True:". */
+		output_line ("while True:");
+		output_block_open ();
+		/* MIGRATION (C -> Python): mark this while-loop as the active inline
+		   PERFORM so EXIT PERFORM CYCLE inside the body emits "continue". */
+		perform_cycle_push (p);
 		output_perform_once (p);
-		output_indent ("  }");
+		perform_cycle_pop ();
+		output_block_close ();
 		break;
 	}
 	if (p->exit_label) {
@@ -2917,14 +3736,22 @@ output_file_error (struct cb_file *pfile)
 				output_perform_call (fl->handler,
 						     fl->handler);
 			} else {
+				/* MIGRATION (C -> Python): a GLOBAL error handler that
+				   resides in ANOTHER program is invoked by calling that
+				   program's internal function.  In the Python dispatch
+				   model the internal function's entry argument IS the
+				   starting label id (_pc), so the handler's label id is
+				   passed directly -- the same value the C convention used
+				   ("%s_ (%d)").  The trailing C ";" is dropped; the trace
+				   toggles become module-qualified runtime calls. */
 				if (cb_flag_traceall) {
-					output_line ("cob_reset_trace ();");
+					output_line ("common.cob_reset_trace ()");
 				}
-				output_line ("%s_ (%d);",
+				output_line ("%s_ (%d)",
 					fl->handler_prog->program_id,
 					fl->handler->id);
 				if (cb_flag_traceall) {
-					output_line ("cob_ready_trace ();");
+					output_line ("common.cob_ready_trace ()");
 				}
 			}
 			return;
@@ -2940,36 +3767,45 @@ output_file_error (struct cb_file *pfile)
 static void
 output_ferror_stmt (struct cb_statement *p, int code)
 {
-	output_line ("if (unlikely(cob_exception_code != 0))");
-	output_indent ("  {");
+	/* MIGRATION (C -> Python): the file-I/O exception dispatch.  The C form
+	   "if (unlikely(cob_exception_code != 0)) { [if <code>: h1 else: file_err]
+	   | file_err } else { h3; h2 }" is re-expressed with the indent-block
+	   model: unlikely() is dropped, the global exception code is read as
+	   common.cob_exception_code, and the C braces become Python suites.  When
+	   a specific handler1 is present the inner code-match selects between
+	   handler1 and the file's error routine; otherwise the error routine runs
+	   unconditionally.  handler2/handler3 (the NOT.../no-exception path) form
+	   the outer "else:". */
+	output_line ("if (common.cob_exception_code != 0):");
+	output_block_open ();
 	if (p->handler1) {
 		if ((code & 0x00ff) == 0) {
-			output_line ("if ((cob_exception_code & 0xff00) == 0x%04x)",
+			output_line ("if ((common.cob_exception_code & 0xff00) == 0x%04x):",
 			     code);
 		} else {
-			output_line ("if (cob_exception_code == 0x%04x)", code);
+			output_line ("if (common.cob_exception_code == 0x%04x):", code);
 		}
-		output_indent ("  {");
+		output_block_open ();
 		output_stmt (p->handler1);
-		output_indent ("  }");
-		output_line ("else");
-		output_indent ("  {");
+		output_block_close ();
+		output_line ("else:");
+		output_block_open ();
+		output_file_error (CB_FILE (p->file));
+		output_block_close ();
+	} else {
+		output_file_error (CB_FILE (p->file));
 	}
-	output_file_error (CB_FILE (p->file));
-	output_indent ("  }");
-	if (p->handler1) {
-		output_indent ("  }");
-	}
+	output_block_close ();
 	if (p->handler2 || p->handler3) {
-		output_line ("else");
-		output_indent ("  {");
+		output_line ("else:");
+		output_block_open ();
 		if (p->handler3) {
 			output_stmt (p->handler3);
 		}
 		if (p->handler2) {
 			output_stmt (p->handler2);
 		}
-		output_indent ("  }");
+		output_block_close ();
 	}
 }
 
@@ -2980,14 +3816,18 @@ output_stmt (cb_tree x)
 	struct cb_label		*lp;
 	struct cb_assign	*ap;
 	struct cb_if		*ip;
-#ifdef	COB_NON_ALIGNED
+	/* MIGRATION (C -> Python): cp and f are now used unconditionally by the
+	   rewritten ASSIGN case (SET ADDRESS / pointer / numeric store dispatch),
+	   so they are no longer guarded by COB_NON_ALIGNED. */
 	struct cb_cast		*cp;
-#endif
+	struct cb_field		*f;
 	int			code;
 
 	stack_id = 0;
 	if (x == NULL) {
-		output_line (";");
+		/* MIGRATION (C -> Python): an empty C statement ";" becomes Python
+		   "pass" so the enclosing suite is never empty. */
+		output_line ("pass");
 		return;
 	}
 #ifndef __GNUC__
@@ -3002,40 +3842,48 @@ output_stmt (cb_tree x)
 	switch (CB_TREE_TAG (x)) {
 	case CB_TAG_STATEMENT:
 		p = CB_STATEMENT (x);
-		/* Output source location as a comment */
+		/* MIGRATION (C -> Python): the C source-provenance comment carrying
+		   "file:line: name" is emitted as a Python "# file:line: name"
+		   comment via output_comment
+		   (which does NOT mark block content, so a statement that emits only
+		   this comment still yields a valid suite). */
 		if (p->name) {
-			output_line ("/* %s:%d: %s */",
-				     x->source_file, x->source_line, p->name);
+			output_comment ("%s:%d: %s",
+					x->source_file, x->source_line, p->name);
 		}
-		/* Output source location as a code */
+		/* Output source location as a runtime call */
 		if (x->source_file && last_line != x->source_line) {
 			if (cb_flag_source_location) {
+				/* MIGRATION (C -> Python): cob_set_location ->
+				   common.cob_set_location; C NULL -> Python None; no
+				   trailing ';'. */
 				output_prefix ();
-				output ("cob_set_location (\"%s\", \"%s\", %d, ",
+				output ("common.cob_set_location (\"%s\", \"%s\", %d, ",
 					excp_current_program_id, x->source_file,
 					x->source_line);
 				if (excp_current_section) {
 					output ("\"%s\", ", excp_current_section);
 				} else {
-					output ("NULL, ");
+					output ("None, ");
 				}
 				if (excp_current_paragraph) {
 					output ("\"%s\", ", excp_current_paragraph);
 				} else {
-					output ("NULL, ");
+					output ("None, ");
 				}
 				if (p->name) {
-					output ("\"%s\");\n", p->name);
+					output ("\"%s\")\n", p->name);
 				} else {
-					output ("NULL);\n");
+					output ("None)\n");
 				}
 			}
 			last_line = x->source_line;
 		}
 
 		if (p->handler1 || p->handler2 || (p->file && CB_EXCEPTION_ENABLE (COB_EC_I_O))) {
-
-			output_line ("cob_exception_code = 0;");
+			/* MIGRATION (C -> Python): clear the runtime exception register
+			   (a module-level global on the common facade). */
+			output_line ("common.cob_exception_code = 0");
 		}
 
 		if (p->null_check) {
@@ -3051,173 +3899,204 @@ output_stmt (cb_tree x)
 			if (p->file) {
 				output_ferror_stmt (p, code);
 			} else {
+				/* MIGRATION (C -> Python): exception handlers test the
+				   common.cob_exception_code register; the C "unlikely()"
+				   branch hint is dropped, the masked/exact comparisons map
+				   directly, and blocks use Python suites. */
 				if (p->handler1) {
 					if ((code & 0x00ff) == 0) {
-						output_line ("if (unlikely((cob_exception_code & 0xff00) == 0x%04x))",
+						output_line ("if (common.cob_exception_code & 0xff00) == 0x%04x:",
 						     code);
 					} else {
-						output_line ("if (unlikely(cob_exception_code == 0x%04x))", code);
+						output_line ("if common.cob_exception_code == 0x%04x:", code);
 					}
-					output_indent ("  {");
+					output_block_open ();
 					output_stmt (p->handler1);
-					output_indent ("  }");
+					output_block_close ();
 					if (p->handler2) {
-						output_line ("else");
+						output_line ("else:");
+						output_block_open ();
 					}
 				}
 				if (p->handler2) {
 					if (p->handler1 == NULL) {
-						output_line ("if (!cob_exception_code)");
+						output_line ("if not common.cob_exception_code:");
+						output_block_open ();
 					}
-					output_indent ("  {");
 					output_stmt (p->handler2);
-					output_indent ("  }");
+					output_block_close ();
 				}
 			}
 		}
 		break;
 	case CB_TAG_LABEL:
+		/* MIGRATION (C -> Python): a paragraph/section LABEL becomes a segment
+		   of the recursive dispatch loop emitted by output_internal_function.
+		   The C emitter laid paragraphs out as a flat instruction stream with
+		   "l_<id>:;" labels and relied on natural fall-through plus computed
+		   "goto".  Python has neither labels nor goto, so a need_begin label
+		   (i.e. a PERFORM/GO TO target) instead starts a new
+		   "if _pc == <id>:" dispatch segment.  Before opening it, any segment
+		   already open is terminated with a fall-through "_pc = <id>" +
+		   "continue" so control flows into this label exactly as the C
+		   fall-through past "l_<id>:;" did.  A non-need_begin label is not a
+		   jump target, so it emits only a provenance comment and stays inside
+		   the current segment (statements before and after it share the same
+		   fall-through region, matching the C behaviour).  Provenance is
+		   emitted with output_comment(), which does NOT mark block content, so
+		   a segment that ends up holding only a comment still receives an
+		   auto-"pass" from output_block_close(). */
 		lp = CB_LABEL (x);
+		/* Close the previously open segment with a fall-through into this
+		   label when the label is a jump target. */
+		if (lp->need_begin && output_segment_open) {
+			output_line ("_pc = %d", lp->id);
+			output_line ("continue");
+			output_block_close ();
+			output_segment_open = 0;
+		}
 		output_newline ();
+		/* Provenance comment (does not mark block content) + exception
+		   bookkeeping, identical in spirit to the C provenance lines. */
 		if (lp->is_section) {
 			if (strcmp ((const char *)(lp->name) , "MAIN SECTION")) {
-				output_line ("/* %s SECTION */", lp->name);
+				output_comment ("%s SECTION", lp->name);
 			} else {
-				output_line ("/* %s */", lp->name);
+				output_comment ("%s", lp->name);
 			}
 			excp_current_section = (const char *)lp->name;
 			excp_current_paragraph = NULL;
 		} else {
 			if (lp->is_entry) {
-				output_line ("/* Entry %s */", lp->orig_name);
+				output_comment ("Entry %s", lp->orig_name);
 			} else {
-				output_line ("/* %s */", lp->name);
+				output_comment ("%s", lp->name);
 			}
 			excp_current_paragraph = (const char *)lp->name;
-			if (!lp->need_begin) {
-				output_newline ();
-			}
 		}
+		/* Open a new dispatch segment for jump targets (need_begin). */
 		if (lp->need_begin) {
-			output_newline ();
-			output_line ("%s%d:;", CB_PREFIX_LABEL, lp->id);
+			output_line ("if _pc == %d:", lp->id);
+			output_block_open ();
+			output_segment_open = 1;
 		}
 		if (cb_flag_trace) {
+			/* Trace runs when the label is reached -> inside the segment.
+			   C "fputs (..., stderr); fflush (stderr);" becomes
+			   "sys.stderr.write (...); sys.stderr.flush ()". */
 			if (lp->is_section) {
 				if (strcmp ((const char *)(lp->name) , "MAIN SECTION")) {
-					output_line ("fputs (\"PROGRAM-ID: %s: %s SECTION\\n\", stderr);", excp_current_program_id, lp->orig_name);
+					output_line ("sys.stderr.write (\"PROGRAM-ID: %s: %s SECTION\\n\")", excp_current_program_id, lp->orig_name);
 				} else {
-					output_line ("fputs (\"PROGRAM-ID: %s: %s\\n\", stderr);", excp_current_program_id, lp->orig_name);
+					output_line ("sys.stderr.write (\"PROGRAM-ID: %s: %s\\n\")", excp_current_program_id, lp->orig_name);
 				}
 			} else if (lp->is_entry) {
-				output_line ("fputs (\"PROGRAM-ID: %s: ENTRY %s\\n\", stderr);", excp_current_program_id, lp->orig_name);
+				output_line ("sys.stderr.write (\"PROGRAM-ID: %s: ENTRY %s\\n\")", excp_current_program_id, lp->orig_name);
 			} else {
-				output_line ("fputs (\"PROGRAM-ID: %s: %s\\n\", stderr);", excp_current_program_id, lp->orig_name);
+				output_line ("sys.stderr.write (\"PROGRAM-ID: %s: %s\\n\")", excp_current_program_id, lp->orig_name);
 			}
-			output_line ("fflush (stderr);");
+			output_line ("sys.stderr.flush ()");
 		}
 		break;
 	case CB_TAG_FUNCALL:
+		/* MIGRATION (C -> Python): a top-level funcall statement is emitted on
+		   its own line as a module-qualified libcob_py call (output_funcall),
+		   with the C statement terminator ";" replaced by a bare newline.  The
+		   non-__GNUC__ inside_check path (used when a funcall is emitted as an
+		   inline check element rather than a standalone statement) is preserved
+		   structurally; only the emitted terminator changes. */
 		output_prefix ();
 		output_funcall (x);
 #ifdef __GNUC__
-		output (";\n");
+		output ("\n");
 #else
 		if (inside_check == 0) {
-			output (";\n");
+			output ("\n");
 		} else {
 			inside_stack[inside_check -1] = 1;
 		}
 #endif
 		break;
 	case CB_TAG_ASSIGN:
+		/* MIGRATION (C -> Python): the C emitter stored an integer via an
+		   lvalue assignment "output_integer(var) = output_integer(val);"
+		   (output_integer produced a C lvalue -- a dereferenced pointer or
+		   cast).  Python has no assignable accessor expressions, so the store
+		   is re-expressed as a runtime setter chosen to MIRROR output_integer's
+		   read dispatch, so the same storage is written with the same value
+		   (byte-for-byte):
+		     SET ADDRESS OF x (CAST_ADDRESS) -> common.cob_set_addr (data, val)
+		     POINTER usage                   -> common.cob_set_pointer (fld, val)
+		     PROGRAM-POINTER usage           -> common.cob_set_prog_pointer (fld, val)
+		     numeric / index (default)       -> move.cob_set_int (fld, val)
+		   The value expression is produced by output_integer (a Python int /
+		   pointer expression).  The former COB_NON_ALIGNED temp-pointer memcpy
+		   dance is unnecessary in Python -- the pointer setters handle address
+		   assignment directly -- so the two C branches collapse into this one
+		   path.  The trailing C ";" becomes a bare newline (the non-__GNUC__
+		   inside_check deferral path is preserved structurally). */
 		ap = CB_ASSIGN (x);
-#ifdef	COB_NON_ALIGNED
-		/* Nonaligned */
-		if (CB_TREE_CLASS (ap->var) == CB_CLASS_POINTER
-		    || CB_TREE_CLASS (ap->val) == CB_CLASS_POINTER) {
-			/* Pointer assignment */
-			output_indent ("{");
-			output_line ("void *temp_ptr;");
-
-			/* temp_ptr = source address; */
-			output_prefix ();
-			if (ap->val == cb_null || ap->val == cb_zero) {
-				/* MOVE NULL ... */
-				output ("temp_ptr = 0;\n");
-			} else if (CB_TREE_TAG (ap->val) == CB_TAG_CAST) {
-				/* MOVE ADDRESS OF val ... */
-				cp = CB_CAST (ap->val);
-				output ("temp_ptr = ");
-				switch (cp->type) {
-				case CB_CAST_ADDRESS:
-					output_data (cp->val);
-					break;
-				case CB_CAST_PROGRAM_POINTER:
-					output_func_1 ("cob_call_resolve", ap->val);
-					break;
-				default:
-					fprintf (stderr, "Unexpected cast type %d\n", cp->type);
-					ABORT ();
-				}
-				output (";\n");
-			} else {
-				/* MOVE val ... */
-				output ("memcpy(&temp_ptr, ");
-				output_data (ap->val);
-				output (", sizeof(temp_ptr));\n");
-			}
-
-			/* destination address = temp_ptr; */
-			output_prefix ();
-			if (CB_TREE_TAG (ap->var) == CB_TAG_CAST) {
-				/* SET ADDRESS OF var ... */
-				cp = CB_CAST (ap->var);
-				if (cp->type != CB_CAST_ADDRESS) {
-					fprintf (stderr, "Unexpected tree type %d\n", cp->type);
-					ABORT ();
-				}
-				output_data (cp->val);
-				output (" = temp_ptr;\n");
-			} else {
-				/* MOVE ... TO var */
-				output ("memcpy(");
-				output_data (ap->var);
-				output (", &temp_ptr, sizeof(temp_ptr));\n");
-			}
-
-			output_indent ("}");
-		} else {
-			/* Numeric assignment */
-			output_prefix ();
-			output_integer (ap->var);
-			output (" = ");
-			output_integer (ap->val);
-#ifdef __GNUC__
-			output (";\n");
-#else
-			if (inside_check == 0) {
-				output (";\n");
-			} else {
-				inside_stack[inside_check -1] = 1;
-			}
-#endif
-		}
-#else	/* Nonaligned */
 		output_prefix ();
-		output_integer (ap->var);
-		output (" = ");
-		output_integer (ap->val);
+		if (CB_TREE_TAG (ap->var) == CB_TAG_CAST) {
+			/* SET ADDRESS OF var TO val */
+			cp = CB_CAST (ap->var);
+			if (cp->type != CB_CAST_ADDRESS) {
+				fprintf (stderr, "Unexpected tree type %d\n", cp->type);
+				ABORT ();
+			}
+			/* MIGRATION (C -> Python): C re-pointed the LINKAGE/BASED item's
+			   data pointer in place ("item->data = val").  Python has no
+			   address-of-name, so REBIND the module-level backing name:
+			   "b_<id> = common.cob_resolve_addr(val)".  cob_resolve_addr maps a
+			   NULL/0 to None (unbound), aliases a directly-passed buffer
+			   (ADDRESS OF x), and resolves an integer read from a POINTER item
+			   back to the storage it addresses.  The name is declared "global"
+			   in the dispatch scope (see output_internal_function) so the
+			   assignment updates the shared module object.  Falls back to the
+			   in-place pointer-byte store for any non-reference target. */
+			if (CB_REF_OR_FIELD_P (cp->val)) {
+				output_base (cb_field (cp->val));
+				output (" = common.cob_resolve_addr (");
+				output_integer (ap->val);
+				output (")");
+			} else {
+				output ("common.cob_set_addr (");
+				output_data (cp->val);
+				output (", ");
+				output_integer (ap->val);
+				output (")");
+			}
+		} else {
+			f = cb_field (ap->var);
+			if (f->usage == CB_USAGE_POINTER) {
+				output ("common.cob_set_pointer (");
+				output_param (ap->var, -1);
+				output (", ");
+				output_integer (ap->val);
+				output (")");
+			} else if (f->usage == CB_USAGE_PROGRAM_POINTER) {
+				output ("common.cob_set_prog_pointer (");
+				output_param (ap->var, -1);
+				output (", ");
+				output_integer (ap->val);
+				output (")");
+			} else {
+				output ("move.cob_set_int (");
+				output_param (ap->var, -1);
+				output (", ");
+				output_integer (ap->val);
+				output (")");
+			}
+		}
 #ifdef __GNUC__
-		output (";\n");
+		output ("\n");
 #else
 		if (inside_check == 0) {
-			output (";\n");
+			output ("\n");
 		} else {
 			inside_stack[inside_check -1] = 1;
 		}
 #endif
-#endif	/* Nonaligned */
 		break;
 	case CB_TAG_INITIALIZE:
 		output_initialize (CB_INITIALIZE (x));
@@ -3232,38 +4111,72 @@ output_stmt (cb_tree x)
 		output_goto (CB_GOTO (x));
 		break;
 	case CB_TAG_IF:
+		/* MIGRATION (C -> Python): "if (cond)\n {s1} else {s2}" becomes the
+		   indent-block form "if (cond):\n <s1>\n else:\n <s2>".  The condition
+		   keeps its surrounding parentheses ("if (cond):") because output_cond
+		   may emit a walrus assignment, which requires parentheses in an
+		   if-header.  An empty then-branch emits "pass" (Python forbids an
+		   empty suite).
+		   CRITICAL: an else-branch that is ITSELF an IF (COBOL "ELSE IF" /
+		   chained WHENs) is FLATTENED into an "elif" chain rather than a nested
+		   "else: if", because output_search_whens() appends its own "else:"
+		   after output_stmt(whens) at the chain's top indent and relies on a
+		   flat if/elif structure for that "else:" to bind correctly (a nested
+		   "else: if" would already own the else and yield a double-else
+		   SyntaxError). */
 		ip = CB_IF (x);
 		output_prefix ();
 		output ("if (");
 		output_cond (ip->test, 0);
-		output (")\n");
+		output ("):\n");
+		output_block_open ();
 		if (ip->stmt1) {
-			output_indent_level += 2;
 			output_stmt (ip->stmt1);
-			output_indent_level -= 2;
 		} else {
-			output_line ("  /* nothing */;");
+			output_line ("pass");
+		}
+		output_block_close ();
+		/* Flatten chained "ELSE IF" into Python "elif". */
+		while (ip->stmt2 && CB_TREE_TAG (ip->stmt2) == CB_TAG_IF) {
+			ip = CB_IF (ip->stmt2);
+			output_prefix ();
+			output ("elif (");
+			output_cond (ip->test, 0);
+			output ("):\n");
+			output_block_open ();
+			if (ip->stmt1) {
+				output_stmt (ip->stmt1);
+			} else {
+				output_line ("pass");
+			}
+			output_block_close ();
 		}
 		if (ip->stmt2) {
-			output_line ("else");
-			output_indent_level += 2;
+			output_line ("else:");
+			output_block_open ();
 			output_stmt (ip->stmt2);
-			output_indent_level -= 2;
+			output_block_close ();
 		}
 		break;
 	case CB_TAG_PERFORM:
 		output_perform (CB_PERFORM (x));
 		break;
 	case CB_TAG_CONTINUE:
-		output_prefix ();
-		output (";\n");
+		/* MIGRATION (C -> Python): the COBOL CONTINUE no-op (C empty ";")
+		   becomes Python "pass". */
+		output_line ("pass");
 		break;
 	case CB_TAG_LIST:
-		output_indent ("{");
+		/* MIGRATION (C -> Python): a statement LIST is a flat sequence, not a
+		   Python suite.  The C bare scope "{ ... }" supplied only C block
+		   scope, which is irrelevant in Python, so NO indent block is emitted
+		   -- the child statements are emitted in order at the CURRENT indent.
+		   If the LIST is empty and is the sole body of an enclosing suite,
+		   output_block_close() (called by that enclosing construct) injects the
+		   required "pass". */
 		for (; x; x = CB_CHAIN (x)) {
 			output_stmt (CB_VALUE (x));
 		}
-		output_indent ("}");
 		break;
 	default:
 		fprintf (stderr, "Unexpected tree tag %d\n", CB_TREE_TAG (x));
@@ -3278,61 +4191,67 @@ output_stmt (cb_tree x)
 static int
 output_file_allocation (struct cb_file *f)
 {
-
+	/* MIGRATION (C->Python): emit module-level Python file-container declarations.
+	   C emitted "static cob_file *h_X = NULL;", a 4-byte status buffer and an
+	   optional "static struct cob_file_key *k_X = NULL;".  Python emits late-bound
+	   module globals: the file-object placeholder (None until built at run time by
+	   output_file_initialization), a 4-byte status bytearray and (for
+	   RELATIVE/INDEXED) a key-array placeholder.  Global vs local file scope still
+	   selects the storage vs local module buffer; both flush into the one .py. */
 	if (f->global) {
-		output_storage ("/* Global file %s */\n", f->name);
+		output_storage ("# Global file %s\n", f->name);
 	} else {
-		output_local ("/* File %s */\n", f->name);
+		output_local ("# File %s\n", f->name);
 	}
 	/* Output RELATIVE/RECORD KEY's */
 	if (f->organization == COB_ORG_RELATIVE || f->organization == COB_ORG_INDEXED) {
 		if (f->global) {
-			output_storage ("static struct cob_file_key\t*%s%s = NULL;\n",
-				CB_PREFIX_KEYS, f->cname);
+			output_storage ("%s%s = None\n", CB_PREFIX_KEYS, f->cname);
 		} else {
-			output_local ("static struct cob_file_key\t*%s%s = NULL;\n",
-				CB_PREFIX_KEYS, f->cname);
+			output_local ("%s%s = None\n", CB_PREFIX_KEYS, f->cname);
 		}
 	}
 	if (f->global) {
-		output_storage ("static cob_file\t\t*%s%s = NULL;\n",
-			CB_PREFIX_FILE, f->cname);
-		output_storage ("static unsigned char\t%s%s_status[4];\n",
-			CB_PREFIX_FILE, f->cname);
+		output_storage ("%s%s = None\n", CB_PREFIX_FILE, f->cname);
+		output_storage ("%s%s_status = bytearray (4)\n", CB_PREFIX_FILE, f->cname);
 	} else {
-		output_local ("static cob_file\t\t*%s%s = NULL;\n",
-			CB_PREFIX_FILE, f->cname);
-		output_local ("static unsigned char\t%s%s_status[4];\n",
-			CB_PREFIX_FILE, f->cname);
+		output_local ("%s%s = None\n", CB_PREFIX_FILE, f->cname);
+		output_local ("%s%s_status = bytearray (4)\n", CB_PREFIX_FILE, f->cname);
 	}
 	if (f->linage) {
 		return 1;
 	}
 	return 0;
 }
-
 static void
 output_file_initialization (struct cb_file *f)
 {
 	int			nkeys = 1;
 	struct cb_alt_key	*l;
 
+	/* MIGRATION (C->Python): emit run-time statements that build the cob_file
+	   object and its key array through the libcob_py fileio runtime, replacing
+	   the C cob_malloc / pointer-attribute sequence.  The "global" declarations
+	   for the h_/k_ handles are emitted once at the top of the enclosing program
+	   function, so none are emitted here.  For EXTERNAL files the whole attribute
+	   initialization stays guarded by "if common.cob_initial_external:" exactly as
+	   the C code guarded it with "if (cob_initial_external) { ... }". */
 	if (f->external) {
-		output_line ("%s%s = (cob_file *)cob_external_addr (\"%s\", sizeof(cob_file));",
+		output_line ("%s%s = fileio.cob_file_external (\"%s\")",
 			     CB_PREFIX_FILE, f->cname, f->cname);
-		output_line ("if (cob_initial_external)");
-		output_indent ("{");
+		output_line ("if common.cob_initial_external:");
+		output_block_open ();
 		if (f->linage) {
-			output_line ("%s%s->linorkeyptr = cob_malloc (sizeof(struct linage_struct));", CB_PREFIX_FILE, f->cname);
+			output_line ("%s%s.linorkeyptr = fileio.cob_linage_struct ()", CB_PREFIX_FILE, f->cname);
 		}
 	} else {
-		output_line ("if (!%s%s)", CB_PREFIX_FILE, f->cname);
-		output_indent ("{");
-		output_line ("%s%s = cob_malloc (sizeof(cob_file));", CB_PREFIX_FILE, f->cname);
+		output_line ("if %s%s is None:", CB_PREFIX_FILE, f->cname);
+		output_block_open ();
+		output_line ("%s%s = fileio.cob_file ()", CB_PREFIX_FILE, f->cname);
 		if (f->linage) {
-			output_line ("%s%s->linorkeyptr = cob_malloc (sizeof(struct linage_struct));", CB_PREFIX_FILE, f->cname);
+			output_line ("%s%s.linorkeyptr = fileio.cob_linage_struct ()", CB_PREFIX_FILE, f->cname);
 		}
-		output_indent ("}");
+		output_block_close ();
 	}
 	/* Output RELATIVE/RECORD KEY's */
 	if (f->organization == COB_ORG_RELATIVE
@@ -3340,145 +4259,140 @@ output_file_initialization (struct cb_file *f)
 		for (l = f->alt_key_list; l; l = l->next) {
 			nkeys++;
 		}
-		output_line ("if (!%s%s)", CB_PREFIX_KEYS, f->cname);
-		output_indent ("{");
-		output_line ("%s%s = cob_malloc (sizeof (struct cob_file_key) * %d);",
+		output_line ("if %s%s is None:", CB_PREFIX_KEYS, f->cname);
+		output_block_open ();
+		output_line ("%s%s = fileio.cob_file_key_array (%d)",
 			     CB_PREFIX_KEYS, f->cname, nkeys);
-		output_indent ("}");
+		output_block_close ();
 		nkeys = 1;
 		output_prefix ();
-		output ("%s%s->field = ", CB_PREFIX_KEYS, f->cname);
+		output ("%s%s[0].field = ", CB_PREFIX_KEYS, f->cname);
 		output_param (f->key, -1);
-		output (";\n");
-		output_prefix ();
-		output ("%s%s->flag = 0;\n", CB_PREFIX_KEYS, f->cname);
-		output_prefix ();
+		output ("\n");
+		output_line ("%s%s[0].flag = 0", CB_PREFIX_KEYS, f->cname);
 		if (f->key) {
-			output ("%s%s->offset = %d;\n", CB_PREFIX_KEYS, f->cname,
+			output_line ("%s%s[0].offset = %d", CB_PREFIX_KEYS, f->cname,
 				cb_field (f->key)->offset);
 		} else {
-			output ("%s%s->offset = 0;\n", CB_PREFIX_KEYS, f->cname);
+			output_line ("%s%s[0].offset = 0", CB_PREFIX_KEYS, f->cname);
 		}
 		for (l = f->alt_key_list; l; l = l->next) {
 			output_prefix ();
-			output ("(%s%s + %d)->field = ", CB_PREFIX_KEYS, f->cname,
-				nkeys);
+			output ("%s%s[%d].field = ", CB_PREFIX_KEYS, f->cname, nkeys);
 			output_param (l->key, -1);
-			output (";\n");
-			output_prefix ();
-			output ("(%s%s + %d)->flag = %d;\n", CB_PREFIX_KEYS, f->cname,
+			output ("\n");
+			output_line ("%s%s[%d].flag = %d", CB_PREFIX_KEYS, f->cname,
 				nkeys, l->duplicates);
-			output_prefix ();
-			output ("(%s%s + %d)->offset = %d;\n", CB_PREFIX_KEYS, f->cname,
+			output_line ("%s%s[%d].offset = %d", CB_PREFIX_KEYS, f->cname,
 				nkeys, cb_field (l->key)->offset);
 			nkeys++;
 		}
 	}
 
-	output_line ("%s%s->select_name = (const char *)\"%s\";", CB_PREFIX_FILE, f->cname, f->name);
+	output_line ("%s%s.select_name = \"%s\"", CB_PREFIX_FILE, f->cname, f->name);
 	if (f->external && !f->file_status) {
-		output_line ("%s%s->file_status = cob_external_addr (\"%s%s_status\", 4);",
+		output_line ("%s%s.file_status = common.cob_external_addr (\"%s%s_status\", 4)",
 			     CB_PREFIX_FILE, f->cname, CB_PREFIX_FILE, f->cname);
 	} else {
-		output_line ("%s%s->file_status = %s%s_status;", CB_PREFIX_FILE, f->cname,
+		output_line ("%s%s.file_status = %s%s_status", CB_PREFIX_FILE, f->cname,
 			     CB_PREFIX_FILE, f->cname);
-		output_line ("memset (%s%s_status, '0', 2);", CB_PREFIX_FILE, f->cname);
+		output_line ("%s%s_status[0:2] = b\"00\"", CB_PREFIX_FILE, f->cname);
 	}
 	output_prefix ();
-	output ("%s%s->assign = ", CB_PREFIX_FILE, f->cname);
+	output ("%s%s.assign = ", CB_PREFIX_FILE, f->cname);
 	if (f->special) {
-		output ("NULL");
+		output ("None");
 	} else {
 		output_param (f->assign, -1);
 	}
-	output (";\n");
+	output ("\n");
 	output_prefix ();
-	output ("%s%s->record = ", CB_PREFIX_FILE, f->cname);
+	output ("%s%s.record = ", CB_PREFIX_FILE, f->cname);
 	output_param (CB_TREE (f->record), -1);
-	output (";\n");
+	output ("\n");
 	output_prefix ();
-	output ("%s%s->record_size = ", CB_PREFIX_FILE, f->cname);
+	output ("%s%s.record_size = ", CB_PREFIX_FILE, f->cname);
 	if (f->record_depending) {
 		output_param (f->record_depending, -1);
 	} else {
-		output ("NULL");
+		output ("None");
 	}
-	output (";\n");
-	output_line ("%s%s->record_min = %d;", CB_PREFIX_FILE, f->cname, f->record_min);
-	output_line ("%s%s->record_max = %d;", CB_PREFIX_FILE, f->cname, f->record_max);
+	output ("\n");
+	output_line ("%s%s.record_min = %d", CB_PREFIX_FILE, f->cname, f->record_min);
+	output_line ("%s%s.record_max = %d", CB_PREFIX_FILE, f->cname, f->record_max);
 	if (f->organization == COB_ORG_RELATIVE
 	 || f->organization == COB_ORG_INDEXED) {
-		output_line ("%s%s->nkeys = %d;", CB_PREFIX_FILE, f->cname, nkeys);
-		output_line ("%s%s->keys = %s%s;", CB_PREFIX_FILE, f->cname, CB_PREFIX_KEYS,
+		output_line ("%s%s.nkeys = %d", CB_PREFIX_FILE, f->cname, nkeys);
+		output_line ("%s%s.keys = %s%s", CB_PREFIX_FILE, f->cname, CB_PREFIX_KEYS,
 			     f->cname);
 	} else {
-		output_line ("%s%s->nkeys = 0;", CB_PREFIX_FILE, f->cname);
-		output_line ("%s%s->keys = NULL;", CB_PREFIX_FILE, f->cname);
+		output_line ("%s%s.nkeys = 0", CB_PREFIX_FILE, f->cname);
+		output_line ("%s%s.keys = None", CB_PREFIX_FILE, f->cname);
 	}
-	output_line ("%s%s->file = NULL;", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.file = None", CB_PREFIX_FILE, f->cname);
 
 	if (f->linage) {
-		output_line ("lingptr = (struct linage_struct *)(%s%s->linorkeyptr);",
+		output_line ("lingptr = %s%s.linorkeyptr",
 				CB_PREFIX_FILE, f->cname);
 		output_prefix ();
-		output ("lingptr->linage = ");
+		output ("lingptr.linage = ");
 		output_param (f->linage, -1);
-		output (";\n");
+		output ("\n");
 		output_prefix ();
-		output ("lingptr->linage_ctr = ");
+		output ("lingptr.linage_ctr = ");
 		output_param (f->linage_ctr, -1);
-		output (";\n");
+		output ("\n");
 		if (f->latfoot) {
 			output_prefix ();
-			output ("lingptr->latfoot = ");
+			output ("lingptr.latfoot = ");
 			output_param (f->latfoot, -1);
-			output (";\n");
+			output ("\n");
 		} else {
-			output_line ("lingptr->latfoot = NULL;");
+			output_line ("lingptr.latfoot = None");
 		}
 		if (f->lattop) {
 			output_prefix ();
-			output ("lingptr->lattop = ");
+			output ("lingptr.lattop = ");
 			output_param (f->lattop, -1);
-			output (";\n");
+			output ("\n");
 		} else {
-			output_line ("lingptr->lattop = NULL;");
+			output_line ("lingptr.lattop = None");
 		}
 		if (f->latbot) {
 			output_prefix ();
-			output ("lingptr->latbot = ");
+			output ("lingptr.latbot = ");
 			output_param (f->latbot, -1);
-			output (";\n");
+			output ("\n");
 		} else {
-			output_line ("lingptr->latbot = NULL;");
+			output_line ("lingptr.latbot = None");
 		}
-		output_line ("lingptr->lin_lines = 0;");
-		output_line ("lingptr->lin_foot = 0;");
-		output_line ("lingptr->lin_top = 0;");
-		output_line ("lingptr->lin_bot = 0;");
+		output_line ("lingptr.lin_lines = 0");
+		output_line ("lingptr.lin_foot = 0");
+		output_line ("lingptr.lin_top = 0");
+		output_line ("lingptr.lin_bot = 0");
 	}
 
-	output_line ("%s%s->organization = %d;", CB_PREFIX_FILE, f->cname, f->organization);
-	output_line ("%s%s->access_mode = %d;", CB_PREFIX_FILE, f->cname, f->access_mode);
-	output_line ("%s%s->lock_mode = %d;", CB_PREFIX_FILE, f->cname, f->lock_mode);
-	output_line ("%s%s->open_mode = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_optional = %d;", CB_PREFIX_FILE, f->cname, f->optional);
-	output_line ("%s%s->last_open_mode = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->special = %d;", CB_PREFIX_FILE, f->cname, f->special);
-	output_line ("%s%s->flag_nonexistent = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_end_of_file = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_begin_of_file = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_first_read = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_read_done = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_select_features = %d;", CB_PREFIX_FILE, f->cname,
-		     ((f->file_status ? COB_SELECT_FILE_STATUS : 0) |
-		     (f->linage ? COB_SELECT_LINAGE : 0) |
-		     (f->external_assign ? COB_SELECT_EXTERNAL : 0)));
-	output_line ("%s%s->flag_needs_nl = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->flag_needs_top = 0;", CB_PREFIX_FILE, f->cname);
-	output_line ("%s%s->file_version = %d;", CB_PREFIX_FILE, f->cname, COB_FILE_VERSION);
+	output_line ("%s%s.organization = %d", CB_PREFIX_FILE, f->cname, f->organization);
+	output_line ("%s%s.access_mode = %d", CB_PREFIX_FILE, f->cname, f->access_mode);
+	output_line ("%s%s.lock_mode = %d", CB_PREFIX_FILE, f->cname, f->lock_mode);
+	output_line ("%s%s.open_mode = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_optional = %d", CB_PREFIX_FILE, f->cname, f->optional);
+	output_line ("%s%s.last_open_mode = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.special = %d", CB_PREFIX_FILE, f->cname, f->special);
+	output_line ("%s%s.flag_nonexistent = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_end_of_file = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_begin_of_file = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_first_read = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_read_done = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_select_features = %d", CB_PREFIX_FILE, f->cname,
+		((f->file_status ? COB_SELECT_FILE_STATUS : 0) |
+		(f->linage ? COB_SELECT_LINAGE : 0) |
+		(f->external_assign ? COB_SELECT_EXTERNAL : 0)));
+	output_line ("%s%s.flag_needs_nl = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.flag_needs_top = 0", CB_PREFIX_FILE, f->cname);
+	output_line ("%s%s.file_version = %d", CB_PREFIX_FILE, f->cname, COB_FILE_VERSION);
 	if (f->external) {
-		output_indent ("}");
+		output_block_close ();
 	}
 }
 
@@ -3501,57 +4415,62 @@ output_screen_definition (struct cb_field *p)
 	type = (p->children ? COB_SCREEN_TYPE_GROUP :
 		p->values ? COB_SCREEN_TYPE_VALUE :
 		(p->size > 0) ? COB_SCREEN_TYPE_FIELD : COB_SCREEN_TYPE_ATTRIBUTE);
-	output ("static cob_screen s_%d = {", p->id);
+	/* MIGRATION (C->Python): emit a screenio.cob_screen(...) constructor instead of
+	   a C "static cob_screen s_N = { ... };" aggregate.  Argument order mirrors the
+	   C struct layout exactly: next, child, field, value, line, column, foreg,
+	   backg, type, occurs_min, screen_flag.  Sisters/children are emitted first by
+	   the recursive calls above, so their names already exist. */
+	output ("s_%d = screenio.cob_screen (", p->id);
 
 	if (p->sister) {
-		output ("&s_%d, ", p->sister->id);
+		output ("s_%d, ", p->sister->id);
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 	if (type == COB_SCREEN_TYPE_GROUP) {
-		output ("&s_%d, ", p->children->id);
+		output ("s_%d, ", p->children->id);
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 	if (type == COB_SCREEN_TYPE_FIELD) {
 		p->count++;
 		output_param (cb_build_field_reference (p, NULL), -1);
 		output (", ");
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 	if (type == COB_SCREEN_TYPE_VALUE) {
 		output_param (CB_VALUE(p->values), p->id);
 		output (", ");
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 
 	if (p->screen_line) {
 		output_param (p->screen_line, 0);
 		output (", ");
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 	if (p->screen_column) {
 		output_param (p->screen_column, 0);
 		output (", ");
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 	if (p->screen_foreg) {
 		output_param (p->screen_foreg, 0);
 		output (", ");
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
 	if (p->screen_backg) {
 		output_param (p->screen_backg, 0);
 		output (", ");
 	} else {
-		output ("NULL, ");
+		output ("None, ");
 	}
-	output ("%d, %d, %d};\n", type, p->occurs_min, p->screen_flag);
+	output ("%d, %d, %d)\n", type, p->occurs_min, p->screen_flag);
 }
 
 /*
@@ -3644,20 +4563,19 @@ output_alphabet_name_definition (struct cb_alphabet_name *p)
 	}
 
 	/* Output the table */
-	output_local ("static const unsigned char %s%s[256] = {\n", CB_PREFIX_SEQUENCE, p->cname);
+	/* MIGRATION (C->Python): emit the 256-byte collating table as a Python bytes
+	   object and the alphabet cob_field via the common.cob_field(...) constructor,
+	   preserving every table byte exactly (collating order affects emitted bytes). */
+	output_local ("%s%s = bytes ((\n", CB_PREFIX_SEQUENCE, p->cname);
 	for (i = 0; i < 256; i++) {
-		if (i == 255) {
-			output_local (" %d", table[i]);
-		} else {
-			output_local (" %d,", table[i]);
-		}
+		output_local (" %d,", table[i]);
 		if (i % 16 == 15) {
 			output_local ("\n");
 		}
 	}
-	output_local ("};\n");
+	output_local ("))\n");
 	i = lookup_attr (COB_TYPE_ALPHANUMERIC, 0, 0, 0, NULL, 0);
-	output_local ("static cob_field f_%s = { 256, (unsigned char *)%s%s, &%s%d };\n",
+	output_local ("f_%s = common.cob_field (256, %s%s, %s%d)\n",
 		p->cname, CB_PREFIX_SEQUENCE, p->cname, CB_PREFIX_ATTR, i);
 	output_local ("\n");
 }
@@ -3677,41 +4595,45 @@ output_class_name_definition (struct cb_class_name *p)
 	int		lower;
 	int		upper;
 
-	output_line ("static int");
-	output_line ("%s (cob_field *f)", p->cname);
-	output_indent ("{");
-	output_line ("int i;");
-	output_line ("for (i = 0; i < f->size; i++)");
+	/* MIGRATION (C->Python): emit a Python class-check "def <cname>(f):" returning
+	   0/1, mirroring the C "static int <cname>(cob_field *f)" per-byte range test.
+	   f.data[i] is the i-th data byte (int) and f.size is the field size.  C "||"
+	   becomes Python "or"; the multi-line condition stays inside parentheses so
+	   Python line-continuation applies. */
+	output_line ("def %s (f):", p->cname);
+	output_block_open ();
+	output_line ("for i in range (f.size):");
+	output_block_open ();
 	output_prefix ();
-	output ("  if (!(    ");
+	output ("if not (    ");
 	for (l = p->list; l; l = CB_CHAIN (l)) {
 		x = CB_VALUE (l);
 		if (CB_PAIR_P (x)) {
 			lower = literal_value (CB_PAIR_X (x));
 			upper = literal_value (CB_PAIR_Y (x));
 			if (!lower) {
-				output ("f->data[i] <= %d", upper);
+				output ("f.data[i] <= %d", upper);
 			} else {
-				output ("(%d <= f->data[i] && f->data[i] <= %d)", lower, upper);
+				output ("(%d <= f.data[i] and f.data[i] <= %d)", lower, upper);
 			}
 		} else {
 			if (CB_TREE_CLASS (x) == CB_CLASS_NUMERIC) {
-				output ("f->data[i] == %d", literal_value(x));
+				output ("f.data[i] == %d", literal_value(x));
 			} else if (x == cb_space) {
-				output ("f->data[i] == %d", ' ');
+				output ("f.data[i] == %d", ' ');
 			} else if (x == cb_zero) {
-				output ("f->data[i] == %d", '0');
+				output ("f.data[i] == %d", '0');
 			} else if (x == cb_quote) {
-				output ("f->data[i] == %d", '"');
+				output ("f.data[i] == %d", '"');
 			} else if (x == cb_null) {
-				output ("f->data[i] == 0");
+				output ("f.data[i] == 0");
 			} else {
 				size = CB_LITERAL (x)->size;
 				data = CB_LITERAL (x)->data;
 				for (i = 0; i < size; i++) {
-					output ("f->data[i] == %d", data[i]);
+					output ("f.data[i] == %d", data[i]);
 					if (i + 1 < size) {
-						output (" || ");
+						output (" or ");
 					}
 				}
 			}
@@ -3719,13 +4641,16 @@ output_class_name_definition (struct cb_class_name *p)
 		if (CB_CHAIN (l)) {
 			output ("\n");
 			output_prefix ();
-			output ("         || ");
+			output ("         or ");
 		}
 	}
-	output (" ))\n");
-	output_line ("    return 0;");
-	output_line ("return 1;");
-	output_indent ("}");
+	output (" ):\n");
+	output_block_open ();
+	output_line ("return 0");
+	output_block_close ();
+	output_block_close ();
+	output_line ("return 1");
+	output_block_close ();
 	output_newline ();
 }
 
@@ -3749,6 +4674,243 @@ output_initial_values (struct cb_field *p)
 	}
 }
 
+/* QA-FIX (G1/IC226A EXTERNAL sibling rebind): an EXTERNAL data item is entered
+   into field_cache (and therefore re-pointed by output_external_data_init)
+   only when its FIRST PROCEDURE-DIVISION reference is emitted by output_param.
+   For a nested / sibling program that reference is emitted AFTER the program's
+   one-time-init block, so at init time field_cache held no entry for the item
+   and its cob_field.data was never re-pointed -- it stayed None, producing a
+   run-time "'NoneType' object is not subscriptable" the first time the sibling
+   touched the field (e.g. IC226A's IC226A__1 sub-program crashed on EXT-DATA-4
+   / f_139).  field_cache is reset only for the top-level program (if (!nested)
+   above), so it accumulates across the compilation unit -- which is why the
+   sibling already rebinds the MAIN program's EXTERNAL fields but not its own.
+   This helper walks the CURRENT program's WORKING-STORAGE and pre-registers any
+   referenced EXTERNAL item using exactly the bookkeeping output_param performs,
+   so the immediately-following rebind loop binds them.  Items already
+   registered (count of the main program, or earlier in this walk) are skipped
+   via flag_field and harmlessly rebound to the same shared base slice. */
+static void
+register_program_external_fields (struct cb_field *f)
+{
+	struct cb_field		*pechk;
+	struct field_list	*fl;
+	cb_tree			x;
+	void			*savetarget;
+	int			is_ext;
+
+	for (; f; f = f->sister) {
+		if (f->children) {
+			register_program_external_fields (f->children);
+		}
+		/* Determine EXTERNAL membership exactly as output_param does
+		   (see the parent-chain walk at the external registration path). */
+		is_ext = 0;
+		if (f->redefines && f->redefines->flag_external) {
+			f->flag_item_external = 1;
+			f->flag_external = 1;
+		}
+		if (f->flag_external || f->flag_item_external) {
+			is_ext = 1;
+		}
+		for (pechk = f->parent; pechk && !is_ext; pechk = pechk->parent) {
+			if (pechk->flag_external
+			    || (pechk->redefines && pechk->redefines->flag_external)) {
+				is_ext = 1;
+			}
+		}
+		if (!is_ext) {
+			continue;
+		}
+		f->flag_item_external = 1;
+		/* Same guard as output_param: a plain (no subscript / no offset),
+		   fixed-size, referenced item that is not yet cached. */
+		if (f->count > 0 && !f->flag_field
+		    && !cb_field_variable_size (f)
+		    && !cb_field_variable_address (f)) {
+			x = cb_build_field_reference (f, NULL);
+			savetarget = output_target;
+			output_target = NULL;
+			output_field (x);
+			fl = cobc_malloc (sizeof (struct field_list));
+			fl->x = x;
+			fl->f = f;
+			fl->curr_prog = excp_current_program_id;
+			fl->nulldata = 0;
+			fl->next = field_cache;
+			field_cache = fl;
+			f->flag_field = 1;
+			output_target = savetarget;
+		}
+	}
+}
+
+/* MIGRATION (C->Python): helper that inlines the EXTERNAL data-item field
+   re-pointing that the C emitter performed via "goto L_initextern".  After an
+   EXTERNAL base (b_<name>) has been bound to its shared buffer by
+   common.cob_external_addr, every cob_field that lives in that buffer must
+   have its .data re-pointed at the (now bound) base.  Python has no goto, so
+   the assignments are emitted inline at each initialisation point. */
+static void
+output_external_data_init (void)
+{
+	struct field_list	*k;
+
+	/* QA-FIX (G1/IC226A): ensure the CURRENT program's referenced EXTERNAL
+	   items are present in field_cache before the rebind loop runs, so a
+	   nested / sibling program re-points its own EXTERNAL fields and not only
+	   those inherited from earlier programs in the compilation unit. */
+	if (current_prog) {
+		register_program_external_fields (current_prog->working_storage);
+	}
+
+	for (k = field_cache; k; k = k->next) {
+		if (k->f->flag_item_external) {
+			output_prefix ();
+			output ("%s%d.data = ", CB_PREFIX_FIELD, k->f->id);
+			output_data (k->x);
+			output ("\n");
+		}
+	}
+}
+
+/* MIGRATION (C->Python): the "normal entry" prologue (everything the C emitter
+   placed between the global-entry dispatch and the entry-dispatch switch).  It
+   runs only for ordinary (non GLOBAL-USE-reentry) entries: re-initialises an
+   INITIAL program, allocates and initialises LOCAL-STORAGE, publishes the CALL
+   parameter count, primes ANY LENGTH parameters, and saves parameters for
+   GLOBAL USE.  Factored into a helper so it can be emitted either directly
+   (no GLOBAL declaratives) or inside the "else" arm of the global-entry
+   dispatch without duplicating the body. */
+static void
+output_internal_normal_prologue (struct cb_program *prog, cb_tree parameter_list,
+				 int anyseen)
+{
+	cb_tree			l;
+	struct cb_field		*f;
+	struct local_list	*locptr;
+	int			i;
+	char			*p;
+	char			name[COB_MINI_BUFF];
+
+	/* INITIAL program: re-establish WORKING-STORAGE on every entry */
+	if (prog->flag_initial) {
+		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
+			f = CB_FILE (CB_VALUE (l))->record;
+			if (f->flag_external) {
+				strcpy (name, f->name);
+				for (p = name; *p; p++) {
+					if (*p == '-') {
+						*p = '_';
+					}
+				}
+				output_line ("%s%s = common.cob_external_addr (\"%s\", %d)",
+					     CB_PREFIX_BASE, name, name,
+					     CB_FILE (CB_VALUE (l))->record_max);
+			}
+		}
+		output_initial_values (prog->working_storage);
+		if (has_external) {
+			output_external_data_init ();
+		}
+		output_newline ();
+		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
+			output_file_initialization (CB_FILE (CB_VALUE (l)));
+		}
+		output_newline ();
+	}
+
+	/* LOCAL-STORAGE: a fresh bytearray per invocation (the C runtime used
+	   cob_malloc; in Python a per-call bytearray gives identical
+	   per-invocation lifetime and byte layout) */
+	if (prog->local_storage) {
+		if (local_cache) {
+			output_comment ("Allocate LOCAL storage");
+		}
+		for (locptr = local_cache; locptr; locptr = locptr->next) {
+			output_line ("%s%d = bytearray (%d)", CB_PREFIX_BASE,
+				     locptr->f->id, locptr->f->memory_size);
+			if (current_prog->flag_global_use) {
+				output_line ("save_%s%d = %s%d",
+					     CB_PREFIX_BASE, locptr->f->id,
+					     CB_PREFIX_BASE, locptr->f->id);
+			}
+		}
+		output_newline ();
+		output_comment ("Initialize LOCAL storage");
+		output_initial_values (prog->local_storage);
+		output_newline ();
+	}
+
+	/* Publish the number of CALL parameters into the program's special
+	   register (an LVALUE store -> the move.cob_set_int setter) */
+	if (cb_field (current_prog->cb_call_params)->count) {
+		output_comment ("Initialize number of call params");
+		output_prefix ();
+		output ("move.cob_set_int (");
+		output_param (current_prog->cb_call_params, -1);
+		output (", common.cob_call_params)\n");
+	}
+	output_line ("common.cob_save_call_params = common.cob_call_params");
+	output_newline ();
+	if (cb_flag_traceall) {
+		output_line ("common.cob_ready_trace ()");
+		output_newline ();
+	}
+
+	/* ANY LENGTH parameters: bind the caller-supplied field and adopt its
+	   actual length from the caller's parameter table */
+	i = 0;
+	if (anyseen) {
+		output_comment ("Initialize ANY LENGTH parameters");
+	}
+	for (l = parameter_list; l; l = CB_CHAIN (l), i++) {
+		f = cb_field (CB_VALUE (l));
+		if (f->flag_any_length) {
+			output_prefix ();
+			output ("anylen_%d = ", i);
+			output_param (CB_VALUE (l), i);
+			output ("\n");
+			if (prog->flag_global_use) {
+				output_line ("save_anylen_%d = anylen_%d", i, i);
+			}
+			output_line ("if common.cob_call_params > %d and module.next.cob_procedure_parameters[%d] is not None:",
+				     i, i);
+			output_block_open ();
+			output_line ("anylen_%d.size = module.next.cob_procedure_parameters[%d].size",
+				     i, i);
+			output_block_close ();
+		}
+	}
+	if (anyseen) {
+		output_newline ();
+	}
+
+	/* Parameter save for GLOBAL USE re-entry */
+	if (prog->flag_global_use && parameter_list) {
+		output_comment ("Parameter save");
+		for (l = parameter_list; l; l = CB_CHAIN (l)) {
+			f = cb_field (CB_VALUE (l));
+			output_line ("save_%s%d = %s%d",
+				     CB_PREFIX_BASE, f->id, CB_PREFIX_BASE, f->id);
+		}
+		output_newline ();
+	}
+	/* MIGRATION (C->Python): the C entry-dispatch "switch (entry) { case i:
+	   goto l_<id>; }" is removed.  _entry already carries the starting label
+	   id (see ENTRY CONVENTION) and the nested _dispatch(_entry, 0) call
+	   begins execution directly at that segment. */
+}
+
+/* MIGRATION (C->Python): a COBOL program unit is emitted as a Python function
+   "def <pid>_ (_entry, <bases>):".  The flat C instruction stream with C
+   labels and computed gotos becomes a nested "def _dispatch (_pc, _through):"
+   that re-enters a "while True:" loop; each need_begin paragraph/section is a
+   "if _pc == <id>:" segment, GO TO raises _CobGoto, and PERFORM is a
+   synchronous recursive _dispatch() call (the Python call stack replaces the
+   C perform frame stack).  Program termination (STOP RUN / GOBACK / fall off
+   the end) raises _CobExit, caught just outside _dispatch so the module-pop
+   and RETURN-CODE handling run exactly once. */
 static void
 output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 {
@@ -3756,87 +4918,40 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 	cb_tree			l2;
 	struct cb_field		*f;
 	struct cb_field		*ff;
-	struct field_list	*k;
 	struct local_list	*locptr;
 	struct cb_file		*fl;
 	char			*p;
 	struct handler_struct	*hstr;
-#ifndef	__GNUC__
-	struct label_list	*pl;
-#endif
+	/* MIGRATION (C -> Python): the non-GCC "struct label_list *pl" cursor that
+	   drove the perform-frame jump table is removed -- the Python backend has
+	   no jump table (control flow is the _dispatch loop plus _CobGoto/_CobExit),
+	   so the cursor is dead on every compiler build.  See the matching removal
+	   at the end of this function. */
 	int			i;
 	int			n;
 	int			parmnum = 0;
 	int			seen = 0;
 	int			anyseen;
+	int			first;
 	char			name[COB_MINI_BUFF];
 
-	/* Program function */
-	output ("static int\n%s_ (const int entry", prog->program_id);
+	/* Program function header: def <pid>_ (_entry, <base params>): */
+	output ("def %s_ (_entry", prog->program_id);
 	if (!prog->flag_chained) {
 		for (l = parameter_list; l; l = CB_CHAIN (l)) {
-			output (", unsigned char *%s%d",
+			output (", %s%d=None",
 				CB_PREFIX_BASE, cb_field (CB_VALUE (l))->id);
 			parmnum++;
 		}
 	}
-	output (")\n");
-	output_indent ("{");
+	output ("):\n");
+	output_block_open ();
 
-	/* Local variables */
-	output_line ("/* Local variables */");
-	output_line ("#include \"%s\"", prog->local_storage_name);
-	output_newline ();
-
-	/* Alphabet-names */
-	if (prog->alphabet_name_list) {
-		output_local ("/* Alphabet names */\n");
-		for (l = prog->alphabet_name_list; l; l = CB_CHAIN (l)) {
-			output_alphabet_name_definition (CB_ALPHABET_NAME (CB_VALUE (l)));
-		}
-		output_local ("\n");
-	}
-
-	output_line ("static int initialized = 0;");
-	if (prog->decimal_index_max) {
-		output_local ("/* Decimal structures */\n");
-		for (i = 0; i < prog->decimal_index_max; i++) {
-			output_local ("static cob_decimal d%d;\n", i);
-		}
-		output_local ("\n");
-	}
-
-	output_prefix ();
-	output ("static cob_field *cob_user_parameters[COB_MAX_FIELD_PARAMS];\n");
-	output_prefix ();
-	output ("static struct cob_module module = { NULL, ");
-	if (prog->collating_sequence) {
-		output_param (cb_ref (prog->collating_sequence), -1);
-	} else {
-		output ("NULL");
-	}
-	output (", ");
-	if (prog->crt_status && cb_field (prog->crt_status)->count) {
-		output_param (cb_ref (prog->crt_status), -1);
-	} else {
-		output ("NULL");
-	}
-	output (", ");
-	if (prog->cursor_pos) {
-		output_param (cb_ref (prog->cursor_pos), -1);
-	} else {
-		output ("NULL");
-	}
-	output (", cob_user_parameters");
-
-	/* Note spare byte at end */
-	output (", %d, '%c', '%c', '%c', %d, %d, %d, 0 };\n",
-		cb_display_sign, prog->decimal_point, prog->currency_symbol,
-		prog->numeric_separator, cb_filename_mapping, cb_binary_truncate,
-		cb_pretty_display);
-	output_newline ();
-
-	/* External items */
+	/* MIGRATION (C->Python): declare as global every module-level name this
+	   function REBINDS so the assignment updates the shared object rather
+	   than creating a shadow local.  Names that are only mutated in place
+	   (ordinary WORKING-STORAGE bytearrays / cob_field objects) are reached
+	   through normal global lookup and need no declaration. */
 	for (f = prog->working_storage; f; f = f->sister) {
 		if (f->flag_external) {
 			strcpy (name, f->name);
@@ -3845,8 +4960,7 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 					*p = '_';
 				}
 			}
-			output_local ("static unsigned char\t*%s%s = NULL;", CB_PREFIX_BASE, name);
-			output_local ("  /* %s */\n", f->name);
+			output_line ("global %s%s", CB_PREFIX_BASE, name);
 		}
 	}
 	for (l = prog->file_list; l; l = CB_CHAIN (l)) {
@@ -3858,230 +4972,225 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 					*p = '_';
 				}
 			}
-			output_local ("static unsigned char\t*%s%s = NULL;", CB_PREFIX_BASE, name);
-			output_local ("  /* %s */\n", f->name);
+			output_line ("global %s%s", CB_PREFIX_BASE, name);
+		}
+		fl = CB_FILE (CB_VALUE (l));
+		output_line ("global %s%s", CB_PREFIX_FILE, fl->cname);
+		if (fl->organization == COB_ORG_RELATIVE
+		    || fl->organization == COB_ORG_INDEXED) {
+			output_line ("global %s%s", CB_PREFIX_KEYS, fl->cname);
 		}
 	}
 	if (cb_sticky_linkage && parmnum) {
-		output_local ("\n/* Sticky linkage save pointers */\n");
 		for (i = 0; i < parmnum; i++) {
-			output_local ("static unsigned char\t*cob_parm_%d = NULL;\n", i);
+			output_line ("global cob_parm_%d", i);
+			/* MIGRATION (C -> Python): the sticky-linkage parameter shadow
+			   "cob_parm_<i>" persists each supplied CALL argument across
+			   invocations so that a later CALL passing FEWER arguments restores
+			   the previous binding (reproducing the C file-scope static
+			   cob_parm[] array used when "sticky-linkage: yes").  The function
+			   declares it "global" and both reads (restore guard) and writes
+			   (remember supplied) it, so the name MUST already exist at module
+			   scope before the first call - otherwise the very first read
+			   ("if _ccp <= i and cob_parm_<i> is not None") raises NameError.
+			   Emit a module-level initialiser into the data stream; None means
+			   "never supplied", exactly the state the restore guard tests. */
+			output_storage ("cob_parm_%d = None\n", i);
 		}
-		output_local ("\n");
 	}
-
-	/* Files */
-	if (prog->file_list) {
-		i = 0;
-		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
-			i += output_file_allocation (CB_FILE (CB_VALUE (l)));
-		}
-		if (i) {
-			output_local ("\nstatic struct linage_struct *lingptr;\n");
-		}
-	}
-
-	if (prog->loop_counter) {
-		output_local ("\n/* Loop counters */\n");
-		for (i = 0; i < prog->loop_counter; i++) {
-			output_local ("int n%d;\n", i);
-		}
-		output_local ("\n");
-	}
-
-	/* BASED working-storage */
-	i = 0;
 	for (f = prog->working_storage; f; f = f->sister) {
 		if (f->flag_item_based) {
-			if (!i) {
-				i = 1;
-				output_local("/* BASED WORKING-STORAGE SECTION */\n");
-			}
-			output_local ("static unsigned char *%s%d = NULL; /* %s */\n",
-				CB_PREFIX_BASE, f->id, f->name);
+			output_line ("global %s%d", CB_PREFIX_BASE, f->id);
 		}
 	}
-	if (i) {
-		output_local ("\n");
-	}
 
-	/* BASED local-storage */
-	i = 0;
-	for (f = prog->local_storage; f; f = f->sister) {
-		if (f->flag_item_based) {
-			if (!i) {
-				i = 1;
-				output_local("/* BASED LOCAL-STORAGE */\n");
-			}
-			output_local ("unsigned char\t\t*%s%d = NULL; /* %s */\n",
-				CB_PREFIX_BASE, f->id, f->name);
-			if (prog->flag_global_use) {
-				output_local ("static unsigned char\t*save_%s%d = NULL;\n",
-					CB_PREFIX_BASE, f->id, f->name);
-			}
+	/* MIGRATION (C->Python): CALL-parameter table and the cob_module record
+	   are rebuilt fresh on every entry (the C runtime used file-scope
+	   statics; per-call objects are semantically identical for COBOL and are
+	   nested-program safe).  The module is pushed onto the run-unit stack
+	   below. */
+	output_line ("cob_user_parameters = [None] * %d", COB_MAX_FIELD_PARAMS);
+	output_prefix ();
+	output ("module = common.cob_module (");
+	if (prog->collating_sequence) {
+		output_param (cb_ref (prog->collating_sequence), -1);
+	} else {
+		output ("None");
+	}
+	output (", ");
+	if (prog->crt_status && cb_field (prog->crt_status)->count) {
+		output_param (cb_ref (prog->crt_status), -1);
+	} else {
+		output ("None");
+	}
+	output (", ");
+	if (prog->cursor_pos) {
+		output_param (cb_ref (prog->cursor_pos), -1);
+	} else {
+		output ("None");
+	}
+	output (", cob_user_parameters, %d, %d, %d, %d, %d, %d, %d)\n",
+		cb_display_sign, (int)prog->decimal_point,
+		(int)prog->currency_symbol, (int)prog->numeric_separator,
+		cb_filename_mapping, cb_binary_truncate, cb_pretty_display);
+
+	/* Decimal scratch registers: re-created per call (always assigned before
+	   use, so a fresh object per invocation matches the C semantics while
+	   avoiding any static/global collision across nested programs) */
+	if (prog->decimal_index_max) {
+		output_comment ("Decimal scratch registers");
+		for (i = 0; i < prog->decimal_index_max; i++) {
+			output_line ("d%d = numeric.cob_decimal ()", i);
 		}
 	}
-	if (i) {
-		output_local ("\n");
-	}
 
-	/* Dangling linkage section items */
-	seen = 0;
-	for (f = prog->linkage_storage; f; f = f->sister) {
-		for (l = parameter_list; l; l = CB_CHAIN (l)) {
-			if (f == cb_field (CB_VALUE (l))) {
-				break;
-			}
-		}
-		if (l == NULL) {
-			if (!seen) {
-				seen = 1;
-				output_local ("\n/* LINKAGE SECTION (Items not referenced by USING clause) */\n");
-			}
-			output_local ("static unsigned char\t*%s%d = NULL;  /* %s */\n",
-				     CB_PREFIX_BASE, f->id, f->name);
-		}
-	}
-	if (seen) {
-		output_local ("\n");
-	}
-
-	/* Screens */
-	if (prog->screen_storage) {
-		output_target = current_prog->local_storage_file;
-		output ("\n/* Screens */\n\n");
-		output_screen_definition (prog->screen_storage);
-		output_newline ();
-		output_target = yyout;
-	}
-
-	output_local ("\n/* Define perform frame stack */\n\n");
-	if (cb_perform_osvs) {
-		output_local ("struct cob_frame\t*temp_index;\n");
-	}
-	if (cb_flag_stack_check) {
-		output_local ("struct cob_frame\t*frame_overflow;\n");
-	}
-	output_local ("struct cob_frame\t*frame_ptr;\n");
-	output_local ("struct cob_frame\tframe_stack[%d];\n\n", COB_STACK_SIZE);
-
-	i = 0;
+	/* EXTERNAL items and dangling LINKAGE items: module-level placeholders
+	   are emitted in storage finalisation; here we only need the per-call
+	   ANY LENGTH and BASED LOCAL-STORAGE locals to exist as names. */
 	anyseen = 0;
+	i = 0;
 	for (l = parameter_list; l; l = CB_CHAIN (l), i++) {
 		f = cb_field (CB_VALUE (l));
 		if (f->flag_any_length) {
 			if (!anyseen) {
 				anyseen = 1;
-				output_local ("/* ANY LENGTH fields */\n");
+				output_comment ("ANY LENGTH parameters");
 			}
-			output_local ("cob_field\t\t*anylen_%d;\n", i);
+			output_line ("anylen_%d = None", i);
 			if (prog->flag_global_use) {
-				output_local ("static cob_field\t*save_anylen_%d;\n", i);
+				output_line ("save_anylen_%d = None", i);
 			}
 		}
 	}
-	if (anyseen) {
-		output_local ("\n");
-	}
-	if (prog->flag_global_use && parameter_list) {
-		output_local ("/* Parameter save */\n");
-		for (l = parameter_list; l; l = CB_CHAIN (l)) {
-			f = cb_field (CB_VALUE (l));
-			output_local ("static unsigned char\t*save_%s%d;\n",
-				CB_PREFIX_BASE, f->id);
+	first = 0;
+	for (f = prog->local_storage; f; f = f->sister) {
+		if (f->flag_item_based) {
+			if (!first) {
+				first = 1;
+				output_comment ("BASED LOCAL-STORAGE");
+			}
+			output_line ("%s%d = None", CB_PREFIX_BASE, f->id);
 		}
-		output_local ("\n");
 	}
 
-	output_line ("/* Start of function code */");
+	/* Alphabet-names are module-level data (emitted into the module stream) */
+	if (prog->alphabet_name_list) {
+		for (l = prog->alphabet_name_list; l; l = CB_CHAIN (l)) {
+			output_alphabet_name_definition
+				(CB_ALPHABET_NAME (CB_VALUE (l)));
+		}
+	}
+
+	/* Screens are module-level data as well */
+	if (prog->screen_storage) {
+		output_target = current_prog->local_storage_file;
+		output_screen_definition (prog->screen_storage);
+		output_target = yyout;
+	}
+
+	/* Files: emit the module-level file-handle / key-array placeholders
+	   (output_file_allocation now produces "h_<name> = None" etc. at module
+	   scope; the names were declared global above so the per-call file
+	   initialisation can rebind them). */
+	if (prog->file_list) {
+		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
+			(void) output_file_allocation (CB_FILE (CB_VALUE (l)));
+		}
+	}
+
+	/* ---- Start of function code ---- */
+	output_comment ("Start of function code");
 	output_newline ();
-	output_line ("/* CANCEL callback handling */");
-	output_line ("if (unlikely(entry < 0)) {");
-	output_line ("	if (!initialized) {");
-	output_line ("		return 0;");
-	output_line ("	}");
+
+	/* CANCEL callback handling (entry < 0) */
+	output_comment ("CANCEL callback handling");
+	output_line ("if _entry < 0:");
+	output_block_open ();
+	output_line ("if not getattr (%s_, '_initialized', 0):", prog->program_id);
+	output_block_open ();
+	output_line ("return 0");
+	output_block_close ();
 	for (l = prog->file_list; l; l = CB_CHAIN (l)) {
 		fl = CB_FILE (CB_VALUE (l));
 		if (fl->organization != COB_ORG_SORT) {
-			output_line ("	cob_close (%s%s, 0, NULL);",
-					CB_PREFIX_FILE, fl->cname);
+			output_line ("fileio.cob_close (%s%s, 0, None)",
+				     CB_PREFIX_FILE, fl->cname);
 		}
 	}
-	if (prog->decimal_index_max) {
-		for (i = 0; i < prog->decimal_index_max; i++) {
-			output_line ("	mpz_clear (d%d.value);", i);
-			output_line ("	d%d.scale = 0;", i);
-		}
-	}
-	output_line ("	initialized = 0;");
-	output_line ("	return 0;");
-	output_line ("}");
+	/* Decimal registers are garbage-collected; no explicit clear needed. */
+	output_line ("%s_._initialized = 0", prog->program_id);
+	output_line ("return 0");
+	output_block_close ();
 	output_newline ();
+
+	/* Sticky linkage: restore omitted trailing parameters from the previous
+	   call and remember the supplied ones.  The C fall-through switch
+	   (case K runs cases K..end) becomes "restore param i iff cob_call_params
+	   <= i". */
 	if (cb_sticky_linkage && parmnum) {
-		output_line ("if (cob_call_params < %d) {", parmnum);
-		output_line ("  switch (cob_call_params) {");
+		output_line ("_ccp = common.cob_call_params");
+		output_line ("if _ccp < %d:", parmnum);
+		output_block_open ();
 		for (i = 0, l = parameter_list; l; l = CB_CHAIN (l), i++) {
-			output_line ("  case %d:", i);
-			output_line ("   if (cob_parm_%d != NULL)", i);
-			output_line ("       %s%d = cob_parm_%d;",
-				     CB_PREFIX_BASE, cb_field (CB_VALUE (l))->id, i);
+			output_line ("if _ccp <= %d and cob_parm_%d is not None:",
+				     i, i);
+			output_block_open ();
+			output_line ("%s%d = cob_parm_%d", CB_PREFIX_BASE,
+				     cb_field (CB_VALUE (l))->id, i);
+			output_block_close ();
 		}
-		output_line ("  }");
-		output_line ("}");
+		output_block_close ();
 		for (i = 0, l = parameter_list; l; l = CB_CHAIN (l), i++) {
-			output_line ("if (%s%d != NULL)",
-				     CB_PREFIX_BASE, cb_field (CB_VALUE (l))->id);
-			output_line ("  cob_parm_%d = %s%d;", i,
-				     CB_PREFIX_BASE, cb_field (CB_VALUE (l))->id);
+			output_line ("if %s%d is not None:", CB_PREFIX_BASE,
+				     cb_field (CB_VALUE (l))->id);
+			output_block_open ();
+			output_line ("cob_parm_%d = %s%d", i, CB_PREFIX_BASE,
+				     cb_field (CB_VALUE (l))->id);
+			output_block_close ();
 		}
 		output_newline ();
 	}
 
-	output_line ("/* Initialize frame stack */");
-	output_line ("frame_ptr = &frame_stack[0];");
-	output_line ("frame_ptr->perform_through = 0;");
-	if (cb_flag_stack_check) {
-		output_line ("frame_overflow = &frame_stack[COB_STACK_SIZE - 1];");
-	}
+	/* MIGRATION (C->Python): the C perform frame stack (frame_ptr /
+	   frame_stack / frame_overflow / temp_index) is gone; PERFORM uses the
+	   Python call stack via recursive _dispatch() calls. */
+
+	/* Push module stack */
+	output_comment ("Push module stack");
+	output_line ("module.next = common.cob_current_module");
+	output_line ("common.cob_current_module = module");
 	output_newline ();
 
-	output_line ("/* Push module stack */");
-	output_line ("module.next = cob_current_module;");
-	output_line ("cob_current_module = &module;");
-	output_newline ();
-
-	/* Initialization */
-	output_line ("/* Initialize program */");
-	output_line ("if (unlikely(initialized == 0))");
-	output_indent ("  {");
-	output_line ("if (!cob_initialized) {");
+	/* One-time initialisation (guarded by a per-function attribute so the
+	   guard is private to each nested program) */
+	output_comment ("Initialize program");
+	output_line ("if not getattr (%s_, '_initialized', 0):", prog->program_id);
+	output_block_open ();
+	output_line ("if not common.cob_initialized:");
+	output_block_open ();
 	if (cb_flag_implicit_init) {
-		output_line ("  cob_init (0, NULL);");
+		output_line ("common.cob_init (0, None)");
 	} else {
-		output_line ("  cob_fatal_error (COB_FERROR_INITIALIZED);");
+		output_line ("common.cob_fatal_error (common.COB_FERROR_INITIALIZED)");
 	}
-	output_line ("}");
-	output_line
-	    ("cob_check_version (COB_SOURCE_FILE, COB_PACKAGE_VERSION, COB_PATCH_LEVEL);");
+	output_block_close ();
+	output_line ("common.cob_check_version (COB_SOURCE_FILE, COB_PACKAGE_VERSION, COB_PATCH_LEVEL)");
 	if (!prog->flag_main) {
 		if (cb_flag_implicit_init) {
-			output_line ("cob_set_cancel ((const char *)\"%s\", (void *)%s, (void *)%s_);",
-				prog->orig_source_name, prog->program_id,
-				prog->program_id);
+			output_line ("call.cob_set_cancel (\"%s\", %s, %s_)",
+				     prog->orig_source_name, prog->program_id,
+				     prog->program_id);
 		} else {
-			output_line ("if (module.next)");
-			output_line ("  cob_set_cancel ((const char *)\"%s\", (void *)%s, (void *)%s_);",
-				prog->orig_source_name, prog->program_id,
-				prog->program_id);
+			output_line ("if module.next is not None:");
+			output_block_open ();
+			output_line ("call.cob_set_cancel (\"%s\", %s, %s_)",
+				     prog->orig_source_name, prog->program_id,
+				     prog->program_id);
+			output_block_close ();
 		}
 	}
-	if (prog->decimal_index_max) {
-		output_line ("/* Initialize decimal numbers */");
-		for (i = 0; i < prog->decimal_index_max; i++) {
-			output_line ("cob_decimal_init (&d%d);", i);
-		}
-		output_newline ();
-	}
+	/* Decimal registers were created above; numeric.cob_decimal() performs
+	   their initialisation, so no separate cob_decimal_init step is emitted. */
 	if (!prog->flag_initial) {
 		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
 			f = CB_FILE (CB_VALUE (l))->record;
@@ -4092,15 +5201,14 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 						*p = '_';
 					}
 				}
-				output_line ("%s%s = cob_external_addr (\"%s\", %d);",
+				output_line ("%s%s = common.cob_external_addr (\"%s\", %d)",
 					     CB_PREFIX_BASE, name, name,
 					     CB_FILE (CB_VALUE (l))->record_max);
 			}
 		}
 		output_initial_values (prog->working_storage);
 		if (has_external) {
-			output_line ("goto L_initextern;");
-			output_line ("LRET_initextern: ;");
+			output_external_data_init ();
 		}
 		if (prog->file_list) {
 			output_newline ();
@@ -4110,18 +5218,18 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 			output_newline ();
 		}
 	}
-
-	output_line ("initialized = 1;");
+	output_line ("%s_._initialized = 1", prog->program_id);
+	output_block_close ();
 	if (prog->flag_chained) {
-		output ("    } else {\n");
-		output_line ("  cob_fatal_error (COB_FERROR_CHAINING);");
-		output_indent ("  }");
-	} else {
-		output_indent ("  }");
+		output_line ("else:");
+		output_block_open ();
+		output_line ("common.cob_fatal_error (common.COB_FERROR_CHAINING)");
+		output_block_close ();
 	}
 	output_newline ();
 
-	/* Set up LOCAL-STORAGE cache */
+	/* Build the LOCAL-STORAGE allocation cache (compile-time bookkeeping;
+	   emits nothing) */
 	if (prog->local_storage) {
 		for (f = prog->local_storage; f; f = f->sister) {
 			ff = cb_field_founder (f);
@@ -4143,193 +5251,118 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 		}
 		local_cache = local_list_reverse (local_cache);
 	}
-	/* Global entry dispatch */
+
+	/* GLOBAL USE save pointers must be module-level so they survive across
+	   the re-entry; declare them global before first use. */
+	if (prog->flag_global_use) {
+		for (locptr = local_cache; locptr; locptr = locptr->next) {
+			output_line ("global save_%s%d", CB_PREFIX_BASE,
+				     locptr->f->id);
+		}
+		for (l = parameter_list; l; l = CB_CHAIN (l)) {
+			output_line ("global save_%s%d", CB_PREFIX_BASE,
+				     cb_field (CB_VALUE (l))->id);
+		}
+		i = 0;
+		for (l = parameter_list; l; l = CB_CHAIN (l), i++) {
+			if (cb_field (CB_VALUE (l))->flag_any_length) {
+				output_line ("global save_anylen_%d", i);
+			}
+		}
+	}
+
+	/* Entry routing: GLOBAL USE re-entries restore the saved state and jump
+	   (via _entry) straight to the declarative; all other entries run the
+	   normal prologue. */
 	if (prog->global_list) {
-		output_line ("/* Global entry dispatch */");
-		output_newline ();
+		output_comment ("Global entry dispatch");
+		first = 1;
 		for (l = prog->global_list; l; l = CB_CHAIN (l)) {
-			output_line ("if (unlikely(entry == %d)) {",
-					CB_LABEL (CB_VALUE (l))->id);
+			if (first) {
+				output_line ("if _entry == %d:",
+					     CB_LABEL (CB_VALUE (l))->id);
+				first = 0;
+			} else {
+				output_line ("elif _entry == %d:",
+					     CB_LABEL (CB_VALUE (l))->id);
+			}
+			output_block_open ();
 			if (cb_flag_traceall) {
-				output_line ("\tcob_ready_trace ();");
+				output_line ("common.cob_ready_trace ()");
 			}
 			for (locptr = local_cache; locptr; locptr = locptr->next) {
-				output_line ("\t%s%d = save_%s%d;",
-					CB_PREFIX_BASE, locptr->f->id,
-					CB_PREFIX_BASE, locptr->f->id);
+				output_line ("%s%d = save_%s%d",
+					     CB_PREFIX_BASE, locptr->f->id,
+					     CB_PREFIX_BASE, locptr->f->id);
 			}
 			i = 0;
-			for (l2 = parameter_list; l2; l2 = CB_CHAIN (l), i++) {
+			for (l2 = parameter_list; l2; l2 = CB_CHAIN (l2), i++) {
 				f = cb_field (CB_VALUE (l2));
-				output_line ("\t%s%d = save_%s%d;",
-					CB_PREFIX_BASE, f->id,
-					CB_PREFIX_BASE, f->id);
+				output_line ("%s%d = save_%s%d",
+					     CB_PREFIX_BASE, f->id,
+					     CB_PREFIX_BASE, f->id);
 				if (f->flag_any_length) {
-					output_line ("\tanylen_%d = save_anylen_%d;", i, i);
+					output_line ("anylen_%d = save_anylen_%d",
+						     i, i);
 				}
 			}
-			output_line ("\tgoto %s%d;",
-					CB_PREFIX_LABEL,
-					CB_LABEL (CB_VALUE (l))->id);
-			output_line ("}");
+			output_block_close ();
 		}
-		output_newline ();
-	}
-
-	if (prog->flag_initial) {
-		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
-			f = CB_FILE (CB_VALUE (l))->record;
-			if (f->flag_external) {
-				strcpy (name, f->name);
-				for (p = name; *p; p++) {
-					if (*p == '-') {
-						*p = '_';
-					}
-				}
-				output_line ("%s%s = cob_external_addr (\"%s\", %d);",
-					     CB_PREFIX_BASE, name, name,
-					     CB_FILE (CB_VALUE (l))->record_max);
-			}
-		}
-		output_initial_values (prog->working_storage);
-		if (has_external) {
-			output_line ("goto L_initextern;");
-			output_line ("LRET_initextern: ;");
-		}
-		output_newline ();
-		for (l = prog->file_list; l; l = CB_CHAIN (l)) {
-			output_file_initialization (CB_FILE (CB_VALUE (l)));
-		}
-		output_newline ();
-	}
-	if (prog->local_storage) {
-		if (local_cache) {
-			output_line ("/* Allocate LOCAL storage */");
-		}
-		for (locptr = local_cache; locptr; locptr = locptr->next) {
-			output_line ("%s%d = cob_malloc (%d);", CB_PREFIX_BASE,
-					locptr->f->id, locptr->f->memory_size);
-			if (current_prog->flag_global_use) {
-				output_line ("save_%s%d = %s%d;",
-						CB_PREFIX_BASE, locptr->f->id,
-						CB_PREFIX_BASE, locptr->f->id);
-			}
-		}
-		output_newline ();
-		output_line ("/* Initialialize LOCAL storage */");
-		output_initial_values (prog->local_storage);
-		output_newline ();
-	}
-
-	if (cb_field (current_prog->cb_call_params)->count) {
-		output_line ("/* Initialize number of call params */");
-		output ("  ");
-		output_integer (current_prog->cb_call_params);
-		output_line (" = cob_call_params;");
-	}
-	output_line ("cob_save_call_params = cob_call_params;");
-	output_newline ();
-	if (cb_flag_traceall) {
-		output_line ("cob_ready_trace ();");
-		output_newline ();
-	}
-
-	i = 0;
-	if (anyseen) {
-		output_line ("/* Initialize ANY LENGTH parameters */");
-	}
-	for (l = parameter_list; l; l = CB_CHAIN (l), i++) {
-		f = cb_field (CB_VALUE (l));
-		if (f->flag_any_length) {
-			output ("  anylen_%d = ", i);
-			output_param (CB_VALUE (l), i);
-			output (";\n");
-			if (prog->flag_global_use) {
-				output_line ("save_anylen_%d = anylen_%d;", i, i);
-			}
-			output_line ("if (cob_call_params > %d && %s%d%s)",
-				i, "module.next->cob_procedure_parameters[",
-				i, "]");
-			output_line ("  anylen_%d->size = %s%d%s;", i,
-				"module.next->cob_procedure_parameters[",
-				i, "]->size");
-		}
-	}
-	if (anyseen) {
-		output_newline ();
-	}
-	if (prog->flag_global_use && parameter_list) {
-		output_line ("/* Parameter save */");
-		for (l = parameter_list; l; l = CB_CHAIN (l)) {
-			f = cb_field (CB_VALUE (l));
-			output_line ("save_%s%d = %s%d;",
-				CB_PREFIX_BASE, f->id,
-				CB_PREFIX_BASE, f->id);
-		}
-		output_newline ();
-	}
-
-	/* Entry dispatch */
-	output_line ("/* Entry dispatch */");
-	if (cb_list_length (prog->entry_list) > 1) {
-		output_newline ();
-		output_line ("switch (entry)");
-		output_line ("  {");
-		for (i = 0, l = prog->entry_list; l; l = CB_CHAIN (l)) {
-			output_line ("  case %d:", i++);
-			output_line ("    goto %s%d;",
-				     CB_PREFIX_LABEL, CB_LABEL (CB_PURPOSE (l))->id);
-		}
-		output_line ("  }");
-		output_line ("/* This should never be reached */");
-		output_line ("cob_fatal_error (COB_FERROR_CHAINING);");
-		output_newline ();
+		output_line ("else:");
+		output_block_open ();
+		output_internal_normal_prologue (prog, parameter_list, anyseen);
+		output_block_close ();
 	} else {
-		l = prog->entry_list;
-		output_line ("goto %s%d;", CB_PREFIX_LABEL, CB_LABEL (CB_PURPOSE (l))->id);
-		output_newline ();
+		output_internal_normal_prologue (prog, parameter_list, anyseen);
 	}
+	output_newline ();
+
+	/* ---- Dispatch loop: the PROCEDURE DIVISION as re-enterable segments ---- */
+	output_line ("def _dispatch (_pc, _through):");
+	output_block_open ();
+	/* MIGRATION (C -> Python): ALLOCATE / FREE / SET ADDRESS statements are
+	   emitted inside this nested _dispatch function and REBIND the module-level
+	   backing names "b_<id>" of BASED / non-parameter LINKAGE items.  A plain
+	   assignment inside _dispatch would create a function-local shadow, so each
+	   such name is declared "global" here.  Declaring "global" for a name that
+	   is only read is harmless, so the full rebindable set is declared. */
+	{
+		struct cb_field	*bf;
+		struct cb_field	*lists[2];
+		int		li;
+
+		lists[0] = prog->working_storage;
+		lists[1] = prog->linkage_storage;
+		for (li = 0; li < 2; li++) {
+			for (bf = lists[li]; bf; bf = bf->sister) {
+				if (cb_field_founder (bf) == bf
+				    && is_rebindable_base (prog, bf)) {
+					output_line ("global %s%d", CB_PREFIX_BASE, bf->id);
+				}
+			}
+		}
+	}
+	output_line ("while True:");
+	output_block_open ();
+	output_line ("try:");
+	output_block_open ();
 
 	/* PROCEDURE DIVISION */
-	output_line ("/* PROCEDURE DIVISION */");
+	output_comment ("PROCEDURE DIVISION");
+	output_segment_open = 0;
 	for (l = prog->exec_list; l; l = CB_CHAIN (l)) {
 		output_stmt (CB_VALUE (l));
 	}
-	output_newline ();
-	output_line ("/* Program exit */");
-	output_newline ();
+	/* close the final main-line segment with the implicit STOP RUN */
+	if (output_segment_open) {
+		output_comment ("Fall through end of program");
+		output_line ("raise _CobExit ()");
+		output_block_close ();
+		output_segment_open = 0;
+	}
 
-	if (needs_exit_prog) {
-		output_line ("exit_program:");
-		output_newline ();
-	}
-	if (prog->local_storage) {
-		output_line ("/* Deallocate LOCAL storage */");
-		local_cache = local_list_reverse (local_cache);
-		for (locptr = local_cache; locptr; locptr = locptr->next) {
-			output_line ("if (%s%d) {", CB_PREFIX_BASE, locptr->f->id);
-			output_line ("\tfree (%s%d);", CB_PREFIX_BASE, locptr->f->id);
-			output_line ("\t%s%d = NULL;", CB_PREFIX_BASE, locptr->f->id);
-			output_line ("}");
-		}
-		output_newline ();
-	}
-	output_line ("/* Pop module stack */");
-	output_line ("cob_current_module = cob_current_module->next;");
-	output_newline ();
-	if (cb_flag_traceall) {
-		output_line ("cob_reset_trace ();");
-		output_newline ();
-	}
-	output_line ("/* Program return */");
-	output_prefix ();
-	output ("return ");
-	output_integer (current_prog->cb_return_code);
-	output (";\n");
-
-	/* Error handlers */
+	/* Error handlers (reached only by PERFORM from the I/O runtime) */
 	if (prog->file_list || prog->gen_file_error) {
-		output_newline ();
 		seen = 0;
 		for (i = COB_OPEN_INPUT; i <= COB_OPEN_EXTEND; i++) {
 			if (prog->global_handler[i].handler_label) {
@@ -4338,21 +5371,29 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 			}
 		}
 		output_stmt (cb_standard_error_handler);
-		output_newline ();
+		/* MIGRATION (C->Python): switch (cob_error_file->last_open_mode)
+		   over GLOBAL USE handlers becomes a flat if/elif/else; the
+		   default arm invokes the library default error handler. */
 		if (seen) {
-			output_line ("switch (cob_error_file->last_open_mode)");
-			output_indent ("{");
+			first = 1;
 			for (i = COB_OPEN_INPUT; i <= COB_OPEN_EXTEND; i++) {
 				hstr = &prog->global_handler[i];
 				if (hstr->handler_label) {
-					output_line ("case %d:", i);
-					output_indent ("{");
+					if (first) {
+						output_line ("if fileio.cob_error_file.last_open_mode == %d:",
+							     i);
+						first = 0;
+					} else {
+						output_line ("elif fileio.cob_error_file.last_open_mode == %d:",
+							     i);
+					}
+					output_block_open ();
 					if (prog == hstr->handler_prog) {
 						output_perform_call (hstr->handler_label,
 								     hstr->handler_label);
 					} else {
 						if (cb_flag_traceall) {
-							output_line ("cob_reset_trace ();");
+							output_line ("common.cob_reset_trace ()");
 						}
 						output_prefix ();
 						output ("%s_ (%d",
@@ -4360,66 +5401,116 @@ output_internal_function (struct cb_program *prog, cb_tree parameter_list)
 							hstr->handler_label->id);
 						parmnum = cb_list_length (hstr->handler_prog->parameter_list);
 						for (n = 0; n < parmnum; n++) {
-							output (", NULL");
+							output (", None");
 						}
-						output (");\n");
+						output (")\n");
 						if (cb_flag_traceall) {
-							output_line ("cob_ready_trace ();");
+							output_line ("common.cob_ready_trace ()");
 						}
 					}
-					output_line ("break;");
-					output_indent ("}");
+					output_block_close ();
 				}
 			}
-			output_line ("default:");
-			output_indent ("{");
-		}
-		output_line ("if (!(cob_error_file->flag_select_features & COB_SELECT_FILE_STATUS)) {");
-		output_line ("	cob_default_error_handle ();");
-		output_line ("	cob_stop_run (1);");
-		output_line ("}");
-		if (seen) {
-			output_line ("break;");
-			output_indent ("}");
-			output_indent ("}");
+			output_line ("else:");
+			output_block_open ();
+			output_line ("if not (fileio.cob_error_file.flag_select_features & %d):",
+				     COB_SELECT_FILE_STATUS);
+			output_block_open ();
+			output_line ("fileio.cob_default_error_handle ()");
+			output_line ("common.cob_stop_run (1)");
+			output_block_close ();
+			output_block_close ();
+		} else {
+			output_line ("if not (fileio.cob_error_file.flag_select_features & %d):",
+				     COB_SELECT_FILE_STATUS);
+			output_block_open ();
+			output_line ("fileio.cob_default_error_handle ()");
+			output_line ("common.cob_stop_run (1)");
+			output_block_close ();
 		}
 		output_perform_exit (CB_LABEL (cb_standard_error_handler));
-		output_newline ();
-		output_line ("cob_fatal_error (COB_FERROR_CODEGEN);");
-		output_newline ();
-	}
-#ifndef	__GNUC__
-	output_newline ();
-	output_line ("/* Frame stack jump table */");
-	output_line ("P_switch:");
-	if (label_cache) {
-		output_line (" switch (frame_ptr->return_address) {");
-		for (pl = label_cache; pl; pl = pl->next) {
-			output_line (" case %d:", pl->call_num);
-			output_line ("   goto %s%d;", CB_PREFIX_LABEL, pl->id);
+		output_line ("common.cob_fatal_error (common.COB_FERROR_CODEGEN)");
+		if (output_segment_open) {
+			output_block_close ();
+			output_segment_open = 0;
 		}
-		output_line (" }");
-	}
-	output_line (" cob_fatal_error (COB_FERROR_CODEGEN);");
-	output_newline ();
-#endif
-
-	if (has_external) {
-		output_newline ();
-		output_line ("/* EXTERNAL data initialization */");
-		output_line ("L_initextern: ;");
-		for (k = field_cache; k; k = k->next) {
-			if (k->f->flag_item_external) {
-				output_prefix ();
-				output ("\t%s%d.data = ", CB_PREFIX_FIELD, k->f->id);
-				output_data (k->x);
-				output (";\n");
-			}
-		}
-		output_line ("\tgoto LRET_initextern;");
 	}
 
-	output_indent ("}");
+	/* Terminal: an unmatched _pc means the run unit is finished */
+	output_line ("raise _CobExit ()");
+	output_block_close ();		/* close try */
+	output_line ("except _CobGoto as _g:");
+	output_block_open ();
+	output_line ("_pc = _g.pc");
+	output_block_close ();
+	if (cb_perform_osvs) {
+		/* OS/VS PERFORM exit semantics: unwind to the matching range */
+		output_line ("except _CobPerformExit as _pe:");
+		output_block_open ();
+		output_line ("if _pe.label_id == _through:");
+		output_block_open ();
+		output_line ("return 0");
+		output_block_close ();
+		output_line ("raise");
+		output_block_close ();
+	}
+	output_block_close ();		/* close while True */
+	output_block_close ();		/* close def _dispatch */
+	output_newline ();
+
+	/* Enter the dispatch loop at the requested entry label */
+	output_line ("try:");
+	output_block_open ();
+	output_line ("_dispatch (_entry, 0)");
+	output_block_close ();
+	output_line ("except _CobExit:");
+	output_block_open ();
+	output_line ("pass");
+	output_block_close ();
+	output_newline ();
+
+	/* Program exit cleanup (runs exactly once, regardless of how the run
+	   unit terminated) */
+	if (prog->local_storage) {
+		output_comment ("Deallocate LOCAL storage");
+		local_cache = local_list_reverse (local_cache);
+		for (locptr = local_cache; locptr; locptr = locptr->next) {
+			output_line ("if %s%d is not None:", CB_PREFIX_BASE,
+				     locptr->f->id);
+			output_block_open ();
+			output_line ("%s%d = None", CB_PREFIX_BASE, locptr->f->id);
+			output_block_close ();
+		}
+		output_newline ();
+	}
+	output_comment ("Pop module stack");
+	output_line ("common.cob_current_module = common.cob_current_module.next");
+	output_newline ();
+	if (cb_flag_traceall) {
+		output_line ("common.cob_reset_trace ()");
+		output_newline ();
+	}
+	output_comment ("Program return");
+	output_prefix ();
+	output ("return ");
+	output_integer (current_prog->cb_return_code);
+	output ("\n");
+
+	/* MIGRATION (C -> Python): the C emitter closed each program with a
+	   "#ifndef __GNUC__" perform-frame jump table -- a "P_switch:" label, a
+	   "switch (frame_ptr->return_address)" with one "case N: goto l_M;" per
+	   PERFORM target, and a trailing "cob_fatal_error(COB_FERROR_CODEGEN)".
+	   That fallback existed only for C compilers lacking GCC's computed-goto
+	   ("&&label") extension, and it emitted C tokens (switch/case/goto) that
+	   are not valid Python.  The Python backend models every PERFORM/GO TO
+	   through the _dispatch loop and the _CobGoto / _CobExit / _CobPerformExit
+	   exception classes emitted in the preamble -- a single representation that
+	   is identical regardless of which C compiler builds cobc.  The jump table
+	   is therefore dead and is removed for ALL compiler builds, satisfying the
+	   Python-only emitted-code requirement (it would otherwise leak C tokens
+	   into generated .py output when cobc is built with a non-GCC compiler). */
+
+	output_block_close ();		/* close def <pid>_ */
 	output_newline ();
 }
 
@@ -4427,124 +5518,61 @@ static void
 output_entry_function (struct cb_program *prog, cb_tree entry,
 		       cb_tree parameter_list, const int gencode)
 {
-
 	const unsigned char	*entry_name;
 	cb_tree			using_list;
-	cb_tree			l, l1, l2;
+	cb_tree			l;
+	cb_tree			l1;
+	cb_tree			l2;
 	struct cb_field		*f;
-	int			parmnum;
+	int			nbytes;
 
 	entry_name = CB_LABEL (CB_PURPOSE (entry))->name;
 	using_list = CB_VALUE (entry);
-#if	defined(_WIN32) || defined(__CYGWIN__)
-	if (!gencode && !prog->nested_level) {
-		output ("__declspec(dllexport) ");
+
+	/* MIGRATION (C->Python): the public ENTRY point becomes a thin Python
+	   wrapper "def <entry> (<params>): return <pid>_ (<label id>, <args>)".
+	   Python needs no forward prototypes, so the prototype pass
+	   (gencode == 0) emits nothing.  Per the ENTRY CONVENTION the internal
+	   function is entered with the entry's LABEL id (not a 0-based progid
+	   index), so _dispatch begins directly at the correct segment. */
+	if (!gencode) {
+		return;
 	}
-#endif
-	output ("int");
-	if (gencode) {
-		output ("\n");
-	} else {
-		output (" ");
-	}
-	output ("%s (", entry_name);
+
 	if (prog->flag_chained) {
 		using_list = NULL;
 		parameter_list = NULL;
 	}
-	if (!gencode && !using_list) {
-		output ("void);\n");
-		return;
-	}
-	parmnum = 0;
-	for (l = using_list; l; l = CB_CHAIN (l), parmnum++) {
+
+	output ("def %s (", entry_name);
+	for (l = using_list; l; l = CB_CHAIN (l)) {
 		f = cb_field (CB_VALUE (l));
-		switch (CB_PURPOSE_INT (l)) {
-		case CB_CALL_BY_VALUE:
-			if (CB_TREE_CLASS (CB_VALUE (l)) == CB_CLASS_NUMERIC) {
-				if (CB_SIZES(l) & CB_SIZE_UNSIGNED) {
-					output ("unsigned ");
-				}
-				switch (CB_SIZES_INT (l)) {
-				case CB_SIZE_1:
-					if (gencode) {
-						output ("char i_%d", f->id);
-					} else {
-						output ("char");
-					}
-					break;
-				case CB_SIZE_2:
-					if (gencode) {
-						output ("short i_%d", f->id);
-					} else {
-						output ("short");
-					}
-					break;
-				case CB_SIZE_4:
-					if (gencode) {
-						output ("int i_%d", f->id);
-					} else {
-						output ("int");
-					}
-					break;
-				case CB_SIZE_8:
-					if (gencode) {
-						output ("long long i_%d", f->id);
-					} else {
-						output ("long long");
-					}
-					break;
-				}
-/* RXW
-				if (!f->pic->have_sign) {
-					output ("unsigned ");
-				}
-				if (gencode) {
-					output ("int i_%d", f->id);
-				} else {
-					output ("int");
-				}
-*/
-				break;
-			}
-			/* Fall through */
-		case CB_CALL_BY_REFERENCE:
-		case CB_CALL_BY_CONTENT:
-			if (gencode) {
-				output ("unsigned char *%s%d", CB_PREFIX_BASE, f->id);
-			} else {
-				output ("unsigned char *");
-			}
-			break;
-		}
-		if (CB_CHAIN (l)) {
-			output (", ");
+		if (CB_PURPOSE_INT (l) == CB_CALL_BY_VALUE
+		    && CB_TREE_CLASS (CB_VALUE (l)) == CB_CLASS_NUMERIC) {
+			output ("i_%d=None, ", f->id);
+		} else {
+			output ("%s%d=None, ", CB_PREFIX_BASE, f->id);
 		}
 	}
+	/* MIGRATION (C -> Python): a trailing "*_extra" catch-all is appended to
+	   EVERY public entry signature so the callee tolerates being invoked with
+	   MORE positional arguments than it declares in USING.  The C runtime was
+	   inherently variadic at the call site (cob_unifunc punned the function
+	   pointer and C ignores surplus arguments), and the emitter pads each CALL
+	   with up to 4 trailing None placeholders when sticky-linkage / null-param
+	   is in effect (see output_call).  Without "*_extra" a fixed-arity Python
+	   def raises "takes N positional arguments but M were given".  Surplus
+	   arguments are COBOL-correct to ignore (a called program only ever reads
+	   the linkage items it declares); they are discarded into _extra.  Every
+	   parameter above already carries an "=None" default, so a CALL passing
+	   FEWER arguments than declared is equally tolerated (the missing trailing
+	   linkage items stay None / OMITTED), exactly matching the C behaviour. */
+	output ("*_extra):\n");
+	output_block_open ();
 
-	if (gencode) {
-		output (")\n");
-	} else {
-		output (");\n");
-		return;
-	}
-
-	output ("{\n");
-	for (l1 = parameter_list; l1; l1 = CB_CHAIN (l1)) {
-		for (l2 = using_list; l2; l2 = CB_CHAIN (l2)) {
-			if (strcasecmp (cb_field (CB_VALUE (l1))->name,
-					cb_field (CB_VALUE (l2))->name) == 0) {
-				f = cb_field (CB_VALUE (l2));
-				if (CB_PURPOSE_INT (l2) == CB_CALL_BY_VALUE &&
-				    (f->usage == CB_USAGE_POINTER ||
-				     f->usage == CB_USAGE_PROGRAM_POINTER)) {
-					output ("  unsigned char *ptr_%d = %s%d;\n",
-						f->id, CB_PREFIX_BASE, f->id);
-				}
-			}
-		}
-	}
-	output ("  return %s_ (%d", prog->program_id, progid++);
+	output_prefix ();
+	output ("return %s_ (%d", prog->program_id,
+		CB_LABEL (CB_PURPOSE (entry))->id);
 	for (l1 = parameter_list; l1; l1 = CB_CHAIN (l1)) {
 		for (l2 = using_list; l2; l2 = CB_CHAIN (l2)) {
 			if (strcasecmp (cb_field (CB_VALUE (l1))->name,
@@ -4554,10 +5582,35 @@ output_entry_function (struct cb_program *prog, cb_tree entry,
 				case CB_CALL_BY_VALUE:
 					if (f->usage == CB_USAGE_POINTER ||
 					    f->usage == CB_USAGE_PROGRAM_POINTER) {
-						output (", (unsigned char *)&ptr_%d", f->id);
+						/* pass the pointer object directly */
+						output (", %s%d", CB_PREFIX_BASE, f->id);
 						break;
 					} else if (CB_TREE_CLASS (CB_VALUE (l2)) == CB_CLASS_NUMERIC) {
-						output (", (unsigned char *)&i_%d", f->id);
+						/* MIGRATION (C->Python): a BY VALUE numeric
+						   argument arrives as a Python int; wrap it
+						   into a byte buffer of the declared width so
+						   the internal function reads it like the C
+						   runtime read &i_<id>. */
+						switch (CB_SIZES_INT (l2)) {
+						case CB_SIZE_1:
+							nbytes = 1;
+							break;
+						case CB_SIZE_2:
+							nbytes = 2;
+							break;
+						case CB_SIZE_4:
+							nbytes = 4;
+							break;
+						case CB_SIZE_8:
+							nbytes = 8;
+							break;
+						default:
+							nbytes = 4;
+							break;
+						}
+						output (", call.cob_value_buffer (i_%d, %d, %d)",
+							f->id, nbytes,
+							(CB_SIZES (l2) & CB_SIZE_UNSIGNED) ? 1 : 0);
 						break;
 					}
 					/* Fall through */
@@ -4570,23 +5623,39 @@ output_entry_function (struct cb_program *prog, cb_tree entry,
 			}
 		}
 		if (l2 == NULL) {
-			output (", NULL");
+			/* This entry does not USE this parameter -> pass None */
+			output (", None");
 		}
 	}
-	output (");\n");
-	output ("}\n\n");
+	output (")\n");
+	output_block_close ();
+	output_newline ();
 }
 
 static void
 output_main_function (struct cb_program *prog)
 {
-	output_line ("/* Main function */");
-	output_line ("int");
-	output_line ("main (int argc, char **argv)");
-	output_indent ("{");
-	output_line ("cob_init (argc, argv);");
-	output_line ("cob_stop_run (%s ());", prog->program_id);
-	output_indent ("}\n");
+	/* MIGRATION (C->Python): the C "int main (argc, argv)" entry becomes a
+	   Python "def main ():" that initialises the runtime and runs the public
+	   program entry.  The actual "if __name__ == \"__main__\":" trigger is
+	   emitted by codegen() AFTER the module data has been flushed, so every
+	   referenced name (functions and storage) already exists at run time.
+	   cob_stop_run terminates the run unit (it is reached only when the
+	   program GOBACKs / falls off the end without an explicit STOP RUN). */
+	output_comment ("Main entry point");
+	output_line ("def main ():");
+	output_block_open ();
+	/* MIGRATION / REVIEW FIX (CRITICAL #1): common.cob_init has the C-style
+	   signature cob_init(argc=0, argv=None).  Emitting "cob_init (sys.argv)"
+	   passed the argv LIST as the argc parameter, corrupting _cob_argc (it
+	   became a list, breaking ACCEPT FROM ARGUMENT-NUMBER / COMMAND-LINE and any
+	   cob_get_environment/argument API).  Pass the count and the vector
+	   explicitly, mirroring the C "main (argc, argv) -> cob_init (argc, argv)". */
+	output_line ("common.cob_init (len (sys.argv), sys.argv)");
+	output_line ("common.cob_stop_run (%s ())", prog->program_id);
+	output_block_close ();
+	output_newline ();
+	gen_main_trigger = 1;
 }
 
 static void
@@ -4595,17 +5664,23 @@ output_header (FILE *fp, const char *locbuff)
 	int	i;
 
 	if (fp) {
-		fprintf (fp, "/* Generated by            cobc %s.%d */\n",
+		/* MIGRATION (C -> Python): the provenance banner is emitted as Python
+		   "#" comment lines carrying identical metadata (cobc version/patch,
+		   source file, generation time, GNU Cobol build/package dates, and the
+		   full compile command).  The C-style comment wrappers are removed; a
+		   leading "#" comment block is valid as the first lines of a Python
+		   module. */
+		fprintf (fp, "# Generated by            cobc %s.%d\n",
 			PACKAGE_VERSION, PATCH_LEVEL);
-		fprintf (fp, "/* Generated from          %s */\n", cb_source_file);
-		fprintf (fp, "/* Generated at            %s */\n", locbuff);
-		fprintf (fp, "/* GNU Cobol build date    %s */\n", cb_oc_build_stamp);
-		fprintf (fp, "/* GNU Cobol package date  %s */\n", COB_TAR_DATE);
-		fprintf (fp, "/* Compile command         ");
+		fprintf (fp, "# Generated from          %s\n", cb_source_file);
+		fprintf (fp, "# Generated at            %s\n", locbuff);
+		fprintf (fp, "# GNU Cobol build date    %s\n", cb_oc_build_stamp);
+		fprintf (fp, "# GNU Cobol package date  %s\n", COB_TAR_DATE);
+		fprintf (fp, "# Compile command         ");
 		for (i = 0; i < cb_saveargc; i++) {
 			fprintf (fp, "%s ", cb_saveargv[i]);
 		}
-		fprintf (fp, "*/\n\n");
+		fprintf (fp, "\n\n");
 	}
 }
 
@@ -4709,11 +5784,11 @@ void
 codegen (struct cb_program *prog, const int nested)
 {
 	int			i;
+	int			n;	/* MIGRATION (C->Python): PICTURE byte-count for output_string */
 	cb_tree			l;
 	struct attr_list	*j;
 	struct literal_list	*m;
 	struct field_list	*k;
-	struct call_list	*clp;
 	struct base_list	*blp;
 	unsigned char		*s;
 	struct cb_program	*cp;
@@ -4725,6 +5800,34 @@ codegen (struct cb_program *prog, const int nested)
 
 	/* Clear local program stuff */
 	current_prog = prog;
+	/* QA-FIX (G1/IC222A..IC237A file-status-48): namespace this program's
+	   NON-global, NON-external file handles so sequential/nested programs that
+	   each declare a file with the same COBOL name do not collide on a single
+	   shared "h_<cname>" module global.  Mirrors C, where every program owns a
+	   distinct function-local "static cob_file *".  GLOBAL files (shared with
+	   contained programs) and EXTERNAL files (shared across programs by their
+	   linkage name) are intentionally left untouched.  The outermost program
+	   (id 0) keeps the original name so single-program emission is unchanged. */
+	if (!nested) {
+		file_namespace_id = 0;
+	}
+	{
+		int		fns_id = file_namespace_id++;
+		cb_tree		fns_l;
+
+		if (fns_id > 0) {
+			for (fns_l = prog->file_list; fns_l; fns_l = CB_CHAIN (fns_l)) {
+				struct cb_file	*fns_f = CB_FILE (CB_VALUE (fns_l));
+
+				if (!fns_f->external && !fns_f->global) {
+					char	*fns_cn = cobc_malloc (strlen (fns_f->cname) + 16);
+
+					sprintf (fns_cn, "%s_%d", fns_f->cname, fns_id);
+					fns_f->cname = fns_cn;
+				}
+			}
+		}
+	}
 	param_id = 0;
 	stack_id = 0;
 	num_cob_fields = 0;
@@ -4758,102 +5861,87 @@ codegen (struct cb_program *prog, const int nested)
 		strftime (locbuff, sizeof(locbuff) - 1, "%b %d %Y %H:%M:%S %Z",
 			localtime (&loctime));
 		output_header (output_target, locbuff);
-		output_header (cb_storage_file, locbuff);
-		for (cp = prog; cp; cp = cp->next_program) {
-			output_header (cp->local_storage_file, locbuff);
-		}
+		/* MIGRATION (C -> Python): the C emitter wrote a provenance header
+		   into the separate storage (".h") and per-program local-storage
+		   (".l.h") files as well.  Under the single-module model there are no
+		   such files -- all storage is appended into THIS module by
+		   output_flush_module_buffers() -- so those header calls are dropped. */
 
-		output_storage ("/* Frame stack declaration */\n");
-		output_storage ("struct cob_frame {\n");
-		output_storage ("\tint\tperform_through;\n");
-#ifndef	__GNUC__
-		output_storage ("\tint\treturn_address;\n");
-#elif	COB_USE_SETJMP
-		output_storage ("\tjmp_buf\treturn_address;\n");
-#else
-		output_storage ("\tvoid\t*return_address;\n");
-#endif
-		output_storage ("};\n\n");
-		output_storage ("/* Union for CALL statement */\n");
-		output_storage ("union cob_call_union {\n");
-		output_storage ("\tvoid *(*funcptr)();\n");
-		output_storage ("\tint  (*funcint)();\n");
-		output_storage ("\tvoid *func_void;\n");
-		output_storage ("};\n");
-		output_storage ("union cob_call_union\tcob_unifunc;\n\n");
+		/* MIGRATION (C -> Python): the C runtime scaffolding emitted here --
+		   the "struct cob_frame" perform-frame stack, the "union
+		   cob_call_union" function-pointer holder, the <stdio.h>/<stdlib.h>/
+		   <string.h>/<math.h> includes, the WORDS_BIGENDIAN/HAVE_BUILTIN_EXPECT
+		   feature macros, and "#include <libcob.h>" -- has no place in Python.
+		   The perform-frame stack is replaced by ordinary Python recursion in
+		   the _dispatch loop; cob_call_union is replaced by a plain Python
+		   callable (_unifunc in output_call); and the C runtime is replaced by
+		   the libcob_py package.  We instead emit the Python module preamble:
+		   the runtime imports, the recursion-limit bump (deep PERFORM nesting
+		   recurses through _dispatch), the control-flow exception classes used
+		   by the dispatch model, and the module-level provenance constants. */
+		output_line ("import sys");
+		/* MIGRATION (C -> Python): bind the libcob_py package name itself in
+		   addition to the ten submodules.  codegen_pymod() rule 15 routes any
+		   symbol it cannot classify through the package facade, emitting
+		   "libcob_py.<name>(...)"; libcob_py/__init__.py re-exports the whole
+		   cob_* surface, so this import makes that fallback reference resolvable
+		   at runtime (without it the bare "libcob_py" name would be undefined). */
+		output_line ("import libcob_py");
+		output_line ("from libcob_py import common, numeric, move, strings, "
+			     "intrinsic, fileio, call, screenio, termio, system");
+		output_newline ();
+		output_line ("# Deep PERFORM nesting recurses through _dispatch; raise");
+		output_line ("# Python's recursion ceiling well above the C frame stack.");
+		output_line ("sys.setrecursionlimit (1000000)");
+		output_newline ();
+		/* Control-flow exception classes (mirror the C computed-goto model):
+		   _CobGoto carries a target label id (GO TO), _CobExit unwinds the
+		   whole program (GOBACK / EXIT PROGRAM / STOP RUN fall-through), and
+		   _CobPerformExit carries a label id for the OSVS multi-level
+		   PERFORM-exit search.  Defined once per module (the preamble runs only
+		   for the outermost, non-nested program). */
+		output_line ("class _CobGoto (Exception):");
+		output_block_open ();
+		output_line ("def __init__ (self, pc):");
+		output_block_open ();
+		output_line ("self.pc = pc");
+		output_block_close ();
+		output_block_close ();
+		output_newline ();
+		output_line ("class _CobExit (Exception):");
+		output_block_open ();
+		output_line ("pass");
+		output_block_close ();
+		output_newline ();
+		output_line ("class _CobPerformExit (Exception):");
+		output_block_open ();
+		output_line ("def __init__ (self, label_id):");
+		output_block_open ();
+		output_line ("self.label_id = label_id");
+		output_block_close ();
+		output_block_close ();
+		output_newline ();
+		output_line ("COB_SOURCE_FILE = \"%s\"", cb_source_file);
+		output_line ("COB_PACKAGE_VERSION = \"%s\"", PACKAGE_VERSION);
+		output_line ("COB_PATCH_LEVEL = %d", PATCH_LEVEL);
+		output_newline ();
 
-		output ("#define  __USE_STRING_INLINES 1\n");
-#ifdef	_XOPEN_SOURCE_EXTENDED
-		output ("#ifndef	_XOPEN_SOURCE_EXTENDED\n");
-		output ("#define  _XOPEN_SOURCE_EXTENDED 1\n");
-		output ("#endif\n");
-#endif
-		output ("#include <stdio.h>\n");
-		output ("#include <stdlib.h>\n");
-		output ("#include <string.h>\n");
-		output ("#include <math.h>\n");
-#if	COB_USE_SETJMP
-		output ("#include <setjmp.h>\n");
-#endif
-#ifdef	WORDS_BIGENDIAN
-		output ("#define WORDS_BIGENDIAN 1\n");
-#endif
-#ifdef	HAVE_BUILTIN_EXPECT
-		output ("#define HAVE_BUILTIN_EXPECT\n");
-#endif
-		if (optimize_flag) {
-			output ("#define COB_LOCAL_INLINE\n");
-		}
-		output ("#include <libcob.h>\n\n");
+		/* MIGRATION (C -> Python): the GMP-based helpers cob_decimal_set_int /
+		   cob_decimal_set_uint and the pointer-arithmetic helper
+		   cob_pointer_manip were emitted as static C functions by the C
+		   backend.  In Python they live in the libcob_py runtime
+		   (numeric.cob_decimal_set_int / ..._uint and common pointer helpers),
+		   so nothing is emitted here; the gen_decset/gen_udecset/gen_ptrmanip
+		   flags are no longer consulted at emission time.
 
-		output ("#define COB_SOURCE_FILE		\"%s\"\n", cb_source_file);
-		output ("#define COB_PACKAGE_VERSION	\"%s\"\n", PACKAGE_VERSION);
-		output ("#define COB_PATCH_LEVEL		%d\n\n", PATCH_LEVEL);
-		output ("/* Global variables */\n");
-		output ("#include \"%s\"\n\n", cb_storage_file_name);
-
+		   Python needs no forward function prototypes (a "def" is visible
+		   module-wide once executed and call targets resolve at call time), so
+		   the C "Function prototypes" block is dropped too.  Its loop, however,
+		   performed an ESSENTIAL side effect -- building each program's
+		   parameter_list by unioning the USING fields of every ENTRY -- which is
+		   preserved below; only the prototype emission is removed. */
 		for (cp = prog; cp; cp = cp->next_program) {
-			if (cp->gen_decset) {
-				output("static void\n");
-				output("cob_decimal_set_int (cob_decimal *d, const int n)\n");
-				output("{\n");
-				output("	mpz_set_si (d->value, n);\n");
-				output("	d->scale = 0;\n");
-				output("}\n\n");
-				break;
-			}
-		}
-		for (cp = prog; cp; cp = cp->next_program) {
-			if (cp->gen_udecset) {
-				output("static void\n");
-				output("cob_decimal_set_uint (cob_decimal *d, const unsigned int n)\n");
-				output("{\n");
-				output("	mpz_set_ui (d->value, n);\n");
-				output("	d->scale = 0;\n");
-				output("}\n\n");
-				break;
-			}
-		}
-		for (cp = prog; cp; cp = cp->next_program) {
-			if (cp->gen_ptrmanip) {
-				output("static void\n");
-				output("cob_pointer_manip (cob_field *f1, cob_field *f2, size_t addsub)\n");
-				output("{\n");
-				output("	unsigned char	*tmptr;\n");
-				output("	memcpy (&tmptr, f1->data, sizeof(void *));\n");
-				output("	if (addsub) {\n");
-				output("		tmptr -= cob_get_int (f2);\n");
-				output("	} else {\n");
-				output("		tmptr += cob_get_int (f2);\n");
-				output("	}\n");
-				output("	memcpy (f1->data, &tmptr, sizeof(void *));\n");
-				output("}\n\n");
-				break;
-			}
-		}
-		output ("/* Function prototypes */\n\n");
-		for (cp = prog; cp; cp = cp->next_program) {
-			/* Build parameter list */
+			/* Build parameter list (side effect retained) */
 			for (l = cp->entry_list; l; l = CB_CHAIN (l)) {
 				for (l1 = CB_VALUE (l); l1; l1 = CB_CHAIN (l1)) {
 					for (l2 = cp->parameter_list; l2; l2 = CB_CHAIN (l2)) {
@@ -4867,27 +5955,12 @@ codegen (struct cb_program *prog, const int nested)
 					}
 				}
 			}
-			if (cp->flag_main) {
-				output ("int %s ();\n", cp->program_id);
-			} else {
-				for (l = cp->entry_list; l; l = CB_CHAIN (l)) {
-					output_entry_function (cp, l, cp->parameter_list, 0);
-				}
-			}
-			output ("static int %s_ (const int", cp->program_id);
-			if (!cp->flag_chained) {
-				for (l = cp->parameter_list; l; l = CB_CHAIN (l)) {
-					output (", unsigned char *");
-				}
-			}
-			output (");\n");
 		}
-		output ("\n");
 	}
 
 	/* Class-names */
 	if (!prog->nested_level && prog->class_name_list) {
-		output ("/* Class names */\n");
+		output ("# Class names\n");
 		for (l = prog->class_name_list; l; l = CB_CHAIN (l)) {
 			output_class_name_definition (CB_CLASS_NAME (CB_VALUE (l)));
 		}
@@ -4900,7 +5973,7 @@ codegen (struct cb_program *prog, const int nested)
 
 	/* Functions */
 	if (!nested) {
-		output ("/* Functions */\n\n");
+		output ("# Functions\n\n");
 	}
 	for (l = prog->entry_list; l; l = CB_CHAIN (l)) {
 		output_entry_function (prog, l, prog->parameter_list, 1);
@@ -4909,7 +5982,7 @@ codegen (struct cb_program *prog, const int nested)
 	output_internal_function (prog, prog->parameter_list);
 
 	if (!prog->next_program) {
-		output ("/* End functions */\n\n");
+		output ("# End functions\n\n");
 	}
 
 	if (gen_native || gen_full_ebcdic ||
@@ -4917,34 +5990,61 @@ codegen (struct cb_program *prog, const int nested)
 		(void)lookup_attr (COB_TYPE_ALPHANUMERIC, 0, 0, 0, NULL, 0);
 	}
 
-	output_target = cb_storage_file;
+	/* MIGRATION (C -> Python): direct the storage-finalization emissions
+	   (fields/constants/collating tables, which use output()) into the
+	   in-memory storage stream rather than a separate ".h" file, so they are
+	   flushed into the single module by output_flush_module_buffers(). */
+	output_storage_open ();
+	output_target = storage_mem;
 
-	/* Program local stuff */
+	/* MIGRATION (C -> Python): emit a module-level "b_<id> = None" backing name
+	   for every BASED founder and every non-parameter LINKAGE founder.  field.c
+	   marks these flag_base=1 at parse time, so output_base() never enters them
+	   into base_cache (no bytearray is emitted for them) and the emitted
+	   references "b_<id>" would otherwise be undefined module names (NameError).
+	   None models the C NULL data pointer = unallocated (BASED) / unbound
+	   (LINKAGE); ALLOCATE rebinds it to a fresh bytearray and SET ADDRESS rebinds
+	   it to the aliased storage (see output_funcall / CB_TAG_ASSIGN).  LINKAGE
+	   PARAMETER items are excluded (their "b_<id>" is the entry-function
+	   argument) and LOCAL-STORAGE BASED items are excluded (emitted per
+	   invocation in the prologue). */
+	{
+		struct cb_field	*bf;
+		int		first_based = 0;
+		struct cb_field	*lists[2];
+		int		li;
 
-	/* CALL cache */
-	if (call_cache) {
-		output_local ("\n/* Call pointers */\n");
-		for (clp = call_cache; clp; clp = clp->next) {
-			output_local ("static union cob_call_union\tcall_%s = { NULL };\n", clp->callname);
+		lists[0] = prog->working_storage;
+		lists[1] = prog->linkage_storage;
+		for (li = 0; li < 2; li++) {
+			for (bf = lists[li]; bf; bf = bf->sister) {
+				if (cb_field_founder (bf) == bf
+				    && is_rebindable_base (prog, bf)) {
+					if (!first_based) {
+						first_based = 1;
+						output ("\n# BASED / LINKAGE backing pointers\n");
+					}
+					output ("%s%d = None", CB_PREFIX_BASE, bf->id);
+					output ("\t# %s\n", bf->name);
+				}
+			}
 		}
-		output_local ("\n");
 	}
 
-	/* Local indexes */
-	for (i = 0; i < COB_MAX_SUBSCRIPTS; i++) {
-		if (i_counters[i]) {
-			output_local ("int\t\ti%d;\n", i);
-		}
-	}
-
-	/* Local implicit fields */
-	if (num_cob_fields) {
-		output_local ("\n/* Local cob_field items */\n");
-		for (i = 0; i < num_cob_fields; i++) {
-			output_local ("cob_field\tf%d;\n", i);
-		}
-		output_local ("\n");
-	}
+	/* MIGRATION (C->Python): Program-local declaration block neutralized.
+	   The C backend emitted per-program local C declarations into local_mem:
+	     - CALL cache: one "union cob_call_union call_<name>" static per CALL
+	       target (memoized resolved function pointer). The Python backend
+	       resolves CALL targets through a per-call-site local "_unifunc"
+	       (see output_call), so no module-level cache declaration is emitted.
+	     - Local indexes: "int iN;" subscript temporaries. In Python each
+	       subscript loop is a "for iN in range(...):" which self-declares iN.
+	     - Local implicit fields: "cob_field fN;" temporaries. In Python each
+	       such reference is materialized inline as common.cob_field(...), so
+	       no forward declaration is required.
+	   The i_counters[]/num_cob_fields/call_cache bookkeeping is still computed
+	   during emission (it is harmless and feeds dedup/diagnostics); only the
+	   emission of the now-unused declarations is suppressed. */
 
 	/* Skip to next nested program */
 
@@ -4956,88 +6056,100 @@ codegen (struct cb_program *prog, const int nested)
 	/* Finalize the storage file */
 
 	if (base_cache) {
-		output_storage ("\n/* Data storage */\n");
+		/* MIGRATION (C->Python): each WORKING-STORAGE base becomes a mutable
+		   bytearray of exactly memory_size bytes (the C "aligned" attribute is
+		   irrelevant in Python).  output_data() slices memoryview(b_N) so the
+		   emitted code shares this backing store byte-for-byte. */
+		output_storage ("\n# Data storage\n");
 		base_cache = list_cache_sort (base_cache, &base_cache_cmp);
 		prevprog = NULL;
 		for (blp = base_cache; blp; blp = blp->next) {
 			if (blp->curr_prog != prevprog) {
 				prevprog = blp->curr_prog;
-				output_storage ("\n/* PROGRAM-ID : %s */\n", prevprog);
+				output_storage ("\n# PROGRAM-ID : %s\n", prevprog);
 			}
-			output_storage ("static unsigned char %s%d[%d]%s;",
+			output_storage ("%s%d = bytearray (%d)",
 					CB_PREFIX_BASE, blp->f->id,
-					blp->f->memory_size, COB_ALIGN);
-			output_storage ("\t/* %s */\n", blp->f->name);
+					blp->f->memory_size);
+			output_storage ("\t# %s\n", blp->f->name);
 		}
-		output_storage ("\n/* End of data storage */\n\n");
+		output_storage ("\n# End of data storage\n\n");
 	}
 
 	/* Attributes */
 	if (attr_cache) {
-		output_storage ("\n/* Attributes */\n\n");
+		/* MIGRATION (C->Python): a cob_field_attr aggregate becomes a
+		   common.cob_field_attr(type, digits, scale, flags, pic) constructor.
+		   The PICTURE string (5-byte groups: symbol + 4 binary count bytes) is
+		   emitted as a byte-exact Python bytes literal via output_string. */
+		output_storage ("\n# Attributes\n\n");
 		attr_cache = attr_list_reverse (attr_cache);
 		for (j = attr_cache; j; j = j->next) {
-			output_storage ("static const cob_field_attr %s%d = ",
+			output_storage ("%s%d = common.cob_field_attr (",
 					CB_PREFIX_ATTR, j->id);
-			output_storage ("{%d, %d, %d, %d, ",
+			output_storage ("%d, %d, %d, %d, ",
 					j->type, j->digits,
 					j->scale, j->flags);
 			if (j->pic) {
-				output_storage ("\"");
+				n = 0;
 				for (s = j->pic; *s; s += 5) {
-					output_storage ("%c\\%03o\\%03o\\%03o\\%03o",
-						s[0], s[1], s[2], s[3], s[4]);
+					n += 5;
 				}
-				output_storage ("\"");
+				output_string (j->pic, n);
 			} else {
-				output_storage ("NULL");
+				output_storage ("None");
 			}
-			output_storage ("};\n");
+			output_storage (")\n");
 		}
 	}
 
 	if (field_cache) {
-		output_storage ("\n/* Fields */\n");
+		output_storage ("\n# Fields\n");
 		field_cache = list_cache_sort (field_cache, &field_cache_cmp);
 		prevprog = NULL;
 		for (k = field_cache; k; k = k->next) {
 			if (k->curr_prog != prevprog) {
 				prevprog = k->curr_prog;
-				output_storage ("\n/* PROGRAM-ID : %s */\n",
+				output_storage ("\n# PROGRAM-ID : %s\n",
 						prevprog);
 			}
-			output ("static cob_field %s%d\t= ", CB_PREFIX_FIELD,
-						k->f->id);
+			/* MIGRATION (C->Python): "static cob_field f_N = {...}" becomes a
+			   module-level "f_N = common.cob_field(size, data, attr)".  LOCAL /
+			   EXTERNAL fields are bound with a None data slot (re-pointed at run
+			   time by the function prologue). */
+			output ("%s%d = ", CB_PREFIX_FIELD, k->f->id);
 			if (!k->f->flag_local && !k->f->flag_item_external) {
 				output_field (k->x);
 			} else {
-				output ("{");
+				output ("common.cob_field (");
 				output_size (k->x);
-				output (", NULL, ");
+				output (", None, ");
 				output_attr (k->x);
-				output ("}");
+				output (")");
 			}
-			output (";\t/* %s */\n", k->f->name);
+			output ("\t# %s\n", k->f->name);
 		}
-		output_storage ("\n/* End of fields */\n\n");
+		output_storage ("\n# End of fields\n\n");
 	}
 
 	/* Literals, constants */
 	if (literal_cache) {
-		output_storage ("\n/* Constants */\n");
+		output_storage ("\n# Constants\n");
 		literal_cache = literal_list_reverse (literal_cache);
 		for (m = literal_cache; m; m = m->next) {
-			output ("static cob_field %s%d\t= ", CB_PREFIX_CONST, m->id);
+			/* MIGRATION (C->Python): literal/constant cob_field aggregate ->
+			   common.cob_field(...) constructor. */
+			output ("%s%d = ", CB_PREFIX_CONST, m->id);
 			output_field (m->x);
-			output (";\n");
+			output ("\n");
 		}
 		output ("\n");
 	}
 
 	/* Collating tables */
 	if (gen_ebcdic) {
-		output_storage ("\n/* ASCII to EBCDIC translate table (restricted) */\n");
-		output ("static const unsigned char\tcob_a2e[256] = {\n");
+		output_storage ("\n# ASCII to EBCDIC translate table (restricted)\n");
+		output ("cob_a2e = bytes((\n");
 		if (alt_ebcdic) {
 			output ("\t0x00, 0x01, 0x02, 0x03, 0x37, 0x2D, 0x2E, 0x2F,\n");
 			output ("\t0x16, 0x05, 0x25, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,\n");
@@ -5106,12 +6218,12 @@ codegen (struct cb_program *prog, const int nested)
 			output ("\t0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7,\n");
 			output ("\t0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF\n");
 		}
-		output ("};\n");
+		output ("))\n");
 		output_storage ("\n");
 	}
 	if (gen_full_ebcdic) {
-		output_storage ("\n/* ASCII to EBCDIC table */\n");
-		output ("static const unsigned char\tcob_ebcdic[256] = {\n");
+		output_storage ("\n# ASCII to EBCDIC table\n");
+		output ("cob_ebcdic = bytes((\n");
 		output ("\t0x00, 0x01, 0x02, 0x03, 0x37, 0x2D, 0x2E, 0x2F,\n");
 		output ("\t0x16, 0x05, 0x25, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,\n");
 		output ("\t0x10, 0x11, 0x12, 0x13, 0x3C, 0x3D, 0x32, 0x26,\n");
@@ -5144,16 +6256,16 @@ codegen (struct cb_program *prog, const int nested)
 		output ("\t0xCA, 0x3A, 0xFE, 0x3B, 0x04, 0xCF, 0xDA, 0x14,\n");
 		output ("\t0xE1, 0x8F, 0x46, 0x75, 0xFD, 0xEB, 0xEE, 0xED,\n");
 		output ("\t0x90, 0xEF, 0xB3, 0xFB, 0xB9, 0xEA, 0xBB, 0xFF\n");
-		output ("};\n");
+		output ("))\n");
 		i = lookup_attr (COB_TYPE_ALPHANUMERIC, 0, 0, 0, NULL, 0);
 		output
-		    ("static cob_field f_ebcdic = { 256, (unsigned char *)cob_ebcdic, &%s%d };\n",
+		    ("f_ebcdic = common.cob_field (256, cob_ebcdic, %s%d)\n",
 		     CB_PREFIX_ATTR, i);
 		output_storage ("\n");
 	}
 	if (gen_ebcdic_ascii) {
-		output_storage ("\n/* EBCDIC to ASCII table */\n");
-		output ("static const unsigned char\tcob_ebcdic_ascii[256] = {\n");
+		output_storage ("\n# EBCDIC to ASCII table\n");
+		output ("cob_ebcdic_ascii = bytes((\n");
 		output ("\t0x00, 0x01, 0x02, 0x03, 0xEC, 0x09, 0xCA, 0x7F,\n");
 		output ("\t0xE2, 0xD2, 0xD3, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,\n");
 		output ("\t0x10, 0x11, 0x12, 0x13, 0xEF, 0xC5, 0x08, 0xCB,\n");
@@ -5186,16 +6298,16 @@ codegen (struct cb_program *prog, const int nested)
 		output ("\t0x59, 0x5A, 0xFD, 0xF5, 0x99, 0xF7, 0xF6, 0xF9,\n");
 		output ("\t0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,\n");
 		output ("\t0x38, 0x39, 0xDB, 0xFB, 0x9A, 0xF4, 0xEA, 0xFF\n");
-		output ("};\n");
+		output ("))\n");
 		i = lookup_attr (COB_TYPE_ALPHANUMERIC, 0, 0, 0, NULL, 0);
 		output
-		    ("static cob_field f_ebcdic_ascii = { 256, (unsigned char *)cob_ebcdic_ascii, &%s%d };\n",
+		    ("f_ebcdic_ascii = common.cob_field (256, cob_ebcdic_ascii, %s%d)\n",
 		     CB_PREFIX_ATTR, i);
 		output_storage ("\n");
 	}
 	if (gen_native) {
-		output_storage ("\n/* NATIVE table */\n");
-		output ("static const unsigned char\tcob_native[256] = {\n");
+		output_storage ("\n# NATIVE table\n");
+		output ("cob_native = bytes((\n");
 		output ("\t0, 1, 2, 3, 4, 5, 6, 7,\n");
 		output ("\t8, 9, 10, 11, 12, 13, 14, 15,\n");
 		output ("\t16, 17, 18, 19, 20, 21, 22, 23,\n");
@@ -5228,11 +6340,29 @@ codegen (struct cb_program *prog, const int nested)
 		output ("\t232, 233, 234, 235, 236, 237, 238, 239,\n");
 		output ("\t240, 241, 242, 243, 244, 245, 246, 247,\n");
 		output ("\t248, 249, 250, 251, 252, 253, 254, 255\n");
-		output ("};\n");
+		output ("))\n");
 		i = lookup_attr (COB_TYPE_ALPHANUMERIC, 0, 0, 0, NULL, 0);
 		output
-		    ("static cob_field f_native = { 256, (unsigned char *)cob_native, &%s%d };\n",
+		    ("f_native = common.cob_field (256, cob_native, %s%d)\n",
 		     CB_PREFIX_ATTR, i);
 		output_storage ("\n");
+	}
+
+	/* MIGRATION (C -> Python): collapse the three former streams into one.
+	   All storage and local declarations accumulated above are now flushed
+	   into the single module stream (yyout) so the emitted ".py" is fully
+	   self-contained with no external storage/local include dependency.  This
+	   runs once, at the outermost finalization (prog->next_program == NULL). */
+	output_flush_module_buffers ();
+
+	/* MIGRATION (C->Python): emit the module entry trigger AFTER the data has
+	   been flushed, so every name (functions + storage) the main() body
+	   references already exists when the module is run as a script. */
+	if (gen_main_trigger) {
+		output_target = yyout;
+		output_line ("if __name__ == \"__main__\":");
+		output_block_open ();
+		output_line ("main ()");
+		output_block_close ();
 	}
 }

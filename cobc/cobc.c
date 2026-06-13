@@ -41,6 +41,24 @@
 #include <signal.h>
 #endif
 
+/* MIGRATION (C->Python) / SECURITY (CWE-78): headers for the argv-vector
+   process runner (cobc_spawn_argv) that replaces the former system()/shell
+   string executor.  On POSIX the Python backend interpreter is launched with
+   fork()+execvp()+waitpid() (declared in <unistd.h>/<sys/wait.h>), and the
+   child's stdout/stderr are silenced by redirecting file descriptors with
+   open()+dup2() (<fcntl.h>) -- never by a shell ">" redirection.  On Windows
+   the equivalent argv-vector launcher is _spawnvp (<process.h>), which also
+   bypasses the command interpreter.  None of these paths invoke /bin/sh or
+   cmd.exe, so shell metacharacters in COB_PYTHON or any file path are inert. */
+#ifdef _WIN32
+#include <process.h>		/* _spawnvp / _P_WAIT (argv-vector, no shell) */
+#else
+#include <sys/wait.h>		/* waitpid / WIFEXITED / WEXITSTATUS */
+#endif
+#ifdef	HAVE_FCNTL_H
+#include <fcntl.h>		/* open() for child stdout/stderr redirection */
+#endif
+
 #ifdef _WIN32
 #include <windows.h>		/* for GetTempPath, GetTempFileName */
 #endif
@@ -63,6 +81,16 @@
 
 #include "cobc.h"
 #include "tree.h"
+
+/* MIGRATION (C->Python): Null device used to silence the Python interpreter
+   probe issued by cobc_check_python().  The native C backend assumed a working
+   C compiler and never probed it; the Python backend validates the configured
+   COB_PYTHON interpreter at start-up and discards the probe's output. */
+#ifdef _WIN32
+#define COB_NULL_DEVICE		"NUL"
+#else
+#define COB_NULL_DEVICE		"/dev/null"
+#endif
 
 /* Compile level */
 enum cb_compile_level {
@@ -291,11 +319,10 @@ static const char fcopts[] = " -Q -qro -qroconst ";
 static const char fcopts[] = " ";
 #endif
 
-#if defined (__GNUC__) && (__GNUC__ >= 3)
-static const char	gccpipe[] = "-pipe";
-#else
-static const char	gccpipe[] = "\0";
-#endif
+/* MIGRATION (C->Python): The "gccpipe" helper held the gcc "-pipe" flag that
+   was spliced into every C-compiler command line.  CPython is invoked directly
+   (py_compile / zipapp) and takes no such flag, so the variable is removed to
+   keep the translation unit free of dead, C-toolchain-only state. */
 
 #ifdef	HAVE_SIGNAL_H
 typedef void (*cob_sighandler_t) (int);
@@ -349,8 +376,25 @@ static const struct option long_options[] = {
 	{NULL, 0, NULL, 0}
 };
 
-static const char	*cob_cc;				/* gcc */
-static char		cob_cflags[COB_SMALL_BUFF];		/* -I... */
+/* MIGRATION (C->Python): "cob_cc" (the native C backend compiler) becomes
+   "cob_python" - the path to the Python 3.11+ interpreter that compiles and
+   packages the emitted ".py" modules via py_compile / zipapp.  It is resolved
+   from $COB_PYTHON or, failing that, the COB_PYTHON macro emitted into
+   defaults.h by the top-level Makefile.am (lockstep change). */
+static const char	*cob_python;				/* python3 (>=3.11) */
+/* MIGRATION (C->Python) / REVIEW FIX (CRITICAL #2): the directory holding the
+   "libcob_py" runtime package.  Generated modules do "import libcob_py", so the
+   package must be bundled into every -m/-x ".pyz" for the archive to run off the
+   source tree / installed runtime.  Resolved from $COB_LIBPY_DIR or, failing
+   that, the COB_LIBPY_DIR macro emitted into defaults.h by the top-level
+   Makefile.am (= $(pkgdatadir)/libcob_py) - a lockstep change. */
+static const char	*cob_libpy_dir;				/* libcob_py runtime package dir */
+/* MIGRATION (C->Python): "cob_cflags" no longer carries C-compiler flags - the
+   COB_CFLAGS macro is removed from defaults.h.  The buffer is retained (declared
+   and initialised empty) ONLY so the still-immutable -O/-A/-g/-fomit-frame
+   option handlers that strcat() into it keep compiling and running harmlessly;
+   it is inert for the Python backend and is never passed to CPython. */
+static char		cob_cflags[COB_SMALL_BUFF];		/* inert: kept for immutable option handlers */
 static char		cob_libs[COB_MEDIUM_BUFF];		/* -L... -lcob */
 static char		cob_define_flags[COB_SMALL_BUFF];	/* -D... */
 static char		cob_ldflags[COB_SMALL_BUFF];
@@ -627,8 +671,11 @@ cobc_print_info (void)
 	cobc_var_print ("LDFLAGS",		COB_BLD_LDFLAGS);
 	putchar ('\n');
 	puts (_("GNU Cobol information"));
-	cobc_var_print ("COB_CC",		COB_CC);
-	cobc_var_print ("COB_CFLAGS",		COB_CFLAGS);
+	/* MIGRATION (C->Python): Report the Python 3.11+ backend interpreter
+	   (the resolved cob_python) in place of the former C compiler (COB_CC).
+	   The COB_CFLAGS line is removed - that macro no longer exists in the
+	   regenerated defaults.h and CPython takes no C-compiler flags. */
+	cobc_var_print ("COB_PYTHON",		cob_python);
 	cobc_var_print ("COB_LDFLAGS",		COB_LDFLAGS);
 	cobc_var_print ("COB_LIBS",		COB_LIBS);
 	cobc_var_print ("COB_CONFIG_DIR",	COB_CONFIG_DIR);
@@ -637,11 +684,14 @@ cobc_print_info (void)
 	cobc_var_print ("COB_MODULE_EXT",	COB_MODULE_EXT);
 	cobc_var_print ("COB_EXEEXT",		COB_EXEEXT);
 
-#if	defined(USE_LIBDL) || defined(_WIN32)
-	cobc_var_print (_("Dynamic loading"),	_("System"));
-#else
-	cobc_var_print (_("Dynamic loading"),	_("Libtool"));
-#endif
+	/* MIGRATION (C->Python): The runtime no longer resolves modules through
+	   the native dynamic linker (USE_LIBDL/dlopen) or libltdl ("Libtool").
+	   libcob_py.call loads COBOL programs with importlib + sys.path, so the
+	   build-info summary now reports the Python loader unconditionally. The
+	   former USE_LIBDL/_WIN32 conditional and its stale "System"/"Libtool"
+	   strings are removed because neither backend is used by the Python
+	   runtime. (QA Issue 3: "--info still reports Dynamic loading: Libtool".) */
+	cobc_var_print (_("Dynamic loading"),	_("Python (importlib)"));
 
 #ifdef	COB_PARAM_CHECK
 	cobc_var_print ("\"CBL_\" param check",	_("Enabled"));
@@ -1342,9 +1392,13 @@ process_filename (const char *filename)
 	} else if (save_csrc || save_temps ||
 		   cb_compile_level == CB_LEVEL_TRANSLATE) {
 		fn->translate = cobc_malloc (strlen (basename) + 5);
-		sprintf (fn->translate, "%s.c", basename);
+		/* MIGRATION (C->Python): the translate artifact is now a Python
+		   module ".py" (not C ".c") - codegen.c emits one self-contained
+		   ".py" per compilation unit targeting libcob_py. */
+		sprintf (fn->translate, "%s.py", basename);
 	} else {
-		fn->translate = cobc_temp_name (".c");
+		/* MIGRATION (C->Python): temp intermediate is ".py" (was ".c"). */
+		fn->translate = cobc_temp_name (".py");
 	}
 
 	/* Set storage filename */
@@ -1380,46 +1434,91 @@ process_filename (const char *filename)
 	return fn;
 }
 
-static int
-process (const char *cmd)
-{
-	char	*p;
-	char	*buffptr;
-	size_t	clen;
-	int	ret;
-	char	buff[COB_MEDIUM_BUFF];
+/* MIGRATION (C->Python) / SECURITY (CWE-78): argv-vector process runner that
+   replaces the former process()/system() shell-string executor.  The original
+   process() concatenated the C-compiler command line into a single string,
+   back-slash-quoted only '$', and handed the result to system(), i.e. to
+   "/bin/sh -c <string>".  That made every other shell metacharacter (; | & `
+   > < * ? () newline ...) live, so a COB_PYTHON value or a source/output/module
+   path containing such a character could inject arbitrary shell commands.
 
-	if (strchr (cmd, '$') == NULL) {
-		if (verbose_output) {
-			fprintf (stderr, "%s\n", (char *)cmd);
+   The Python backend instead passes a NULL-terminated argv vector straight to
+   execvp() (POSIX) / _spawnvp() (Windows): the kernel launches the interpreter
+   directly with those exact argument strings and NO command interpreter is
+   involved, so shell metacharacters are inert.  Output is suppressed - when the
+   caller sets "silence" (the version probe) - by redirecting the child's
+   stdout/stderr onto an open() file descriptor for the null device via dup2(),
+   not by a shell ">" redirection.  The return value is the child's exit code
+   (0 == success), preserving the "!= 0" failure checks at every call site; a
+   fork/exec/wait failure maps to a non-zero status. */
+static int
+cobc_spawn_argv (char *const argv[], const int silence)
+{
+#ifdef _WIN32
+	/* Windows: _spawnvp passes argv directly to the program image (it does not
+	   route through cmd.exe), so the command-injection surface is removed here
+	   too.  Silencing the version probe is best-effort on this platform, which
+	   is acceptable: per AAP 0.2.2 Windows-specific behaviour beyond removing
+	   the C-compiler requirement is out of scope. */
+	intptr_t	rc;
+
+	if (verbose_output) {
+		char *const	*a;
+		for (a = argv; *a != NULL; a++) {
+			fprintf (stderr, "%s%s", (a == argv) ? "" : " ", *a);
 		}
-		return system (cmd);
+		fputc ('\n', stderr);
 	}
-    	clen = strlen (cmd) + 32;
-    	if (clen > COB_MEDIUM_BUFF) {
-    		buffptr = cobc_malloc (clen);
-    	} else {
-    		buffptr = buff;
-    	}
-    	p = buffptr;
-    	/* quote '$' */
-	for (; *cmd; cmd++) {
-    		if (*cmd == '$') {
-    			p += sprintf (p, "\\$");
-    		} else {
-    			*p++ = *cmd;
-    		}
-    	}
-    	*p = 0;
-    
-    	if (verbose_output) {
-    		fprintf (stderr, "%s\n", buffptr);
-    	}
-	   ret = system (buffptr);
-   	if (buffptr != buff) {
-   		free (buffptr);
-   	}
-	return ret;
+	(void)silence;
+	rc = _spawnvp (_P_WAIT, argv[0], (const char * const *)argv);
+	return (rc == 0) ? 0 : 1;
+#else
+	pid_t	pid;
+	int	status;
+	int	devnull;
+
+	if (verbose_output) {
+		/* Informational echo only - this string is NEVER re-parsed for
+		   execution, so it cannot reintroduce the injection vector. */
+		char *const	*a;
+		for (a = argv; *a != NULL; a++) {
+			fprintf (stderr, "%s%s", (a == argv) ? "" : " ", *a);
+		}
+		fputc ('\n', stderr);
+	}
+
+	pid = fork ();
+	if (pid < 0) {
+		return 1;
+	}
+	if (pid == 0) {
+		/* Child: optionally silence stdout/stderr via fd redirection, then
+		   exec the interpreter directly (no shell). */
+		if (silence) {
+			devnull = open (COB_NULL_DEVICE, O_WRONLY);
+			if (devnull >= 0) {
+				dup2 (devnull, STDOUT_FILENO);
+				dup2 (devnull, STDERR_FILENO);
+				if (devnull > STDERR_FILENO) {
+					close (devnull);
+				}
+			}
+		}
+		execvp (argv[0], argv);
+		/* Reached only if exec failed (e.g. interpreter not found). */
+		_exit (127);
+	}
+	/* Parent: reap the child, retrying across signal interruptions. */
+	while (waitpid (pid, &status, 0) < 0) {
+		if (errno != EINTR) {
+			return 1;
+		}
+	}
+	if (WIFEXITED (status)) {
+		return WEXITSTATUS (status);
+	}
+	return 1;
+#endif
 }
 
 /* Preprocess source */
@@ -1678,12 +1777,308 @@ process_translate (struct filename *fn)
 	return 0;
 }
 
+/* MIGRATION (C->Python): Validate the configured Python 3.11+ backend
+   interpreter before any compilation is dispatched.  The native backend
+   implicitly relied on a working C compiler; here we probe cob_python and
+   require sys.version_info >= (3, 11).  Any failure - missing interpreter,
+   exec error, or a version below 3.11 - is fatal: emit the mandated
+   diagnostic and exit(1) performing no compilation (AAP 0.7.2).
+   SECURITY (CWE-78): the probe is dispatched through cobc_spawn_argv with a
+   fixed argv vector { cob_python, "-c", <probe>, NULL } - cob_python is one
+   argument and is never concatenated into a shell command, so a metacharacter
+   in its path cannot inject a command.  The probe's stdout/stderr are silenced
+   by file-descriptor redirection (silence=1), replacing the former
+   "> COB_NULL_DEVICE 2>&1" shell redirection. */
+static void
+cobc_check_python (void)
+{
+	static char	probe[] =
+		"import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)";
+	char		*argv[4];
+
+	argv[0] = (char *)cob_python;
+	argv[1] = (char *)"-c";
+	argv[2] = probe;
+	argv[3] = NULL;
+	if (cobc_spawn_argv (argv, 1) != 0) {
+		fprintf (stderr,
+			 "cobc: Python 3.11+ interpreter not found at %s. Set COB_PYTHON.\n",
+			 cob_python);
+		exit (1);
+	}
+}
+
+/* MIGRATION (C->Python): Python module / executable packager.
+   The native backend produced ".so" modules and native executables by invoking
+   cob_cc with linker state (cob_ldflags, cob_libs, COB_SHARED_OPT, COB_PIC_FLAGS,
+   COB_EXPORT_DYN) - none of which applies to Python.  Instead we bundle the
+   emitted ".py" module(s) into a self-contained ".pyz" zip archive using the
+   standard-library "zipapp" module, run through cob_python.  Each module is
+   staged under its base name (so it remains importable, e.g. for COBOL CALL)
+   and the primary/entry module is additionally staged as "__main__.py" so the
+   archive runs via "python <archive>" - matching how bin/cobcrun.c launches
+   "python <module>" (AAP 0.4.1).  REVIEW FIX (CRITICAL #2): the libcob_py runtime
+   package (resolved into cob_libpy_dir) is also bundled into the archive so the
+   emitted modules' "import libcob_py" resolves from inside the ".pyz" - the
+   artifact is then self-contained and runs with no source-tree PYTHONPATH.
+   When "as_exec" is set a shebang for cob_python
+   is embedded and the executable bit set, yielding a directly runnable artifact
+   for the "-x" mode.  The staging is performed by one argv-driven "python -c"
+   command (no nested double quotes); SECURITY (CWE-78): it is dispatched
+   through the cobc_spawn_argv argv-vector runner - the output archive name and
+   every module path are individual argv elements passed verbatim to execvp(),
+   so no shell parses them and metacharacters in any path are inert.  The
+   child's exit status is returned. */
+static int
+cobc_build_pyz (struct filename *primary, struct filename *modlist,
+		const char *outname, const int as_exec)
+{
+	struct filename	*f;
+	char		**argv;
+	int		argc;
+	int		nargs;
+	int		ret;
+
+	/* Fixed staging script.  Python's sys.argv becomes
+	   [ "-c"-script, outname, "0"/"1", libpy_dir, mod1, mod2, ... ]: copy each
+	   module by basename, the first additionally as __main__.py, bundle the
+	   libcob_py runtime package, then write the archive (optionally with an
+	   interpreter shebang).
+	   REVIEW FIX (CRITICAL #2): the emitted modules do "import libcob_py", so the
+	   runtime package is copytree'd into the staging dir as "libcob_py/" before
+	   the archive is built - zipimport then resolves it from inside the ".pyz",
+	   making the archive self-contained off the source tree.  Non-runtime files
+	   are excluded from the bundle (runtime source modules only): the __pycache__
+	   directory, compiled .pyc and .pyo files, the pyproject.toml manifest, and -
+	   when COB_LIBPY_DIR points at the in-tree source rather than the installed
+	   pkgdatadir copy - the autotools Makefile / Makefile.am / Makefile.in.
+
+	   QA FIX (CRITICAL Issue 2 - "generated .pyz is not self-contained"): the
+	   runtime directory is now resolved in three steps so the archive ALWAYS
+	   bundles libcob_py:
+	     1. use the directory cobc passed in argv[3] (= $COB_LIBPY_DIR or the
+	        COB_LIBPY_DIR macro = installed $(pkgdatadir)/libcob_py) when present;
+	     2. otherwise (e.g. compiling against an in-tree / PYTHONPATH-importable
+	        runtime before "make install"), locate libcob_py via importlib so it
+	        is still bundled from wherever it is importable;
+	     3. if it still cannot be found, FAIL HARD (write an error and exit 1)
+	        rather than the former warning-and-continue, because a self-contained
+	        -m/-x artifact is an AAP requirement - a non-self-contained archive
+	        would only fail later with ModuleNotFoundError at run time.
+	   The script is newline-delimited (real "\n" bytes in argv[2]); it is passed
+	   as a single execvp() argument by cobc_spawn_argv, so no shell parses it. */
+	static char	pyz_stage[] =
+		"import os, sys, shutil, tempfile, zipapp, importlib.util\n"
+		"outname = sys.argv[1]\n"
+		"as_exec = sys.argv[2] == '1'\n"
+		"libpy_dir = sys.argv[3]\n"
+		"modules = sys.argv[4:]\n"
+		"# (1)/(2) Resolve the libcob_py runtime directory to bundle.\n"
+		"if not os.path.isdir(libpy_dir):\n"
+		"    try:\n"
+		"        spec = importlib.util.find_spec('libcob_py')\n"
+		"    except Exception:\n"
+		"        spec = None\n"
+		"    if spec is not None and spec.origin:\n"
+		"        libpy_dir = os.path.dirname(spec.origin)\n"
+		"    elif spec is not None and spec.submodule_search_locations:\n"
+		"        libpy_dir = list(spec.submodule_search_locations)[0]\n"
+		"# (3) Hard error: a self-contained .pyz is required for -m/-x.\n"
+		"if not os.path.isdir(libpy_dir):\n"
+		"    sys.stderr.write(\"cobc: error: libcob_py runtime package not found \"\n"
+		"                     \"(looked in \" + repr(sys.argv[3]) + \" and via \"\n"
+		"                     \"importlib); cannot build a self-contained .pyz. \"\n"
+		"                     \"Set COB_LIBPY_DIR to the libcob_py directory or \"\n"
+		"                     \"install the runtime with 'make install'.\\n\")\n"
+		"    sys.exit(1)\n"
+		"stage = tempfile.mkdtemp()\n"
+		"# QA FIX (Issue G1 - inter-program CALL): the importable module name\n"
+		"# inside the archive must be the COBOL PROGRAM-ID (= the output base\n"
+		"# name) so a subprogram compiled with 'cobc -m' can be loaded by a CALL\n"
+		"# via importlib - libcob_py.call adds the .pyz to sys.path and imports\n"
+		"# <PROGRAM-ID>.  This mirrors the C resolver finding a <name>.so and\n"
+		"# dlsym-ing the PROGRAM-ID entry.  The temp-named copy is kept too (it is\n"
+		"# harmless and preserves any multi-module bundle's basenames), and the\n"
+		"# entry module is ALSO staged as __main__.py so 'cobc -x'/cobcrun still\n"
+		"# execute the archive directly.\n"
+		"modbase = os.path.splitext(os.path.basename(outname))[0]\n"
+		"# QA FIX (Dynamic call with static linking - 'cobc -c' then link):\n"
+		"# a module input is either an emitted SOURCE '.py' (the -x/-m direct\n"
+		"# path) or a BYTE-COMPILED object carried under cobc's '.o' name (the\n"
+		"# '-c' compile-then-link path, e.g. 'cobc -x -o prog caller.o callee.o').\n"
+		"# Stage each so it is importable inside the archive under its PROGRAM-ID\n"
+		"# base name: a source module as '<base>.py', a compiled object as the\n"
+		"# zipimport-loadable '<base>.pyc'.  Copying a '.pyc' under a '.py' name\n"
+		"# would make Python try to compile its NUL bytes as source and fail with\n"
+		"# 'source code string cannot contain null bytes', so the extension MUST\n"
+		"# track the actual file kind.\n"
+		"def _is_src(p):\n"
+		"    return os.path.splitext(p)[1] == '.py'\n"
+		"for s in modules:\n"
+		"    base = os.path.splitext(os.path.basename(s))[0]\n"
+		"    shutil.copy(s, os.path.join(stage,\n"
+		"                base + ('.py' if _is_src(s) else '.pyc')))\n"
+		"prim = modules[0]\n"
+		"prim_base = os.path.splitext(os.path.basename(prim))[0]\n"
+		"if _is_src(prim):\n"
+		"    # SOURCE primary: also stage under the output base name and reuse it\n"
+		"    # verbatim as __main__.py - the emitted 'if __name__ == \"__main__\":\n"
+		"    # main()' trigger fires when the archive runs (unchanged -x/-m path).\n"
+		"    shutil.copy(prim, os.path.join(stage, modbase + '.py'))\n"
+		"    shutil.copy(prim, os.path.join(stage, '__main__.py'))\n"
+		"else:\n"
+		"    # COMPILED primary: stage under the output base name as '.pyc'.\n"
+		"    # zipapp requires a SOURCE __main__.py entry point (it rejects a\n"
+		"    # __main__.pyc), so emit a tiny launcher that imports the primary by\n"
+		"    # its PROGRAM-ID base name and invokes main() - the same entry the\n"
+		"    # source __main__ trigger would have run.\n"
+		"    shutil.copy(prim, os.path.join(stage, modbase + '.pyc'))\n"
+		"    with open(os.path.join(stage, '__main__.py'), 'w') as _fh:\n"
+		"        _fh.write('import %s\\n%s.main()\\n' % (prim_base, prim_base))\n"
+		"shutil.copytree(libpy_dir, os.path.join(stage, 'libcob_py'),\n"
+		"                ignore=shutil.ignore_patterns('__pycache__', '*.pyc',\n"
+		"                '*.pyo', 'pyproject.toml', 'Makefile', 'Makefile.am',\n"
+		"                'Makefile.in'))\n"
+		"zipapp.create_archive(stage, outname,\n"
+		"                      interpreter=(sys.executable if as_exec else None))\n"
+		"shutil.rmtree(stage)\n";
+
+	/* MIGRATION (C->Python) / SECURITY (CWE-78): build a NULL-terminated argv
+	   vector rather than a shell command string.  Count the slots first:
+	   cob_python, "-c", script, outname, flag, libpy_dir, primary,
+	   [extra modules], NULL.  REVIEW FIX (CRITICAL #2): one extra fixed slot
+	   (libpy_dir) was added, so the base count is 7 rather than 6. */
+	nargs = 7;
+	if (modlist) {
+		for (f = modlist; f; f = f->next) {
+			if (f != primary) {
+				nargs++;
+			}
+		}
+	}
+	nargs++;			/* NULL terminator */
+	argv = cobc_malloc ((size_t)nargs * sizeof (*argv));
+
+	/* The libcob_py dir is sys.argv[3]; the primary (entry) module is sys.argv[4]
+	   - it becomes m[0]/__main__.py.  The (char *) casts drop const for the
+	   execvp prototype only; execvp does not modify the strings. */
+	argc = 0;
+	argv[argc++] = (char *)cob_python;
+	argv[argc++] = (char *)"-c";
+	argv[argc++] = pyz_stage;
+	argv[argc++] = (char *)outname;
+	argv[argc++] = (char *)(as_exec ? "1" : "0");
+	/* REVIEW FIX (CRITICAL #2): the libcob_py runtime directory is sys.argv[3]
+	   in the staging script (bundled into the archive as "libcob_py/"). */
+	argv[argc++] = (char *)cob_libpy_dir;
+	argv[argc++] = (char *)primary->translate;
+	/* Append any additional modules (multi-program -x / -b builds). */
+	if (modlist) {
+		for (f = modlist; f; f = f->next) {
+			if (f == primary) {
+				continue;
+			}
+			argv[argc++] = (char *)f->translate;
+		}
+	}
+	argv[argc] = NULL;
+
+	ret = cobc_spawn_argv (argv, 0);
+	free (argv);
+	return ret;
+}
+
+/* MIGRATION (C->Python): byte-compile an emitted ".py" into a ".pyc" via the
+   standard-library py_compile module, run through cob_python.  An explicit
+   cfile honours the -o / object naming and doraise=True maps a Python syntax
+   error to a non-zero exit status, preserving the original C error mapping.
+   Both process_compile (-S) and process_assemble (-c) share this single
+   implementation.  SECURITY (CWE-78): the interpreter, the inline script and
+   the source and output paths are passed as separate argv elements to the
+   cobc_spawn_argv argv-vector runner, so no shell interprets them - a path
+   containing shell metacharacters cannot inject a command and there is no
+   buffer to overflow. */
+static int
+cobc_build_pycompile (const char *src, const char *out)
+{
+	static char	py_compile_script[] =
+		"import py_compile,sys; "
+		"py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)";
+	char	*argv[6];
+
+	argv[0] = (char *)cob_python;
+	argv[1] = (char *)"-c";
+	argv[2] = py_compile_script;
+	argv[3] = (char *)src;
+	argv[4] = (char *)out;
+	argv[5] = NULL;
+	return cobc_spawn_argv (argv, 0);
+}
+
+/* MIGRATION (C->Python): recognise a NATIVE (C / assembler / C++) subprogram
+   SOURCE supplied directly on the command line - e.g. "cobc -m dump.c".  A
+   COBOL program may CALL an external routine written in C (a legitimate,
+   long-standing COBOL feature exercised by the test oracle's "CALL \"dump\""
+   helpers); such a source cannot be lowered to Python, so it must be compiled
+   by the native C compiler into a shared object rather than wrapped into a
+   ".pyz".  This is distinguished from an emitted Python object carried under
+   cobc's ".o" name (the "cobc -c" compile-then-link path) by the SOURCE
+   extension, so the Python module/object paths are completely unaffected. */
+static int
+is_native_source (const char *source)
+{
+	const char	*ext = file_extension (source);
+
+	return (strcmp (ext, "c") == 0 ||
+		strcmp (ext, "s") == 0 ||
+		strcmp (ext, "cc") == 0 ||
+		strcmp (ext, "cpp") == 0 ||
+		strcmp (ext, "cxx") == 0);
+}
+
+/* MIGRATION (C->Python): compile a native subprogram source (fn->source) into
+   the shared object "outname" with the system C compiler.  This is the faithful
+   analogue of what the original backend did with COB_CC for a ".c" input: the
+   result is a real ELF shared object that libcob_py.call dlopen's through ctypes
+   at CALL time (ctypes being the stdlib replacement for the removed dlopen/dlsym
+   resolver).  The compiler is taken from $COB_CC, falling back to the POSIX
+   standard name "cc"; the portable "-shared -fPIC" flags build a loadable
+   object.  SECURITY (CWE-78): the command is dispatched through the
+   cobc_spawn_argv argv-vector runner - the compiler name, flags, output name and
+   source path are individual argv elements passed verbatim to execvp(), so no
+   shell parses them and a metacharacter in any path is inert. */
+static int
+cobc_build_native (struct filename *fn, const char *outname)
+{
+	const char	*cc;
+	char		*argv[8];
+	int		argc;
+
+	cc = getenv ("COB_CC");
+	if (cc == NULL || cc[0] == '\0') {
+		cc = "cc";
+	}
+	argc = 0;
+	argv[argc++] = (char *)cc;
+	argv[argc++] = (char *)"-shared";
+	argv[argc++] = (char *)"-fPIC";
+	argv[argc++] = (char *)"-o";
+	argv[argc++] = (char *)outname;
+	argv[argc++] = (char *)fn->source;
+	argv[argc] = NULL;
+	return cobc_spawn_argv (argv, 0);
+}
+
 static int
 process_compile (struct filename *fn)
 {
-	char	buff[COB_MEDIUM_BUFF];
 	char	name[COB_MEDIUM_BUFF];
 
+	/* MIGRATION (C->Python): "-S" (CB_LEVEL_COMPILE) previously produced an
+	   assembler file via "cob_cc -S".  Under the Python backend the closest
+	   analogue is byte-compilation, so py_compile turns the emitted ".py" into
+	   a ".pyc".  The output name keeps the original -o / basename rule, with the
+	   extension changed from ".s" to ".pyc". */
 	if (output_name) {
 		strcpy (name, output_name);
 #ifdef _MSC_VER
@@ -1691,21 +2086,10 @@ process_compile (struct filename *fn)
 #endif
 	} else {
 		file_basename (fn->source, name);
-#ifndef _MSC_VER
-		strcat (name, ".s");
-#endif
+		strcat (name, ".pyc");
 	}
-#ifdef _MSC_VER
-	sprintf (buff, gflag_set ? 
-		"%s /c %s %s /Od /MDd /Zi /FR /c /Fa\"%s\" /Fo\"%s\" %s" :
-		"%s /c %s %s /MD /c /Fa\"%s\" /Fo\"%s\" %s",
-			cob_cc, cob_cflags, cob_define_flags, name,
-			name, fn->translate);
-#else
-	sprintf (buff, "%s %s -S -o \"%s\" %s %s %s", cob_cc, gccpipe, name,
-			cob_cflags, cob_define_flags, fn->translate);
-#endif
-	return process (buff);
+	/* MIGRATION (C->Python): byte-compile the emitted ".py" to "name". */
+	return cobc_build_pycompile (fn->translate, name);
 }
 
 /* Create single-element assembled object */
@@ -1713,91 +2097,68 @@ process_compile (struct filename *fn)
 static int
 process_assemble (struct filename *fn)
 {
-	char buff[COB_MEDIUM_BUFF];
-
-#ifdef _MSC_VER
-	sprintf (buff, gflag_set ? 
-		"%s /c %s %s /Od /MDd /Zi /FR /Fo\"%s\" \"%s\"" :
-		"%s /c %s %s /MD /Fo\"%s\" \"%s\"",
-			cob_cc, cob_cflags, cob_define_flags,
-			fn->object, fn->translate);
-#else
-	if (cb_compile_level == CB_LEVEL_MODULE ||
-	    cb_compile_level == CB_LEVEL_LIBRARY) {
-		sprintf (buff, "%s %s -c %s %s %s -o \"%s\" \"%s\"",
-			 cob_cc, gccpipe, cob_cflags, cob_define_flags,
-			 COB_PIC_FLAGS, fn->object, fn->translate);
-	} else {
-		sprintf (buff, "%s %s -c %s %s -o \"%s\" \"%s\"",
-			 cob_cc, gccpipe, cob_cflags, cob_define_flags,
-			 fn->object, fn->translate);
-	}
-#endif
-	return process (buff);
+	/* MIGRATION (C->Python): "-c" (CB_LEVEL_ASSEMBLE) previously assembled the
+	   intermediate into a native object (".o") via "cob_cc -c".  The Python
+	   backend has no assembler; the equivalent reusable compiled artifact is a
+	   ".pyc", so we byte-compile the emitted ".py" into fn->object using
+	   py_compile (cobc_build_pycompile).  This preserves the level model
+	   (process_module / process_link still run afterwards directly from the
+	   ".py") together with the object naming and the cleanup logic in
+	   cobc_clean_up().  doraise=True keeps the non-zero error mapping for a
+	   Python syntax error. */
+	return cobc_build_pycompile (fn->translate, fn->object);
 }
 
 static int
 process_module_direct (struct filename *fn)
 {
-	int	ret;
-	char	buff[COB_MEDIUM_BUFF];
 	char	name[COB_MEDIUM_BUFF];
 
+	/* MIGRATION (C->Python): a NATIVE C/asm subprogram source ("cobc -m
+	   dump.c") cannot become a ".py" - compile it to a real shared object that
+	   libcob_py.call dlopen's via ctypes.  The object keeps the native ".so"
+	   extension so it is unambiguously native (an emitted COBOL module keeps
+	   COB_MODULE_EXT = ".pyz").  This precedes the ".pyz" packaging below and
+	   never triggers for a COBOL input (those have a non-native source ext). */
+	if (is_native_source (fn->source)) {
+		char	nname[COB_MEDIUM_BUFF];
+		if (output_name) {
+			strcpy (nname, output_name);
+			if (strchr (output_name, '.') == NULL) {
+				strcat (nname, ".so");
+			}
+		} else {
+			file_basename (fn->source, nname);
+			strcat (nname, ".so");
+		}
+		return cobc_build_native (fn, nname);
+	}
+
+	/* MIGRATION (C->Python): "-m" (CB_LEVEL_MODULE) previously linked a native
+	   shared object via cob_cc + linker flags (cob_ldflags, cob_libs,
+	   COB_SHARED_OPT, ...).  Now the single emitted ".py" is packaged into a
+	   ".pyz" archive with zipapp (cobc_build_pyz).  The module-name construction
+	   is preserved EXCEPT that COB_MODULE_EXT already includes its leading dot
+	   (".pyz") in the regenerated build macros, so the separate "." that the C
+	   code appended is dropped here to avoid a doubled dot. */
 	if (output_name) {
 		strcpy (name, output_name);
 #if	defined(_MSC_VER)
 		file_stripext (name);
 #else
 		if (strchr (output_name, '.') == NULL) {
-			strcat (name, ".");
 			strcat (name, COB_MODULE_EXT);
 		}
 #endif
 	} else {
 		file_basename (fn->source, name);
 #if	!defined(_MSC_VER)
-		strcat (name, ".");
 		strcat (name, COB_MODULE_EXT);
 #endif
 	}
 
-
-#ifdef _MSC_VER
-	sprintf (buff, gflag_set ? 
-		"%s %s %s /Od /MDd /LDd /Zi /FR /Fe\"%s\" /Fo\"%s\" %s \"%s\" %s" :
-		"%s %s %s /MD /LD /Fe\"%s\" /Fo\"%s\" %s \"%s\" %s",
-			cob_cc, cob_cflags, cob_define_flags, name, name,
-			cob_ldflags, fn->translate, cob_libs);
-	ret = process (buff);
-#if _MSC_VER >= 1400
-	/* Embedding manifest */
-	if (ret == 0) {
-		sprintf (buff,
-			 "%s /manifest \"%s.dll.manifest\" /outputresource:\"%s.dll\";#2",
-			 manicmd, name, name);
-		ret = process (buff);
-		sprintf (buff, "%s.dll.manifest", name);
-		cobc_check_action (buff);
-	}
-#endif
-	sprintf (buff, "%s.exp", name);
-	cobc_check_action (buff);
-	sprintf (buff, "%s.lib", name);
-	cobc_check_action (buff);
-#else	/* _MSC_VER */
-	sprintf (buff, "%s %s %s %s %s %s %s %s -o %s %s %s",
-		 cob_cc, gccpipe, cob_cflags, cob_define_flags, COB_SHARED_OPT,
-		 cob_ldflags, COB_PIC_FLAGS, COB_EXPORT_DYN, name,
-		 fn->translate, cob_libs);
-	ret = process (buff);
-#ifdef	COB_STRIP_CMD
-	if (strip_output && ret == 0) {
-		sprintf (buff, "%s \"%s\"", COB_STRIP_CMD, name);
-		ret = process (buff);
-	}
-#endif
-#endif	/* _MSC_VER */
-	return ret;
+	/* MIGRATION (C->Python): build a loadable (non-executable) ".pyz" module. */
+	return cobc_build_pyz (fn, NULL, name, 0);
 }
 
 /* Create single-element loadable object */
@@ -1805,191 +2166,100 @@ process_module_direct (struct filename *fn)
 static int
 process_module (struct filename *fn)
 {
-	int	ret;
-	char	buff[COB_MEDIUM_BUFF];
 	char	name[COB_MEDIUM_BUFF];
 
+	/* MIGRATION (C->Python): native C/asm subprogram source -> shared object
+	   (see process_module_direct).  Defensive: a ".c" input normally reaches
+	   process_module_direct (need_assemble set), but handle it here too so any
+	   native source packaged in module mode is compiled, never wrapped in a
+	   ".pyz". */
+	if (is_native_source (fn->source)) {
+		char	nname[COB_MEDIUM_BUFF];
+		if (output_name) {
+			strcpy (nname, output_name);
+			if (strchr (output_name, '.') == NULL) {
+				strcat (nname, ".so");
+			}
+		} else {
+			file_basename (fn->source, nname);
+			strcat (nname, ".so");
+		}
+		return cobc_build_native (fn, nname);
+	}
+
+	/* MIGRATION (C->Python): "-m" packaging for an input that needs no further
+	   assembly (the C path linked fn->object into a shared object).  The Python
+	   backend packages the ".py" module (fn->translate, which equals fn->source
+	   for already-translated inputs) into a ".pyz" via zipapp.  Module-name
+	   construction is preserved, dropping the separate "." because COB_MODULE_EXT
+	   now already carries its leading dot (".pyz"). */
 	if (output_name) {
 		strcpy (name, output_name);
 #if	defined(_MSC_VER)
 		file_stripext (name);
 #else
 		if (strchr (output_name, '.') == NULL) {
-			strcat (name, ".");
 			strcat (name, COB_MODULE_EXT);
 		}
 #endif
 	} else {
 		file_basename (fn->source, name);
 #if	!defined(_MSC_VER)
-		strcat (name, ".");
 		strcat (name, COB_MODULE_EXT);
 #endif
 	}
-#ifdef _MSC_VER
-	sprintf (buff, gflag_set ? 
-		"%s /Od /MDd /LDd /Zi /FR /Fe\"%s\" %s \"%s\" %s" :
-		"%s /MD /LD /Fe\"%s\" %s \"%s\" %s",
-			cob_cc, name, cob_ldflags, fn->object, cob_libs);
-	ret = process (buff);
-#if _MSC_VER >= 1400
-	/* Embedding manifest */
-	if (ret == 0) {
-		sprintf (buff,
-			 "%s /manifest \"%s.dll.manifest\" /outputresource:\"%s.dll\";#2",
-			 manicmd, name, name);
-		ret = process (buff);
-		sprintf (buff, "%s.dll.manifest", name);
-		cobc_check_action (buff);
-	}
-#endif
-	sprintf (buff, "%s.exp", name);
-	cobc_check_action (buff);
-	sprintf (buff, "%s.lib", name);
-	cobc_check_action (buff);
-#else	/* _MSC_VER */
-	sprintf (buff, "%s %s %s %s %s %s -o %s %s %s",
-		 cob_cc, gccpipe, COB_SHARED_OPT, cob_ldflags, COB_PIC_FLAGS,
-		 COB_EXPORT_DYN, name, fn->object, cob_libs);
-	ret = process (buff);
-#ifdef	COB_STRIP_CMD
-	if (strip_output && ret == 0) {
-		sprintf (buff, "%s %s", COB_STRIP_CMD, name);
-		ret = process (buff);
-	}
-#endif
-#endif	/* _MSC_VER */
-	return ret;
+
+	/* MIGRATION (C->Python): build a loadable (non-executable) ".pyz" module. */
+	return cobc_build_pyz (fn, NULL, name, 0);
 }
 
 static int
 process_library (struct filename *l)
 {
-	char		*buffptr;
-	char		*objsptr;
-	struct filename	*f;
-	size_t		bufflen;
-	int		ret;
-	char		buff[COB_MEDIUM_BUFF];
 	char		name[COB_MEDIUM_BUFF];
-	char		objs[COB_MEDIUM_BUFF] = "\0";
 
-	bufflen = 0;
-	for (f = l; f; f = f->next) {
-		bufflen += strlen (f->object) + 2;
-	}
-	if (bufflen >= COB_MEDIUM_BUFF) {
-		objsptr = cobc_malloc (bufflen);
-	} else {
-		objsptr = objs;
-	}
-	for (f = l; f; f = f->next) {
-#ifdef _MSC_VER
-		strcat (objsptr, "\"");
-#endif
-		strcat (objsptr, f->object);
-#ifdef _MSC_VER
-		strcat (objsptr, "\"");
-#endif
-		strcat (objsptr, " ");
-	}
-
+	/* MIGRATION (C->Python): "-b" (CB_LEVEL_LIBRARY) previously combined every
+	   compiled object into one shared library via cob_cc + linker flags.  The
+	   Python backend bundles every emitted ".py" module in the file list into a
+	   single ".pyz" archive with zipapp (cobc_build_pyz over the whole list):
+	   the list head becomes the entry/__main__ module and the rest stay
+	   importable by base name.  Module-name construction is preserved, dropping
+	   the separate "." because COB_MODULE_EXT now already carries its leading
+	   dot (".pyz"). */
 	if (output_name) {
 		strcpy (name, output_name);
 #ifdef _MSC_VER
 		file_stripext(name);
 #else
 		if (strchr (output_name, '.') == NULL) {
-			strcat (name, ".");
 			strcat (name, COB_MODULE_EXT);
 		}
 #endif
 	} else {
 		file_basename (l->source, name);
 #ifndef _MSC_VER
-		strcat (name, ".");
 		strcat (name, COB_MODULE_EXT);
 #endif
 	}
 
-	bufflen = strlen (cob_cc) + strlen (gccpipe) + strlen (cob_ldflags)
-			+ strlen (COB_EXPORT_DYN) + strlen (COB_SHARED_OPT)
-			+ strlen (name) + strlen (objsptr) + strlen (cob_libs)
-			+ strlen (COB_PIC_FLAGS) + 16;
-	if (bufflen >= COB_MEDIUM_BUFF) {
-		buffptr = cobc_malloc (bufflen);
-	} else {
-		buffptr = buff;
-	}
-
-#ifdef _MSC_VER
-	sprintf (buff, gflag_set ? 
-		"%s /Od /MDd /LDd /Zi /FR /Fe\"%s\" %s %s %s" :
-		"%s /MD /LD /Fe\"%s\" %s %s %s",
-			cob_cc, name, cob_ldflags, objsptr, cob_libs);
-	ret = process (buff);
-#if _MSC_VER >= 1400
-	/* Embedding manifest */
-	if (ret == 0) {
-		sprintf (buff,
-			 "%s /manifest \"%s.dll.manifest\" /outputresource:\"%s.dll\";#2",
-			 manicmd, name, name);
-		ret = process (buff);
-		sprintf (buff, "%s.dll.manifest", name);
-		cobc_check_action (buff);
-	}
-#endif
-	sprintf (buff, "%s.exp", name);
-	cobc_check_action (buff);
-	sprintf (buff, "%s.lib", name);
-	cobc_check_action (buff);
-#else	/* _MSC_VER */
-	sprintf (buffptr, "%s %s %s %s %s %s -o %s %s %s",
-		 cob_cc, gccpipe, COB_SHARED_OPT, cob_ldflags, COB_PIC_FLAGS,
-		 COB_EXPORT_DYN, name, objsptr, cob_libs);
-	ret = process (buffptr);
-#ifdef	COB_STRIP_CMD
-	if (strip_output && ret == 0) {
-		sprintf (buff, "%s %s", COB_STRIP_CMD, name);
-		ret = process (buff);
-	}
-#endif
-#endif	/* _MSC_VER */
-	return ret;
+	/* MIGRATION (C->Python): combined loadable ".pyz" over the whole list. */
+	return cobc_build_pyz (l, l, name, 0);
 }
 
 static int
 process_link (struct filename *l)
 {
-	char		*buffptr;
-	char		*objsptr;
-	struct filename	*f;
-	size_t		bufflen;
-	int		ret;
-	char		buff[COB_MEDIUM_BUFF];
 	char		name[COB_MEDIUM_BUFF];
-	char		objs[COB_MEDIUM_BUFF] = "\0";
 
-	bufflen = 0;
-	for (f = l; f; f = f->next) {
-		bufflen += strlen (f->object) + 2;
-	}
-	if (bufflen >= COB_MEDIUM_BUFF) {
-		objsptr = cobc_malloc (bufflen);
-	} else {
-		objsptr = objs;
-	}
-	for (f = l; f; f = f->next) {
-#ifdef _MSC_VER
-		strcat (objsptr, "\"");
-#endif
-		strcat (objsptr, f->object);
-#ifdef _MSC_VER
-		strcat (objsptr, "\"");
-#endif
-		strcat (objsptr, " ");
-	}
-
+	/* MIGRATION (C->Python): "-x" (CB_LEVEL_EXECUTABLE) previously linked the
+	   objects, libcob and system libraries into a native executable via cob_cc +
+	   cob_ldflags + cob_libs.  The C runtime is no longer linked (bin/Makefile.am
+	   drops that dependency).  Instead every emitted ".py" module in the file
+	   list is bundled into a single self-contained ".pyz" archive carrying an
+	   embedded shebang for cob_python with the executable bit set, so the result
+	   runs directly (and via "python <module>" as bin/cobcrun.c launches it).
+	   The executable keeps its bare -o / basename name (no extension), mirroring
+	   the original native-executable naming. */
 	if (output_name) {
 		strcpy (name, output_name);
 #ifdef _MSC_VER
@@ -1999,51 +2269,8 @@ process_link (struct filename *l)
 		file_basename (l->source, name);
 	}
 
-	bufflen = strlen (cob_cc) + strlen (gccpipe) + strlen (cob_ldflags)
-			+ strlen (COB_EXPORT_DYN) + strlen (name)
-			+ strlen (objsptr) + strlen (cob_libs) + 16;
-	if (bufflen >= COB_MEDIUM_BUFF) {
-		buffptr = cobc_malloc (bufflen);
-	} else {
-		buffptr = buff;
-	}
-#ifdef _MSC_VER
-	sprintf (buff, gflag_set ? 
-		"%s /Od /MDd /Zi /FR /Fe\"%s\" %s %s %s" :
-		"%s /MD /Fe\"%s\" %s %s %s",
-			cob_cc, name, cob_ldflags, objsptr, cob_libs);
-	ret = process (buff);
-#if _MSC_VER >= 1400
-	/* Embedding manifest */
-	if (ret == 0) {
-		sprintf (buff, 
-			 "%s /manifest \"%s.exe.manifest\" /outputresource:\"%s.exe\";#1",
-			 manicmd, name, name);
-		ret = process (buff);
-		sprintf (buff, "%s.exe.manifest", name);
-		cobc_check_action (buff);
-	}
-#endif
-#else	/* _MSC_VER */
-	sprintf (buffptr, "%s %s %s %s -o %s %s %s",
-		 cob_cc, gccpipe, cob_ldflags, COB_EXPORT_DYN, name,
-		 objsptr, cob_libs);
-
-	ret = process (buffptr);
-#ifdef	__hpux
-	if (ret == 0) {
-		sprintf (buff, "chatr -s +s enable %s%s 1>/dev/null 2>&1", name, COB_EXEEXT);
-		process (buff);
-	}
-#endif
-#ifdef	COB_STRIP_CMD
-	if (strip_output && ret == 0) {
-		sprintf (buff, "%s %s%s", COB_STRIP_CMD, name, COB_EXEEXT);
-		ret = process (buff);
-	}
-#endif
-#endif	/* _MSC_VER */
-	return ret;
+	/* MIGRATION (C->Python): executable ".pyz" (as_exec => shebang + chmod +x). */
+	return cobc_build_pyz (l, l, name, 1);
 }
 
 int
@@ -2120,9 +2347,23 @@ main (int argc, char *argv[])
 		putenv ((char *)"TMPDIR=/tmp");
 	}
 
-	cob_cc = getenv ("COB_CC");
-	if (cob_cc == NULL) {
-		cob_cc = COB_CC;
+	/* MIGRATION (C->Python): resolve the Python 3.11+ backend interpreter from
+	   $COB_PYTHON, falling back to the COB_PYTHON macro emitted into defaults.h
+	   by the top-level Makefile.am (lockstep change).  This supersedes the
+	   former $COB_CC / COB_CC C-compiler resolution. */
+	cob_python = getenv ("COB_PYTHON");
+	if (cob_python == NULL) {
+		cob_python = COB_PYTHON;
+	}
+
+	/* MIGRATION (C->Python) / REVIEW FIX (CRITICAL #2): resolve the libcob_py
+	   runtime package directory from $COB_LIBPY_DIR, falling back to the
+	   COB_LIBPY_DIR macro (= $(pkgdatadir)/libcob_py) emitted into defaults.h by
+	   the top-level Makefile.am (lockstep change).  cobc_build_pyz stages this
+	   directory into the generated ".pyz" so the archive is self-contained. */
+	cob_libpy_dir = getenv ("COB_LIBPY_DIR");
+	if (cob_libpy_dir == NULL) {
+		cob_libpy_dir = COB_LIBPY_DIR;
 	}
 
 	cob_config_dir = getenv ("COB_CONFIG_DIR");
@@ -2130,8 +2371,15 @@ main (int argc, char *argv[])
 		cob_config_dir = COB_CONFIG_DIR;
 	}
 
-	cobc_init_var (cob_cflags, "COB_CFLAGS", COB_CFLAGS);
+	/* MIGRATION (C->Python): the COB_CFLAGS macro is removed from defaults.h and
+	   can no longer initialise cob_cflags.  The buffer is reset to empty here and
+	   stays inert for the Python backend - only the still-immutable -O/-A/-g/
+	   -fomit-frame option handlers append to it (and that output is never used). */
+	cob_cflags[0] = '\0';
 
+	/* MIGRATION (C->Python): the COB_LDFLAGS / COB_LIBS macros still exist, so
+	   these reads still compile; their values are inert under the Python backend
+	   (there is no native linking).  Left as-is for minimal change. */
 	cobc_init_var (cob_ldflags, "COB_LDFLAGS", COB_LDFLAGS);
 
 	cobc_init_var (cob_libs, "COB_LIBS", COB_LIBS);
@@ -2153,16 +2401,15 @@ main (int argc, char *argv[])
 		alt_ebcdic = 1;
 	}
 
-	/* Compiler special options */
-
-#if	defined(__INTEL_COMPILER)
-	strcat (cob_cflags, " -vec-report0 -opt-report 0");
-#elif	defined(__GNUC__)
-	strcat (cob_cflags, " -Wno-unused -fsigned-char");
-#ifdef	HAVE_PSIGN_OPT
-	strcat (cob_cflags, " -Wno-pointer-sign");
-#endif
-#endif
+	/* MIGRATION (C->Python): the former "Compiler special options" block
+	   appended host-C-compiler switches (Intel "-vec-report0 -opt-report 0";
+	   GCC "-Wno-unused -fsigned-char" and optionally "-Wno-pointer-sign") to
+	   cob_cflags.  Those flags configured the native C backend, which no longer
+	   exists, and cob_cflags is inert under the Python backend (it is reset to
+	   "" above and never read by any process_* dispatcher).  The appends were
+	   therefore dead writes and are removed so no stale C-compiler state lingers
+	   (review MINOR / R10).  The immutable CLI option handlers that still target
+	   cob_cflags are deliberately left untouched per the minimal-change clause. */
 
 	/* Process command line arguments */
 	iargs = process_command_line (argc, argv);
@@ -2173,11 +2420,22 @@ main (int argc, char *argv[])
 		exit (1);
 	}
 
+	/* MIGRATION (C->Python): validate the Python 3.11+ backend interpreter
+	   before any process_* dispatch.  Placed here - after process_command_line
+	   (which already handled and exited for --info/--version/--help/--list via
+	   exit_option) and after the no-input-files check - so informational modes
+	   keep working without a Python interpreter, while no compilation can occur
+	   with an invalid COB_PYTHON.  Emits the mandated fatal diagnostic and
+	   exit(1) on failure (AAP 0.7.2). */
+	cobc_check_python ();
+
 	/* Windows stuff reliant upon verbose option */
 #ifdef	_MSC_VER
-	if (!verbose_output) {
-		strcat (cob_cflags, " /nologo");
-	}
+	/* MIGRATION (C->Python): the MSVC "/nologo" switch was appended to
+	   cob_cflags to quiet the native C compiler.  cob_cflags is inert under the
+	   Python backend, so this append is a dead write and is removed (review
+	   MINOR / R10).  The manicmd selection below is unrelated to cob_cflags and
+	   is preserved unchanged. */
 #if	_MSC_VER >= 1400
 	if (!verbose_output) {
 		manicmd = "mt /nologo";

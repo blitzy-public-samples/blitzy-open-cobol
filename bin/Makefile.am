@@ -25,6 +25,10 @@ bin_SCRIPTS=cob-config
 bin_PROGRAMS = cobcrun
 cobcrun_SOURCES = cobcrun.c
 
+# MIGRATION (C→Python): COB_EXPORT_DYN no longer required (cobcrun does not dlopen); retained as harmless
 AM_LDFLAGS = $(COB_EXPORT_DYN)
 cobcrun_CFLAGS = $(AM_CFLAGS) -I$(top_srcdir)
-cobcrun_LDADD = $(top_builddir)/libcob/libcob.la
+# MIGRATION (C→Python): dropped `cobcrun_LDADD = $(top_builddir)/libcob/libcob.la`.
+# cobcrun.c no longer calls cob_init/cob_resolve/cob_stop_run; it spawns the
+# CPython interpreter on the named module instead, so it must not link the C
+# runtime libcob.la (which is no longer built — see libcob/Makefile.am).
