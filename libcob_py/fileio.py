@@ -14,9 +14,10 @@ C ``cob_*`` call-sites (AAP section 0.6.5): e.g. a COBOL ``OPEN INPUT`` becomes
 
 Standard library only
 ---------------------
-The only imports are :mod:`os`, :mod:`io`, :mod:`struct`, :mod:`dbm`,
-:mod:`sqlite3`, :mod:`tempfile`, :mod:`shutil` and the sibling runtime base
-module :mod:`libcob_py.common`.  ZERO third-party dependencies
+The only imports are :mod:`bisect`, :mod:`dbm`, :mod:`functools`, :mod:`heapq`,
+:mod:`io`, :mod:`os`, :mod:`shutil`, :mod:`sqlite3`, :mod:`struct`, :mod:`sys`,
+:mod:`tempfile` and the sibling runtime base module :mod:`libcob_py.common`.
+ZERO third-party dependencies
 (AAP sections 0.5 / 0.7.1).  The numeric helpers ``cob_get_int`` /
 ``cob_set_int`` (provided by ``libcob_py.move``) and ``cob_add_int`` /
 ``cob_numeric_cmp`` (provided by ``libcob_py.numeric``) are reached through
@@ -69,6 +70,7 @@ while not emulating cross-process BDB lock arbitration.
 
 from __future__ import annotations
 
+import bisect
 import dbm
 import functools
 import heapq
@@ -1312,6 +1314,26 @@ def _search_key_bytes(key):
     return bytes(key.data[:key.size])
 
 
+def _prefix_upper_bound(prefix):
+    """Return the exclusive upper bound for a byte-string *prefix*.
+
+    Used by the QA F-PERF F4 migration to turn a prefix (generic-key) match into
+    an index-seekable half-open range ``key >= prefix AND key < bound``.  The
+    bound is *prefix* with its last byte incremented (after stripping any
+    trailing ``0xFF`` bytes, which cannot be incremented).  When the prefix is
+    empty or consists entirely of ``0xFF`` bytes there is no finite upper bound
+    (every key sorting at/after the prefix matches), so ``None`` is returned and
+    the caller emits a lower-bound-only predicate.
+    """
+    b = bytearray(prefix)
+    while b and b[-1] == 0xFF:
+        b.pop()
+    if not b:
+        return None
+    b[-1] += 1
+    return bytes(b)
+
+
 class _IndexedDbm(object):
     """Primary-key-only INDEXED store backed by :mod:`dbm`.
 
@@ -1322,7 +1344,7 @@ class _IndexedDbm(object):
     """
 
     __slots__ = ("db", "filename", "mode", "keylen", "_sorted",
-                 "_idx", "_pending", "_last_key")
+                 "_idx", "_pending", "_last_key", "_resume_key")
 
     def __init__(self, db, filename, mode, keylen):
         self.db = db
@@ -1333,6 +1355,12 @@ class _IndexedDbm(object):
         self._idx = -1          # index of last record returned (-1 = before first)
         self._pending = None    # index to return first after a START
         self._last_key = None   # last key written in sequential (load) mode
+        # QA F-PERF F3 migration: a random READ records the key it positioned on
+        # here instead of eagerly computing ``_idx`` (which required an O(n)
+        # scan of ``_sorted`` on every read).  The cursor index is resolved
+        # lazily - only when a subsequent READ NEXT/PREVIOUS actually needs it -
+        # via an O(log n) bisect, keeping the random-read hot path O(1).
+        self._resume_key = None
 
     # -- ordering helpers ---------------------------------------------------
     def _ensure_sorted(self):
@@ -1396,21 +1424,28 @@ class _IndexedDbm(object):
             val = self.db[kb]
         elif key.size < self.keylen:
             # Partial key: first record whose key starts with kb.
+            # QA F-PERF F4 migration: locate the first prefix match with an
+            # O(log n) bisect on the cached ascending key view instead of the
+            # previous O(n) linear scan.  Because every stored key is the full
+            # ``keylen`` bytes, no stored key equals the shorter ``kb``, so the
+            # first key >= kb is the smallest key above the prefix; if it shares
+            # the prefix it is the match, otherwise no prefix match exists.
             self._ensure_sorted()
-            for k in self._sorted:
-                if k[:key.size] == kb:
-                    val = self.db[k]
-                    kb = k
-                    break
+            pos = bisect.bisect_left(self._sorted, kb)
+            if pos < len(self._sorted) and self._sorted[pos][:key.size] == kb:
+                kb = self._sorted[pos]
+                val = self.db[kb]
         if val is None:
             return COB_STATUS_23_KEY_NOT_EXISTS
         f.record.data[0:len(val)] = val
         f.record.size = len(val)
-        self._ensure_sorted()
-        try:
-            self._idx = self._sorted.index(kb)
-        except ValueError:  # pragma: no cover - key guaranteed present
-            self._idx = -1
+        # QA F-PERF F3 migration: defer cursor positioning.  Record the key we
+        # served and resolve its ordinal lazily in ``read_next`` (O(log n) via
+        # bisect) only if a sequential read actually follows - the previous
+        # ``self._sorted.index(kb)`` made every random READ O(n) (and O(n log n)
+        # when a preceding WRITE/DELETE had invalidated ``_sorted``).
+        self._resume_key = kb
+        self._idx = -1
         self._pending = None
         return COB_STATUS_00_SUCCESS
 
@@ -1422,6 +1457,21 @@ class _IndexedDbm(object):
         if self._pending is not None:
             idx = self._pending
             self._pending = None
+        elif self._resume_key is not None:
+            # QA F-PERF F3 migration: a preceding random READ deferred its
+            # positioning.  Resolve the cursor now with an O(log n) bisect, then
+            # step to the adjacent record exactly as the eager ``_idx`` path did
+            # (forward -> pos+1, previous -> pos-1).  If the served record was
+            # deleted between the READ and this READ NEXT, ``pos`` is its
+            # insertion point: the next record forward is ``keys[pos]`` and the
+            # previous one is ``keys[pos-1]``.
+            rk = self._resume_key
+            self._resume_key = None
+            pos = bisect.bisect_left(keys, rk)
+            if pos < n and keys[pos] == rk:
+                idx = pos - 1 if previous else pos + 1
+            else:
+                idx = pos - 1 if previous else pos
         elif self._idx < 0:
             idx = (n - 1) if previous else 0
         else:
@@ -1444,6 +1494,10 @@ class _IndexedDbm(object):
             return COB_STATUS_23_KEY_NOT_EXISTS
         self._pending = idx
         self._idx = -1
+        # QA F-PERF F3 migration: START defines the cursor via ``_pending``, so
+        # discard any deferred resume key left by an earlier random READ - it
+        # must not override the START position on the next READ NEXT.
+        self._resume_key = None
         return COB_STATUS_00_SUCCESS
 
     def close(self, f, opt):
@@ -1500,39 +1554,62 @@ class _IndexedSqlite(object):
                        % (col, col))
                 args = ()
             else:
-                sql = ("SELECT seq, rec, %s FROM recs WHERE (%s > ? OR (%s = ? "
-                       "AND seq > ?)) ORDER BY %s, seq LIMIT 1"
-                       % (col, col, col, col))
-                args = (lastcol, lastcol, lastseq)
+                # QA F-PERF F1 migration: the previous disjunctive predicate
+                # ``(kN > ? OR (kN = ? AND seq > ?))`` forced SQLite into a
+                # ``MULTI-INDEX OR`` plus a ``USE TEMP B-TREE FOR ORDER BY`` -
+                # every READ NEXT sorted all remaining rows, making a full
+                # traversal O(n^2).  The equivalent row-value comparison
+                # ``(kN, seq) > (?, ?)`` (identical tuple semantics) is satisfied
+                # directly by the ``(kN, seq)`` index (and by the primary ``kN``
+                # index), giving a single index seek with no temp b-tree.
+                sql = ("SELECT seq, rec, %s FROM recs WHERE (%s, seq) > (?, ?) "
+                       "ORDER BY %s, seq LIMIT 1" % (col, col, col))
+                args = (lastcol, lastseq)
         else:
             if lastcol is None:
                 sql = ("SELECT seq, rec, %s FROM recs ORDER BY %s DESC, seq DESC "
                        "LIMIT 1" % (col, col))
                 args = ()
             else:
-                sql = ("SELECT seq, rec, %s FROM recs WHERE (%s < ? OR (%s = ? "
-                       "AND seq < ?)) ORDER BY %s DESC, seq DESC LIMIT 1"
-                       % (col, col, col, col))
-                args = (lastcol, lastcol, lastseq)
+                # QA F-PERF F1 migration: the DESC mirror of the row-value seek
+                # above - ``(kN, seq) < (?, ?)`` walks the index backwards for
+                # READ PREVIOUS without the temp-b-tree sort the old ``OR`` form
+                # incurred.
+                sql = ("SELECT seq, rec, %s FROM recs WHERE (%s, seq) < (?, ?) "
+                       "ORDER BY %s DESC, seq DESC LIMIT 1" % (col, col, col))
+                args = (lastcol, lastseq)
         return self.conn.execute(sql, args).fetchone()
 
     def _locate_seq(self, k, kb, klen, cond):
         col = "k%d" % k
-        head = "substr(%s, 1, ?)" % col
+        # QA F-PERF F2 migration: a full-length search key (the overwhelmingly
+        # common START case) compares the whole key column, so emit a bare
+        # column reference that SQLite can satisfy with an index seek.  The
+        # previous unconditional ``substr(kN, 1, ?)`` wrapper turned even a
+        # full-length, exact-length key into a full ``SCAN ... USING ... INDEX``
+        # (O(n) per START).  ``substr`` is reserved only for a genuinely partial
+        # (generic) key shorter than the full key length, where prefix semantics
+        # are actually required.
+        if klen >= self.keylens[k]:
+            head = col
+            head_args = ()
+        else:
+            head = "substr(%s, 1, ?)" % col
+            head_args = (klen,)
         if cond == common.COB_EQ:
             sql = ("SELECT seq FROM recs WHERE %s = ? ORDER BY %s, seq LIMIT 1"
                    % (head, col))
-            args = (klen, kb)
+            args = head_args + (kb,)
         elif cond in (common.COB_GE, common.COB_GT):
             op = ">=" if cond == common.COB_GE else ">"
             sql = ("SELECT seq FROM recs WHERE %s %s ? ORDER BY %s, seq LIMIT 1"
                    % (head, op, col))
-            args = (klen, kb)
+            args = head_args + (kb,)
         else:
             op = "<=" if cond == common.COB_LE else "<"
             sql = ("SELECT seq FROM recs WHERE %s %s ? ORDER BY %s DESC, seq "
                    "DESC LIMIT 1" % (head, op, col))
-            args = (klen, kb)
+            args = head_args + (kb,)
         row = self.conn.execute(sql, args).fetchone()
         return row[0] if row else None
 
@@ -1556,7 +1633,13 @@ class _IndexedSqlite(object):
         marks = ", ".join("?" for _ in range(self.nkeys))
         self.conn.execute("INSERT INTO recs (rec, %s) VALUES (?, %s)"
                           % (cols, marks), (rec, *keyvals))
-        self.conn.commit()
+        # QA F-PERF F5 migration: do NOT commit (fsync) per WRITE.  COBOL does
+        # not require per-record durability and the C Berkeley DB runtime
+        # buffered writes; a per-op commit cost ~1.6 ms/record (~570 writes/s),
+        # ~530x slower than batching.  Writes remain visible to subsequent reads
+        # on this same connection (deferred-transaction isolation), and
+        # durability is provided at the existing ``cob_sync`` / ``cob_close`` /
+        # COMMIT boundaries (see ``sync`` / ``close`` below).
         return COB_STATUS_00_SUCCESS
 
     def rewrite(self, f, opt):
@@ -1577,13 +1660,16 @@ class _IndexedSqlite(object):
         sets = "rec = ?, " + ", ".join("k%d = ?" % i for i in range(self.nkeys))
         self.conn.execute("UPDATE recs SET %s WHERE seq = ?" % sets,
                           (rec, *keyvals, seq))
-        self.conn.commit()
+        # QA F-PERF F5 migration: no per-REWRITE commit (see ``write``); the
+        # update is visible on this connection immediately and is flushed at the
+        # ``cob_sync`` / ``cob_close`` / COMMIT boundaries.
         return COB_STATUS_00_SUCCESS
 
     def delete(self, f):
         kb = _record_key(f, 0)
         cur = self.conn.execute("DELETE FROM recs WHERE k0 = ?", (kb,))
-        self.conn.commit()
+        # QA F-PERF F5 migration: no per-DELETE commit (see ``write``); deferred
+        # to the existing ``cob_sync`` / ``cob_close`` / COMMIT boundaries.
         if cur.rowcount == 0:
             return COB_STATUS_23_KEY_NOT_EXISTS
         return COB_STATUS_00_SUCCESS
@@ -1593,10 +1679,24 @@ class _IndexedSqlite(object):
         kb = _search_key_bytes(key)
         col = "k%d" % k
         if key.size < self.keylens[k]:
-            row = self.conn.execute(
-                "SELECT seq, rec, %s FROM recs WHERE substr(%s, 1, ?) = ? "
-                "ORDER BY %s, seq LIMIT 1" % (col, col, col),
-                (key.size, kb)).fetchone()
+            # QA F-PERF F4 migration: a partial (generic) key matches every
+            # record whose key starts with ``kb``.  Expressed as the half-open
+            # range ``kN >= kb AND kN < upper`` this is an index seek, whereas
+            # the previous ``substr(kN, 1, ?) = ?`` wrapped the column and forced
+            # a full index ``SCAN``.  ``upper`` is the prefix with its last byte
+            # bumped; an all-``0xFF`` prefix has no finite upper bound, so a
+            # lower-bound-only predicate is emitted instead.
+            upper = _prefix_upper_bound(kb)
+            if upper is None:
+                row = self.conn.execute(
+                    "SELECT seq, rec, %s FROM recs WHERE %s >= ? "
+                    "ORDER BY %s, seq LIMIT 1" % (col, col, col),
+                    (kb,)).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT seq, rec, %s FROM recs WHERE %s >= ? AND %s < ? "
+                    "ORDER BY %s, seq LIMIT 1" % (col, col, col, col),
+                    (kb, upper)).fetchone()
         else:
             row = self.conn.execute(
                 "SELECT seq, rec, %s FROM recs WHERE %s = ? ORDER BY seq LIMIT 1"

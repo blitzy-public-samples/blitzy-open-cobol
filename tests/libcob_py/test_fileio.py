@@ -1286,6 +1286,137 @@ def test_indexed_dbm_partial_key_read(work_dir):
     fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
 
 
+def test_indexed_dbm_random_read_then_sequential(work_dir):
+    """A random keyed READ followed by READ NEXT / READ PREVIOUS continues the
+    sequential scan from the record just read (QA F-PERF F3).
+
+    The dbm backend now defers cursor positioning out of the random-read hot
+    path and resolves it lazily on the first sequential read; this exercises
+    that lazy ``_resume_key`` path in both directions and guards it against
+    regression.
+    """
+    path = work_dir / "idx_dbm_resume"
+    f = make_indexed(path, 6, keylen=3)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    for key in (b"AAA", b"BBB", b"CCC", b"DDD"):
+        set_rec(f, key + b"xy")
+        fileio.cob_write(f, f.record, 0, None)
+    fileio.cob_close(f, common.COB_CLOSE_NORMAL, None)
+
+    g = make_indexed(path, 6, keylen=3)
+    _open_io(g)
+    # Random READ of a middle key, then READ NEXT continues ascending.
+    set_search_key(g.keys[0].field, b"BBB")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "00"
+    fileio.cob_read(g, None, None, common.COB_READ_NEXT)
+    assert st(g) == "00"
+    assert bytes(g.record.data[:3]) == b"CCC"
+    # Random READ then READ PREVIOUS continues descending.
+    set_search_key(g.keys[0].field, b"CCC")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "00"
+    fileio.cob_read(g, None, None, common.COB_READ_PREVIOUS)
+    assert st(g) == "00"
+    assert bytes(g.record.data[:3]) == b"BBB"
+    # READ a record, DELETE it, then READ NEXT continues with the record that
+    # followed the (now removed) one - the lazy-resume path must still position
+    # correctly when its deferred key has been deleted in between.
+    set_search_key(g.keys[0].field, b"CCC")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "00"
+    fileio.cob_delete(g, None)
+    assert st(g) == "00"
+    fileio.cob_read(g, None, None, common.COB_READ_NEXT)
+    assert st(g) == "00"
+    assert bytes(g.record.data[:3]) == b"DDD"
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_sqlite_read_previous_traversal(work_dir):
+    """sqlite START + READ PREVIOUS walks the primary key in descending order
+    (QA F-PERF F1, backward direction).
+
+    Exercises the row-value ``(kN, seq) < (?, ?)`` keyset predicate that
+    replaced the index-defeating ``OR`` form, ensuring backward traversal is
+    both correct and (per the EXPLAIN evidence) an index seek.
+    """
+    path = work_dir / "idx_sql_prev"
+    f = make_indexed(path, 12, keylen=3, nkeys=2, altlen=2, altoff=3,
+                     dup_alt=True)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    for record in (b"K01AArecone", b"K02BBrectwo", b"K03AArecthr"):
+        set_rec(f, record)
+        fileio.cob_write(f, f.record, 0, None)
+    fileio.cob_close(f, common.COB_CLOSE_NORMAL, None)
+
+    g = make_indexed(path, 12, keylen=3, nkeys=2, altlen=2, altoff=3,
+                     dup_alt=True)
+    fileio.cob_open(g, common.COB_OPEN_INPUT, 0, None)
+    set_search_key(g.keys[0].field, b"K03")
+    fileio.cob_start(g, common.COB_LE, g.keys[0].field, None)
+    assert st(g) == "00"
+    ordered = []
+    while True:
+        fileio.cob_read(g, None, None, common.COB_READ_PREVIOUS)
+        if st(g) != "00":
+            break
+        ordered.append(bytes(g.record.data[:3]))
+    assert ordered == [b"K03", b"K02", b"K01"]
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
+
+    # READ PREVIOUS as the very first verb (no preceding START) walks backward
+    # from the last record - the row-value seek with no prior position.
+    h = make_indexed(path, 12, keylen=3, nkeys=2, altlen=2, altoff=3,
+                     dup_alt=True)
+    fileio.cob_open(h, common.COB_OPEN_INPUT, 0, None)
+    fileio.cob_read(h, None, None, common.COB_READ_PREVIOUS)
+    assert st(h) == "00"
+    assert bytes(h.record.data[:3]) == b"K03"
+    fileio.cob_read(h, None, None, common.COB_READ_PREVIOUS)
+    assert st(h) == "00"
+    assert bytes(h.record.data[:3]) == b"K02"
+    fileio.cob_close(h, common.COB_CLOSE_NORMAL, None)
+
+
+def test_indexed_sqlite_partial_key_read(work_dir):
+    """A sqlite-backed keyed READ with a search key shorter than the full key
+    matches the first record sharing that prefix (QA F-PERF F4).
+
+    Exercises the index-seekable half-open range predicate
+    (``kN >= prefix AND kN < upper``) that replaced the index-defeating
+    ``substr()`` wrapper for generic (partial) keys.
+    """
+    path = work_dir / "idx_sql_partial"
+    f = make_indexed(path, 12, keylen=3, nkeys=2, altlen=2, altoff=3,
+                     dup_alt=True)
+    fileio.cob_open(f, common.COB_OPEN_OUTPUT, 0, None)
+    for record in (b"K01AArecone", b"K02BBrectwo", b"X99CCrecthr"):
+        set_rec(f, record)
+        fileio.cob_write(f, f.record, 0, None)
+    fileio.cob_close(f, common.COB_CLOSE_NORMAL, None)
+
+    g = make_indexed(path, 12, keylen=3, nkeys=2, altlen=2, altoff=3,
+                     dup_alt=True)
+    fileio.cob_open(g, common.COB_OPEN_INPUT, 0, None)
+    # A 2-byte partial primary key "K0" matches the first "K0*" record.
+    set_search_key(g.keys[0].field, b"K0")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "00"
+    assert bytes(g.record.data[:3]) == b"K01"
+    # A partial key with no prefix match reports 23.
+    set_search_key(g.keys[0].field, b"Z0")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "23"
+    # An all-0xFF partial key has no finite prefix upper bound; the read falls
+    # back to the lower-bound-only predicate and (no key sorts at/after 0xFF
+    # here) reports 23 - exercising the ``upper is None`` branch.
+    set_search_key(g.keys[0].field, b"\xff")
+    fileio.cob_read(g, g.keys[0].field, None, 0)
+    assert st(g) == "23"
+    fileio.cob_close(g, common.COB_CLOSE_NORMAL, None)
+
+
 def test_indexed_optional_missing_is_05(work_dir):
     """OPEN INPUT of an OPTIONAL, non-existent INDEXED file reports ``05`` and a
     first READ reports EOF (``10``).
